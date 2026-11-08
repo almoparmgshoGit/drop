@@ -295,7 +295,8 @@ describe('Late and stopped tickets, and the booking card in support chat', () =>
           const rider = (await request(http()).post(`${API}/bookings`).set(other.auth).send({ paymentMethod: 'mada', legs: [{ tripId: ctx.trip.id, seats: ['9'], boardingPointId: ctx.points[0].id }], passengers: [{ fullName: 'راكب ثالث' }] }).expect(201)).body.bookings[0];
           await scan(ctx.crew, ctx.trip.id, rider);
         }
-        await prisma.trip.update({ where: { id: ctx.trip.id }, data: { departureTime: new Date(Date.now() - 7_200_000), arrivalTime: new Date(Date.now() - 1000) } });
+        // Arrived, because a trip the crew still reports at a point or on the road stays open past its arrival time.
+        await prisma.trip.update({ where: { id: ctx.trip.id }, data: { departureTime: new Date(Date.now() - 7_200_000), arrivalTime: new Date(Date.now() - 1000), liveStatus: 'ARRIVED' } });
         await app.get(TripsService).completeFinishedTrips();
       };
 

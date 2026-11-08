@@ -1,4 +1,4 @@
-import { BookingKind, BookingLeg, CollectionMethod, RoomType } from '@prisma/client';
+import { BookingKind, BookingLeg, CollectionMethod, Gender, IdType, RoomType } from '@prisma/client';
 import { Transform, Type } from 'class-transformer';
 import {
   ArrayMaxSize,
@@ -23,6 +23,8 @@ import {
   ValidateNested,
 } from 'class-validator';
 import { ALL_PERMISSIONS } from '../../common/permissions';
+import { GENDERS } from '../../common/profile-options';
+import { ID_TYPES } from '../../common/utils/identity.util';
 
 const trimmed = () => Transform(({ value }) => (typeof value === 'string' ? value.trim() : value));
 const SEAT_NUMBER = /^\d{1,3}$/;
@@ -74,6 +76,37 @@ export class CreateBranchEmployeeDto {
   @IsString()
   @Length(10, 200, { message: 'كلمة المرور يجب ألا تقل عن 10 أحرف' })
   password: string;
+
+  // Optional here so the service names the missing one; a new employee cannot be saved without them.
+  @IsOptional()
+  @IsString()
+  @Length(2, 60)
+  nationality?: string;
+
+  @IsOptional()
+  @IsIn(GENDERS, { message: 'اختر الجنس من القائمة' })
+  gender?: Gender;
+
+  @IsOptional()
+  @IsIn(ID_TYPES, { message: 'اختر نوع الهوية: هوية وطنية أو إقامة أو جواز سفر' })
+  idType?: IdType;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(30)
+  idNumber?: string;
+
+  @IsOptional()
+  @Matches(/^\d{4}-\d{2}-\d{2}$/, { message: 'صيغة تاريخ إصدار الهوية غير صحيحة' })
+  idIssueDate?: string;
+
+  @IsOptional()
+  @Matches(/^\d{4}-\d{2}-\d{2}$/, { message: 'صيغة تاريخ انتهاء الهوية غير صحيحة' })
+  idExpiryDate?: string;
+
+  @IsOptional()
+  @Matches(/^\d{4}-\d{2}-\d{2}$/, { message: 'صيغة تاريخ الميلاد غير صحيحة' })
+  birthDate?: string;
 }
 
 export class UpdateAccessDto {

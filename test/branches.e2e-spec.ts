@@ -1,7 +1,7 @@
 import { INestApplication } from '@nestjs/common';
 import * as request from 'supertest';
 import { PrismaService } from '../src/common/services/prisma.service';
-import { API, createStaff, createTestApp, loginStaff, nextPhone, resetDatabase, STAFF_PASSWORD, tripPayload } from './helpers';
+import { API, createStaff, createTestApp, loginStaff, nextPhone, officialDetails, resetDatabase, STAFF_PASSWORD, tripPayload } from './helpers';
 
 describe('Branches, their staff and counter bookings', () => {
   let app: INestApplication;
@@ -96,9 +96,11 @@ describe('Branches, their staff and counter bookings', () => {
   describe('branch staff and access', () => {
     it('registers a new employee in the manager’s own branch only', async () => {
       const body = { name: 'موظف جديد', phone: nextPhone(), rankId: 'rank-branch-clerk', password: STAFF_PASSWORD };
-      const created = await request(http()).post(`${API}/branches/${branchId}/employees`).set(manager.auth).send(body).expect(201);
+      await request(http()).post(`${API}/branches/${branchId}/employees`).set(manager.auth).send(body).expect(400);
+      const created = await request(http()).post(`${API}/branches/${branchId}/employees`).set(manager.auth).send({ ...body, ...officialDetails() }).expect(201);
       const saved = await prisma.user.findUniqueOrThrow({ where: { id: created.body.id } });
       expect(saved.branchId).toBe(branchId);
+      expect(saved.idNumber).toBeTruthy();
       await request(http()).post(`${API}/branches/${otherBranchId}/employees`).set(manager.auth).send({ ...body, phone: nextPhone() }).expect(403);
     });
 
