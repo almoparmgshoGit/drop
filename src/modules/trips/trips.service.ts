@@ -1,0 +1,1612 @@
+import {
+  BadRequestException,
+  ConflictException,
+  Injectable,
+  NotFoundException,
+  OnModuleDestroy,
+  OnModuleInit,
+} from '@nestjs/common';
+import { Prisma } from '@prisma/client';
+import { PrismaService } from '../../common/services/prisma.service';
+import { BookingCancellationService } from '../../common/services/booking-cancellation.service';
+import { LoyaltyService } from '../../common/services/loyalty.service';
+import { NotificationsService, tripValues } from '../../common/services/notifications.service';
+import { TicketAlertsService } from '../../common/services/ticket-alerts.service';
+import { TicketCompensationService } from '../../common/services/ticket-compensation.service';
+import { RoomAllocationService } from '../../common/services/room-allocation.service';
+import { BOOKING_TYPES, includesHousing } from '../../common/utils/booking-types.util';
+import { BOOKING_TYPE_LABELS } from '../../common/booking-type-labels';
+import { HousingTerms, startingSeatPrice } from '../../common/utils/housing-price.util';
+import { CREW_WINDOW_SELECT, MAX_CREW_OPENS_BEFORE_MINUTES, crewWindow } from '../../common/utils/crew-window.util';
+import { BUS_SEAT_COUNT, BUS_SEAT_NUMBERS } from '../../common/utils/bus-layout.util';
+import { assertSinglesFitRange } from '../../common/utils/singles-seats.util';
+import { bookedOnTrips, goOnlyBookings, lockTripsWithLinked, returningBookingIds } from '../../common/utils/linked-seats.util';
+import { addDays, formatRiyadhDate, formatRiyadhTime, riyadhDate, riyadhDayRange, toHijriLabel } from '../../common/utils/time.util';
+import { applyBusServices, busServiceRows } from '../../common/utils/bus-services.util';
+import { nextYearlyDate } from '../../common/utils/recurrence.util';
+import { AppSettingsService } from '../../common/services/app-settings.service';
+import { CreateTripDto, OpenReverseTripDto, UpdateTripDto } from './trips.dto';
+import { assertTripFitsPackage } from '../../common/utils/package-window.util';
+import { PublicService, SERVICE_SELECT, withHotelServices } from '../../common/utils/services.util';
+
+const DEFAULT_TRIP_DURATION_MS = 8 * 60 * 60 * 1000;
+const COMPLETION_SWEEP_MS = 5 * 60 * 1000;
+const CREW_WINDOW_SWEEP_MS = 60 * 1000;
+// Trip writes touch many tables over a remote database, well past Prisma's 5s default.
+const TRIP_TX_OPTIONS = { maxWait: 10_000, timeout: 30_000 };
+
+export const MAX_PUBLIC_IMAGE_BYTES = 5 * 1024 * 1024;
+export const MAX_PUBLIC_IMAGES_PER_UPLOAD = 10;
+
+export interface UploadedImage {
+  buffer: Buffer;
+  size: number;
+}
+
+// The declared type comes from the client, so the stored type is decided by the file's own bytes. No SVG: these open without signing in.
+const publicImageType = (file: Buffer) => {
+  if (file.subarray(0, 3).equals(Buffer.from([0xff, 0xd8, 0xff]))) return 'image/jpeg';
+  if (file.subarray(0, 4).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47]))) return 'image/png';
+  if (file.subarray(0, 4).toString('latin1') === 'RIFF' && file.subarray(8, 12).toString('latin1') === 'WEBP') return 'image/webp';
+  return null;
+};
+
+export const PUBLIC_TRIP_INCLUDE = {
+  boardingPoints: true,
+  itineraryStops: { orderBy: { sortOrder: 'asc' } },
+  images: true,
+  bus: { select: { model: true, color: true, imageUrl: true, company: true, services: SERVICE_SELECT } },
+  package: { select: { id: true, name: true, description: true, price: true, nights: true, type: true, terms: true } },
+  services: { include: { service: true } },
+  visits: { orderBy: { sortOrder: 'asc' } },
+  accommodations: true,
+  // The place and its features are all the customer needs; rates and room counts stay with staff.
+  hotelBookings: {
+    where: { status: 'CONFIRMED' },
+    orderBy: { number: 'asc' },
+    take: 1,
+    select: { hotel: { select: { name: true, city: true, address: true, description: true, services: SERVICE_SELECT } } },
+  },
+  supervisors: { select: { isPrimary: true, user: { select: { name: true } } } },
+} satisfies Prisma.TripInclude;
+
+const STAFF_USER_SELECT = { select: { id: true, name: true, phone: true, role: true } };
+
+const ADMIN_TRIP_INCLUDE = {
+  boardingPoints: true,
+  itineraryStops: { orderBy: { sortOrder: 'asc' } },
+  images: true,
+  bus: true,
+  package: true,
+  services: { include: { service: true } },
+  visits: { orderBy: { sortOrder: 'asc' } },
+  accommodations: true,
+  hotelBookings: { where: { status: 'CONFIRMED' }, orderBy: { number: 'asc' }, select: { hotelId: true } },
+  reverseTrip: { select: { id: true, tripCode: true, tripStatus: true } },
+  reverseOf: { select: { id: true, tripCode: true, departureTime: true } },
+  drivers: { include: { user: STAFF_USER_SELECT } },
+  supervisors: { include: { user: STAFF_USER_SELECT } },
+  _count: { select: { bookings: true } },
+} satisfies Prisma.TripInclude;
+
+type RentActor = { permissions: string[] };
+
+/** The list reaches many sections through their trip filters, but rent belongs to those who manage trips or see the rates. */
+const withoutRentFor = <T extends { busRentalPrice?: unknown }>(actor: RentActor, trip: T) =>
+  actor.permissions.includes('buses.rates') || actor.permissions.includes('trips.manage') ? trip : { ...trip, busRentalPrice: undefined };
+
+const INTERNAL_TRIP_FIELDS = [
+  'busRentalPrice',
+  'reverseEnabled',
+  'reverseReadyAnnouncedAt',
+  'reverseOpenPercent',
+  'reverseDepartureAt',
+  'reversePrice',
+  'channelBranch',
+  'housingPrice',
+  'privateRoomPrice',
+  'privateRoomCapacity',
+  'sharedRoomCapacity',
+  'housingPriceMode',
+  'privateRoomPriceBasis',
+  'housingPricePeriod',
+  'crewOpensBeforeMinutes',
+  'boardingOpensBeforeMinutes',
+  'boardingClosesAfterMinutes',
+  'unpaidBoarding',
+  'crewOpenAnnouncedAt',
+  'boardingOpenAnnouncedAt',
+  'boardingCloseAnnouncedAt',
+  'scheduleType',
+  'recurrenceCalendar',
+  'recurrenceDoneAt',
+] as const;
+
+/** Costs and planning settings stay out of the customer-facing API. */
+export const toPublicTrip = <T extends object>(trip: T) => {
+  const copy = { ...trip } as unknown as Record<string, unknown>;
+  for (const field of INTERNAL_TRIP_FIELDS) delete copy[field];
+  // The hotel's services arrive as join rows; customers get the services themselves.
+  if (Array.isArray(copy.hotelBookings)) {
+    copy.hotelBookings = (copy.hotelBookings as { hotel?: { services: { service: PublicService }[] } }[]).map((row) =>
+      row.hotel?.services ? { ...row, hotel: withHotelServices(row.hotel) } : row,
+    );
+  }
+  return copy as unknown as Omit<T, (typeof INTERNAL_TRIP_FIELDS)[number]>;
+};
+
+type PricedTrip = HousingTerms & { price: Prisma.Decimal; bookingType: string; package?: { price: Prisma.Decimal } | null; accommodations?: { nights: number | null }[] };
+
+/** A package's price is all-inclusive, so its trips charge nothing more for housing. */
+const housingOfferOf = (trip: PricedTrip) => {
+  if (trip.package || !includesHousing(trip.bookingType)) return null;
+  const added = trip.housingPriceMode === 'ADDED_TO_BASE';
+  return {
+    addedToBase: added,
+    bedPrice: added && trip.housingPrice !== null ? Number(trip.housingPrice) : null,
+    privateRoomPrice: trip.privateRoomPrice === null ? null : Number(trip.privateRoomPrice),
+    privateRoomPriceBasis: trip.privateRoomPriceBasis,
+    privateRoomCapacity: trip.privateRoomCapacity,
+    period: trip.housingPricePeriod,
+  };
+};
+
+const withSeatPrice = <T extends PricedTrip>(trip: T) => {
+  const pricePerSeat = Number(trip.package?.price ?? trip.price);
+  const offer = housingOfferOf(trip);
+  return {
+    ...trip,
+    pricePerSeat,
+    housingOffer: offer,
+    startingPrice: offer ? startingSeatPrice(pricePerSeat, trip, trip.accommodations?.[0]?.nights ?? 1) : pricePerSeat,
+  };
+};
+
+interface TripSearchFilters {
+  origin?: string;
+  destination?: string;
+  date?: string;
+  busType?: string;
+  bookingType?: string;
+  packageId?: string;
+}
+
+type OutboundTimes = { direction: string; departureTime: Date; arrivalTime: Date; estimatedArrivalAt: Date | null };
+
+/** When the bus reaches the destination. A round trip's arrivalTime is the end of its return, so without an estimate only its departure is known. */
+const reachesDestinationAt = (trip: OutboundTimes) =>
+  trip.estimatedArrivalAt ?? (trip.direction === 'ONE_WAY' ? trip.arrivalTime : trip.departureTime);
+
+const sameMembers = (a: string[], b: string[]) => a.length === b.length && a.every((id) => b.includes(id));
+
+/** A package's trips go on sale with it: while the package is a draft or archived, its trips stay out of the app. */
+const ON_SALE_PACKAGE: Prisma.TripWhereInput = { OR: [{ packageId: null }, { package: { status: 'PUBLISHED' } }] };
+
+/** The trips a customer can find and book in the app, narrowed to what they searched for. */
+export function appTripWhere(filters: Pick<TripSearchFilters, 'origin' | 'destination' | 'date'>): Prisma.TripWhereInput {
+  const now = new Date();
+  const where: Prisma.TripWhereInput = { tripStatus: 'PUBLISHED', channelApp: true, departureTime: { gt: now }, AND: [ON_SALE_PACKAGE] };
+  if (filters.origin) where.origin = { contains: filters.origin, mode: 'insensitive' };
+  if (filters.destination) where.destination = { contains: filters.destination, mode: 'insensitive' };
+  if (filters.date) {
+    const range = riyadhDayRange(filters.date);
+    if (!range) throw new BadRequestException('صيغة التاريخ غير صحيحة');
+    where.departureTime = { gte: range.start > now ? range.start : now, lt: range.end };
+  }
+  return where;
+}
+
+/** Whoever changed a trip's crew, as the assignment history names them. */
+export interface CrewActor {
+  userId: string;
+  name?: string | null;
+}
+
+@Injectable()
+export class TripsService implements OnModuleInit, OnModuleDestroy {
+  private completionTimer: NodeJS.Timeout;
+  private crewWindowTimer: NodeJS.Timeout;
+
+  constructor(
+    private prisma: PrismaService,
+    private cancellation: BookingCancellationService,
+    private loyalty: LoyaltyService,
+    private rooms: RoomAllocationService,
+    private notifications: NotificationsService,
+    private appSettings: AppSettingsService,
+    private ticketAlerts: TicketAlertsService,
+    private compensation: TicketCompensationService,
+  ) {}
+
+  onModuleInit() {
+    this.completionTimer = setInterval(() => {
+      this.completeFinishedTrips().catch((err) => console.error('Trip completion sweep failed:', err.message));
+    }, COMPLETION_SWEEP_MS);
+    this.completionTimer.unref();
+    this.crewWindowTimer = setInterval(() => {
+      this.announceCrewWindows().catch((err) => console.error('Crew window sweep failed:', err.message));
+      this.announceReverseReady().catch((err) => console.error('Reverse trip sweep failed:', err.message));
+    }, CREW_WINDOW_SWEEP_MS);
+    this.crewWindowTimer.unref();
+  }
+
+  onModuleDestroy() {
+    clearInterval(this.completionTimer);
+    clearInterval(this.crewWindowTimer);
+  }
+
+  /** Tells the crew when their trip opens and when boarding opens and closes; each moment is announced once per trip. */
+  async announceCrewWindows() {
+    const now = Date.now();
+    const trips = await this.prisma.trip.findMany({
+      where: {
+        tripStatus: 'PUBLISHED',
+        departureTime: { lte: new Date(now + MAX_CREW_OPENS_BEFORE_MINUTES * 60_000) },
+        OR: [{ crewOpenAnnouncedAt: null }, { boardingOpenAnnouncedAt: null }, { boardingCloseAnnouncedAt: null }],
+      },
+      select: { id: true, crewOpenAnnouncedAt: true, boardingOpenAnnouncedAt: true, boardingCloseAnnouncedAt: true, ...CREW_WINDOW_SELECT },
+    });
+
+    for (const trip of trips) {
+      const window = crewWindow(trip, now);
+      const hasClosed = now > window.boardingClosesAt.getTime();
+      const moments = [
+        { flag: 'crewOpenAnnouncedAt', isPending: !trip.crewOpenAnnouncedAt, isDue: window.isTripOpen, event: 'CREW_TRIP_OPENED', stillRelevant: !hasClosed },
+        { flag: 'boardingOpenAnnouncedAt', isPending: !trip.boardingOpenAnnouncedAt, isDue: now >= window.boardingOpensAt.getTime(), event: 'CREW_BOARDING_OPENED', stillRelevant: !hasClosed },
+        { flag: 'boardingCloseAnnouncedAt', isPending: !trip.boardingCloseAnnouncedAt, isDue: hasClosed, event: 'CREW_BOARDING_CLOSED', stillRelevant: true },
+      ] as const;
+
+      for (const moment of moments) {
+        if (!moment.isPending || !moment.isDue) continue;
+        await this.prisma.$transaction(async (tx) => {
+          // Claiming the moment first keeps a second server instance from announcing it again.
+          const claimed = await tx.trip.updateMany({ where: { id: trip.id, [moment.flag]: null }, data: { [moment.flag]: new Date(now) } });
+          if (claimed.count === 1 && moment.stillRelevant) {
+            await this.notifications.toTripCrew(tx, moment.event, trip.id, {
+              extra: { boardingClosesTime: formatRiyadhTime(window.boardingClosesAt), boardingOpensTime: formatRiyadhTime(window.boardingOpensAt) },
+            });
+          }
+          // With no word from the crew, the clock is what stops a ticket, so customers hear it from here.
+          if (claimed.count === 1 && moment.flag === 'boardingCloseAnnouncedAt') await this.ticketAlerts.announce(tx, trip.id);
+        }, TRIP_TX_OPTIONS);
+      }
+    }
+  }
+
+  /** Opening a reverse is a person's decision, so whoever can make it is told, once, when the trip reaches its percent. */
+  async announceReverseReady() {
+    const now = new Date();
+    const trips = await this.prisma.trip.findMany({
+      where: { reverseEnabled: true, tripStatus: 'PUBLISHED', reverseReadyAnnouncedAt: null, reverseTrip: null, reverseDepartureAt: { gt: now } },
+      select: { id: true, totalSeats: true, availableSeats: true, reverseOpenPercent: true },
+    });
+    for (const trip of trips) {
+      if (trip.totalSeats === 0 || ((trip.totalSeats - trip.availableSeats) / trip.totalSeats) * 100 < trip.reverseOpenPercent) continue;
+      await this.prisma.$transaction(async (tx) => {
+        const claimed = await tx.trip.updateMany({ where: { id: trip.id, reverseReadyAnnouncedAt: null }, data: { reverseReadyAnnouncedAt: now } });
+        if (claimed.count === 1) await this.notifications.toStaff(tx, 'REVERSE_TRIP_READY', ['trips.manage'], {}, { tripId: trip.id });
+      }, TRIP_TX_OPTIONS);
+    }
+  }
+
+  /** The crew cannot board anyone before the trip is open to them, and boarding needs a moment to be open at all. */
+  private assertCrewWindowSettings(settings: { crewOpensBeforeMinutes: number; boardingOpensBeforeMinutes: number; boardingClosesAfterMinutes: number }) {
+    if (settings.boardingOpensBeforeMinutes > settings.crewOpensBeforeMinutes) {
+      throw new BadRequestException('لا يمكن فتح الصعود قبل فتح الرحلة للطاقم');
+    }
+    if (settings.boardingOpensBeforeMinutes === 0 && settings.boardingClosesAfterMinutes === 0) {
+      throw new BadRequestException('حدد مدة يكون فيها الصعود مفتوحًا');
+    }
+  }
+
+  async completeFinishedTrips() {
+    const now = Date.now();
+    const graceHours = await this.appSettings.number('trackingClosesAfterHours');
+    // A late bus the crew still reports as moving stays open, so they can still report its arrival; only a bus gone silent long past the limit is closed.
+    const completed = await this.prisma.trip.updateMany({
+      where: {
+        tripStatus: 'PUBLISHED',
+        OR: [
+          // Arrival completes a trip at once; this also closes any left open from before that rule.
+          { liveStatus: 'ARRIVED' },
+          { arrivalTime: { lt: new Date(now) }, liveStatus: { notIn: ['AT_POINT', 'ON_ROAD'] } },
+          { arrivalTime: { lt: new Date(now - graceHours * 60 * 60 * 1000) } },
+        ],
+      },
+      data: { tripStatus: 'COMPLETED' },
+    });
+    await this.loyalty.settleCompletedTrips();
+    await this.compensation.compensateFinishedTrips();
+    await this.draftNextFixedTrips();
+    return completed;
+  }
+
+  /**
+   * Once a fixed trip's date has passed, next year's copy waits as a draft for an employee to review and publish.
+   * A cancelled year still counts, since only that year was called off; changing the trip to temporary ends the series.
+   */
+  async draftNextFixedTrips() {
+    const due = await this.prisma.trip.findMany({
+      where: { scheduleType: 'FIXED', recurrenceCalendar: { not: null }, recurrenceDoneAt: null, arrivalTime: { lt: new Date() } },
+      select: { id: true },
+    });
+    for (const { id } of due) {
+      try {
+        await this.prisma.$transaction((tx) => this.draftNextOccurrence(tx, id), TRIP_TX_OPTIONS);
+      } catch (err) {
+        // One trip that cannot be copied must not hold back the others; the next sweep tries it again.
+        console.error(`Could not draft next year's copy of trip ${id}:`, err.message);
+      }
+    }
+  }
+
+  private async nextTripCode(db: Prisma.TransactionClient) {
+    const trips = await db.trip.findMany({ where: { tripCode: { startsWith: 'R' } }, select: { tripCode: true } });
+    const highest = trips.reduce((top, { tripCode }) => Math.max(top, /^R\d+$/.test(tripCode) ? Number(tripCode.slice(1)) : 0), 0);
+    return `R${String(highest + 1).padStart(3, '0')}`;
+  }
+
+  /** Copies everything except the bus and crew, which are assigned for each year, and the rent that came with the bus. */
+  private async draftNextOccurrence(tx: Prisma.TransactionClient, id: string) {
+    // Claiming first keeps a second server instance from drafting the same trip again, and a deleted draft from coming back.
+    const claimed = await tx.trip.updateMany({ where: { id, recurrenceDoneAt: null }, data: { recurrenceDoneAt: new Date() } });
+    if (claimed.count === 0) return;
+
+    const source = await tx.trip.findUniqueOrThrow({
+      where: { id },
+      include: {
+        images: true,
+        boardingPoints: true,
+        itineraryStops: true,
+        services: { where: { fromBus: false } },
+        visits: { orderBy: { sortOrder: 'asc' } },
+        accommodations: true,
+        hotelBookings: { where: { status: 'CONFIRMED' }, orderBy: { number: 'asc' }, include: { hotel: { select: { isActive: true } } } },
+      },
+    });
+
+    let departure = source.departureTime;
+    do departure = nextYearlyDate(departure, source.recurrenceCalendar);
+    while (departure <= new Date());
+    const moved = departure.getTime() - source.departureTime.getTime();
+    const shift = <T extends Date | null>(date: T) => (date ? new Date(date.getTime() + moved) : null) as T;
+
+    const draft = await tx.trip.create({
+      data: {
+        tripCode: await this.nextTripCode(tx),
+        title: source.title,
+        origin: source.origin,
+        destination: source.destination,
+        departureStation: source.departureStation,
+        departureTime: departure,
+        arrivalTime: shift(source.arrivalTime),
+        estimatedArrivalAt: shift(source.estimatedArrivalAt),
+        hijriDate: toHijriLabel(departure),
+        busType: source.busType,
+        price: source.price,
+        totalSeats: BUS_SEAT_COUNT,
+        availableSeats: BUS_SEAT_COUNT,
+        maxSeatsPerBooking: source.maxSeatsPerBooking,
+        miqat: source.miqat,
+        crewOpensBeforeMinutes: source.crewOpensBeforeMinutes,
+        boardingOpensBeforeMinutes: source.boardingOpensBeforeMinutes,
+        boardingClosesAfterMinutes: source.boardingClosesAfterMinutes,
+        unpaidBoarding: source.unpaidBoarding,
+        tripStatus: 'DRAFT',
+        scheduleType: 'FIXED',
+        recurrenceCalendar: source.recurrenceCalendar,
+        direction: source.direction,
+        bookingType: source.bookingType,
+        packageId: source.packageId,
+        housingPrice: source.housingPrice,
+        privateRoomPrice: source.privateRoomPrice,
+        privateRoomCapacity: source.privateRoomCapacity,
+        sharedRoomCapacity: source.sharedRoomCapacity,
+        housingPriceMode: source.housingPriceMode,
+        privateRoomPriceBasis: source.privateRoomPriceBasis,
+        housingPricePeriod: source.housingPricePeriod,
+        reverseEnabled: source.reverseEnabled,
+        reverseOpenPercent: source.reverseOpenPercent,
+        reverseDepartureAt: shift(source.reverseDepartureAt),
+        reversePrice: source.reversePrice,
+        channelApp: source.channelApp,
+        channelBranch: source.channelBranch,
+        seats: { createMany: { data: BUS_SEAT_NUMBERS.map((seatNumber) => ({ seatNumber })) } },
+        images: { create: source.images.map(({ url }) => ({ url })) },
+        boardingPoints: { create: source.boardingPoints.map(({ name, time, address, lat, lng }) => ({ name, time, address, lat, lng })) },
+        itineraryStops: { create: source.itineraryStops.map(({ title, time, desc, kind, sortOrder }) => ({ title, time, desc, kind, sortOrder })) },
+        services: { create: source.services.map(({ serviceId }) => ({ serviceId })) },
+        visits: {
+          create: source.visits.map(({ title, desc, imageUrl, lat, lng, visitDate, expectedTime, duration, sortOrder }) => ({
+            title, desc, imageUrl, lat, lng, expectedTime, duration, sortOrder, visitDate: shift(visitDate),
+          })),
+        },
+        accommodations: {
+          create: source.accommodations.map(({ name, nights, details, checkInDate, checkOutDate }) => ({
+            name, nights, details, checkInDate: shift(checkInDate), checkOutDate: shift(checkOutDate),
+          })),
+        },
+      },
+    });
+
+    for (const stay of source.hotelBookings) {
+      if (!stay.hotel.isActive) continue;
+      const nights = Math.round((stay.checkOut.getTime() - stay.checkIn.getTime()) / (24 * 60 * 60 * 1000));
+      await this.rooms.openForTrip(tx, draft, stay.hotelId, nights);
+    }
+    await this.notifications.toStaff(tx, 'STAFF_FIXED_TRIP_DRAFTED', ['trips.manage'], {}, { tripId: draft.id });
+  }
+
+  private resolveSchedule(scheduleType: 'TEMPORARY' | 'FIXED', calendar: 'HIJRI' | 'GREGORIAN' | null | undefined) {
+    if (scheduleType === 'TEMPORARY') return { scheduleType, recurrenceCalendar: null };
+    if (!calendar) throw new BadRequestException('حدد تقويم تكرار الرحلة الثابتة: هجري أو ميلادي');
+    return { scheduleType, recurrenceCalendar: calendar };
+  }
+
+  async searchTrips(filters: TripSearchFilters) {
+    const where = appTripWhere(filters);
+    if (filters.busType) where.busType = filters.busType;
+    if (filters.bookingType) where.bookingType = filters.bookingType;
+    if (filters.packageId) where.packageId = filters.packageId;
+
+    const trips = await this.prisma.trip.findMany({
+      where,
+      orderBy: { departureTime: 'asc' },
+      take: 100,
+      include: PUBLIC_TRIP_INCLUDE,
+    });
+    return trips.map((trip) => toPublicTrip(withSeatPrice(trip)));
+  }
+
+  /**
+   * What the app's search can offer right now, read from the trips on sale: the trip types staff created,
+   * whether packages exist, each departure city with where its buses gather, and the routes between cities.
+   * Tabs and city lists follow this, so a new type or route appears in the app as soon as a trip uses it.
+   */
+  async searchOptions() {
+    const trips = await this.prisma.trip.findMany({
+      where: appTripWhere({}),
+      select: { origin: true, destination: true, bookingType: true, packageId: true, boardingPoints: { select: { lat: true, lng: true } } },
+      orderBy: { departureTime: 'asc' },
+      take: 2000,
+    });
+    const typeCounts = new Map<string, number>();
+    const origins = new Map<string, { lat: number; lng: number; points: number }>();
+    const routes = new Map<string, { origin: string; destination: string; bookingType: string; isPackage: boolean }>();
+    for (const trip of trips) {
+      typeCounts.set(trip.bookingType, (typeCounts.get(trip.bookingType) ?? 0) + 1);
+      const place = origins.get(trip.origin) ?? { lat: 0, lng: 0, points: 0 };
+      for (const point of trip.boardingPoints) {
+        if (point.lat === null || point.lng === null) continue;
+        place.lat += point.lat;
+        place.lng += point.lng;
+        place.points += 1;
+      }
+      origins.set(trip.origin, place);
+      const isPackage = !!trip.packageId;
+      routes.set(`${trip.origin}|${trip.destination}|${trip.bookingType}|${isPackage}`, { origin: trip.origin, destination: trip.destination, bookingType: trip.bookingType, isPackage });
+    }
+    return {
+      // In the order staff know them, and only the ones a customer can book today.
+      types: BOOKING_TYPES.filter((type) => typeCounts.has(type)).map((type) => ({ key: type, label: BOOKING_TYPE_LABELS[type] ?? type, trips: typeCounts.get(type) })),
+      hasPackages: trips.some((trip) => trip.packageId),
+      // The centre of a city's gathering points, so the app can tell which city a customer is in; null when none has a map pin.
+      origins: [...origins.entries()].map(([name, place]) => ({
+        name,
+        lat: place.points ? place.lat / place.points : null,
+        lng: place.points ? place.lng / place.points : null,
+      })),
+      routes: [...routes.values()],
+    };
+  }
+
+  async getNextAvailableDate(filters: TripSearchFilters & { after?: string }) {
+    const after = filters.after ? riyadhDayRange(filters.after)?.end : undefined;
+    const now = new Date();
+    const trip = await this.prisma.trip.findFirst({
+      where: {
+        tripStatus: 'PUBLISHED',
+        channelApp: true,
+        ...ON_SALE_PACKAGE,
+        departureTime: { gt: after && after > now ? after : now },
+        availableSeats: { gt: 0 },
+        ...(filters.origin && { origin: { contains: filters.origin, mode: 'insensitive' as const } }),
+        ...(filters.destination && { destination: { contains: filters.destination, mode: 'insensitive' as const } }),
+        ...(filters.bookingType && { bookingType: filters.bookingType }),
+      },
+      orderBy: { departureTime: 'asc' },
+      select: { departureTime: true },
+    });
+    return { departureTime: trip?.departureTime ?? null };
+  }
+
+  async getAllAdminTrips(actor: RentActor) {
+    const trips = await this.prisma.trip.findMany({
+      orderBy: { departureTime: 'desc' },
+      include: ADMIN_TRIP_INCLUDE,
+    });
+    return trips.map((trip) => withoutRentFor(actor, withSeatPrice(trip)));
+  }
+
+  async getAdminTripById(actor: RentActor, id: string) {
+    const trip = await this.prisma.trip.findUnique({ where: { id }, include: ADMIN_TRIP_INCLUDE });
+    if (!trip) throw new NotFoundException('Trip not found');
+    return withoutRentFor(actor, withSeatPrice(trip));
+  }
+
+  async getTripById(id: string) {
+    const trip = await this.prisma.trip.findFirst({
+      where: { id, tripStatus: 'PUBLISHED', channelApp: true, ...ON_SALE_PACKAGE },
+      include: PUBLIC_TRIP_INCLUDE,
+    });
+    if (!trip) throw new NotFoundException('Trip not found');
+    return toPublicTrip(withSeatPrice(trip));
+  }
+
+  private async assertAssignableStaff(db: Prisma.TransactionClient, userIds: string[] = []) {
+    if (userIds.length === 0) return;
+    const staff = await db.user.count({
+      where: {
+        id: { in: userIds },
+        role: { not: 'PASSENGER' },
+        blockedAt: null,
+        NOT: [{ driverProfile: { is: { isActive: false } } }, { employeeProfile: { is: { status: { in: ['TERMINATED', 'SUSPENDED'] } } } }],
+      },
+    });
+    if (staff !== new Set(userIds).size) {
+      throw new BadRequestException('لا يمكن الإسناد إلا لحسابات موظفين أو سائقين نشطين');
+    }
+  }
+
+  /** The rent agreed with the bus's office for this route, or null when there is no contract price. */
+  private async contractRent(db: Prisma.TransactionClient, busId: string | null | undefined, origin: string, destination: string) {
+    if (!busId) return null;
+    const rate = await db.busOfficeRate.findFirst({
+      where: { origin: origin.trim(), destination: destination.trim(), office: { buses: { some: { id: busId } } } },
+      select: { price: true },
+    });
+    return rate?.price ?? null;
+  }
+
+  private async assertNoScheduleConflict(
+    db: Prisma.TransactionClient,
+    window: { busId?: string | null; driverIds: string[]; supervisorIds: string[]; start: Date; end: Date; excludeTripIds?: string[]; leaveCheckIds?: string[] },
+  ) {
+    const people = [...window.driverIds, ...window.supervisorIds];
+    const resources: Prisma.TripWhereInput[] = [];
+    if (window.busId) resources.push({ busId: window.busId });
+    if (people.length > 0) {
+      resources.push({ drivers: { some: { userId: { in: people } } } });
+      resources.push({ supervisors: { some: { userId: { in: people } } } });
+    }
+    if (resources.length === 0) return;
+
+    const clash = await db.trip.findFirst({
+      where: {
+        id: window.excludeTripIds?.length ? { notIn: window.excludeTripIds } : undefined,
+        tripStatus: { in: ['DRAFT', 'PUBLISHED'] },
+        departureTime: { lt: window.end },
+        arrivalTime: { gt: window.start },
+        OR: resources,
+      },
+      select: { tripCode: true },
+    });
+    if (clash) {
+      throw new ConflictException(`الحافلة أو الطاقم مسند لرحلة أخرى في نفس الوقت (${clash.tripCode})`);
+    }
+
+    // Approved leave counts in Riyadh calendar days, so any day the trip touches is a day the person must be at work.
+    const checkLeave = window.leaveCheckIds ?? people;
+    if (checkLeave.length > 0) {
+      const away = await db.leaveRequest.findFirst({
+        where: { userId: { in: checkLeave }, status: 'APPROVED', startDate: { lte: new Date(`${riyadhDate(window.end)}T00:00:00.000Z`) }, endDate: { gte: new Date(`${riyadhDate(window.start)}T00:00:00.000Z`) } },
+        select: { user: { select: { name: true } }, startDate: true, endDate: true },
+      });
+      if (away) {
+        const range = `${away.startDate.toISOString().slice(0, 10)} إلى ${away.endDate.toISOString().slice(0, 10)}`;
+        throw new ConflictException(`${away.user.name ?? 'أحد الطاقم'} في إجازة معتمدة من ${range}، اختر غيره أو عدّل إجازته`);
+      }
+    }
+  }
+
+  private async resolveBus(db: Prisma.TransactionClient, busId?: string | null) {
+    if (!busId) return null;
+    const bus = await db.bus.findUnique({ where: { id: busId } });
+    if (!bus) throw new BadRequestException('الحافلة المحددة غير موجودة');
+    if (bus.status !== 'ACTIVE') throw new ConflictException('الحافلة المحددة غير متاحة للتشغيل');
+    return bus;
+  }
+
+  private assertReverseSettings(
+    settings: { enabled: boolean; departureAt?: Date | null; price?: number | Prisma.Decimal | null },
+    outbound: OutboundTimes,
+  ) {
+    if (!settings.enabled) return;
+    if (!settings.departureAt || settings.price == null) {
+      throw new BadRequestException('حدد موعد انطلاق الرحلة العكسية وسعر مقعدها');
+    }
+    this.assertReverseAfterOutbound(settings.departureAt, outbound);
+  }
+
+  /** The bus cannot start back before it has arrived. */
+  private assertReverseAfterOutbound(reverseDeparture: Date, outbound: OutboundTimes) {
+    if (reverseDeparture <= reachesDestinationAt(outbound)) {
+      throw new BadRequestException('موعد الرحلة العكسية يجب أن يكون بعد وصول رحلة الذهاب');
+    }
+  }
+
+  /** Stores photos by their own bytes, refusing the whole upload if any file is not an image. */
+  async saveImages(uploadedById: string, files: UploadedImage[] = []) {
+    if (files.length === 0) throw new BadRequestException('اختر صورة واحدة على الأقل');
+    const rows = files.map((file) => {
+      const mimeType = publicImageType(file.buffer);
+      if (!mimeType) throw new BadRequestException('الصور المقبولة: JPG أو PNG أو WEBP');
+      return { mimeType, size: file.size, data: file.buffer, uploadedById };
+    });
+    const saved = await this.prisma.$transaction(rows.map((data) => this.prisma.publicImage.create({ data, select: { id: true } })));
+    return saved.map(({ id }) => ({ url: `/trips/images/${id}` }));
+  }
+
+  async getImage(id: string) {
+    const image = await this.prisma.publicImage.findUnique({ where: { id } });
+    if (!image) throw new NotFoundException('Image not found');
+    return image;
+  }
+
+  private assertEstimatedArrival(estimate: Date | null, departure: Date, arrival: Date) {
+    if (!estimate) return;
+    if (estimate <= departure) throw new BadRequestException('وقت الوصول المتوقع يجب أن يكون بعد وقت الانطلاق');
+    if (estimate > arrival) throw new BadRequestException('وقت الوصول المتوقع يجب ألا يتجاوز موعد العودة');
+  }
+
+  /**
+   * Writes who joined and who left a trip's crew in one change, with who made it. The crew tables only hold who is on
+   * a trip now; this is the history behind them.
+   */
+  private async logCrew(
+    tx: Prisma.TransactionClient,
+    tripId: string,
+    before: { drivers: string[]; supervisors: string[] },
+    after: { drivers: string[]; supervisors: string[] },
+    actor?: CrewActor,
+    reason?: string,
+  ) {
+    const rows: Prisma.CrewAssignmentLogCreateManyInput[] = [];
+    const by = { byId: actor?.userId ?? null, byName: actor?.name ?? null, reason: reason ?? null };
+    for (const [role, was, now] of [['DRIVER', before.drivers, after.drivers], ['SUPERVISOR', before.supervisors, after.supervisors]] as const) {
+      for (const userId of now.filter((id) => !was.includes(id))) rows.push({ tripId, userId, role, action: 'ASSIGNED', ...by });
+      for (const userId of was.filter((id) => !now.includes(id))) rows.push({ tripId, userId, role, action: 'UNASSIGNED', ...by });
+    }
+    if (rows.length) await tx.crewAssignmentLog.createMany({ data: rows });
+  }
+
+  async createTrip(dto: CreateTripDto, actor?: CrewActor) {
+    const departure = new Date(dto.departureTime);
+    const estimatedArrivalAt = dto.estimatedArrivalAt ? new Date(dto.estimatedArrivalAt) : null;
+    // A one-way trip is over when the bus gets there, so the bus and crew are not held for longer.
+    const arrival = dto.arrivalTime ? new Date(dto.arrivalTime) : estimatedArrivalAt ?? new Date(departure.getTime() + DEFAULT_TRIP_DURATION_MS);
+    if (arrival <= departure) {
+      throw new BadRequestException('وقت الوصول يجب أن يكون بعد وقت الانطلاق');
+    }
+    this.assertEstimatedArrival(estimatedArrivalAt, departure, arrival);
+    if (dto.tripStatus && !['DRAFT', 'PUBLISHED'].includes(dto.tripStatus)) {
+      throw new BadRequestException('تُنشأ الرحلة مسودة أو منشورة فقط');
+    }
+    if (dto.tripStatus === 'PUBLISHED' && departure <= new Date()) {
+      throw new BadRequestException('لا يمكن نشر رحلة موعدها في الماضي');
+    }
+    if (dto.tripStatus === 'PUBLISHED' && !dto.boardingPoints?.length) {
+      throw new BadRequestException('أضف نقطة صعود واحدة على الأقل قبل نشر الرحلة');
+    }
+    if (dto.origin.trim() === dto.destination.trim()) {
+      throw new BadRequestException('نقطة الانطلاق والوجهة يجب أن تكونا مختلفتين');
+    }
+    const reverseDepartureAt = dto.reverseDepartureAt ? new Date(dto.reverseDepartureAt) : null;
+    this.assertReverseSettings(
+      { enabled: !!dto.reverseEnabled, departureAt: reverseDepartureAt, price: dto.reversePrice },
+      { direction: dto.direction ?? 'ONE_WAY', departureTime: departure, arrivalTime: arrival, estimatedArrivalAt },
+    );
+    this.assertHousingTerms(dto.bookingType ?? 'TRANSPORT_ONLY', {
+      housingPrice: dto.housingPrice ?? null,
+      privateRoomPrice: dto.privateRoomPrice ?? null,
+      privateRoomCapacity: dto.privateRoomCapacity ?? null,
+      housingPriceMode: dto.housingPriceMode ?? 'INCLUDED_IN_BASE',
+      privateRoomPriceBasis: dto.privateRoomPriceBasis ?? 'PER_ROOM',
+      housingPricePeriod: dto.housingPricePeriod ?? 'PER_STAY',
+    });
+    const windowDefaults = await this.appSettings.numbers('defaultCrewOpensBeforeMinutes', 'defaultBoardingOpensBeforeMinutes', 'defaultBoardingClosesAfterMinutes');
+    const crewWindowSettings = {
+      crewOpensBeforeMinutes: dto.crewOpensBeforeMinutes ?? windowDefaults.defaultCrewOpensBeforeMinutes,
+      boardingOpensBeforeMinutes: dto.boardingOpensBeforeMinutes ?? windowDefaults.defaultBoardingOpensBeforeMinutes,
+      boardingClosesAfterMinutes: dto.boardingClosesAfterMinutes ?? windowDefaults.defaultBoardingClosesAfterMinutes,
+      unpaidBoarding: dto.unpaidBoarding ?? 'BLOCK',
+    };
+    this.assertCrewWindowSettings(crewWindowSettings);
+    const schedule = this.resolveSchedule(dto.scheduleType ?? 'TEMPORARY', dto.recurrenceCalendar);
+
+    return this.prisma.$transaction(async (tx) => {
+      const existing = await tx.trip.findUnique({ where: { tripCode: dto.tripCode } });
+      if (existing) {
+        throw new ConflictException(`Trip code ${dto.tripCode} already exists`);
+      }
+
+      await this.resolveBus(tx, dto.busId);
+      const pkg = dto.packageId ? await assertTripFitsPackage(tx, dto.packageId, departure) : null;
+      // A stay with no nights given lasts as long as the package it is sold under.
+      const accommodation = dto.accommodation && { ...dto.accommodation, nights: dto.accommodation.nights ?? pkg?.nights ?? undefined };
+      await this.assertAssignableStaff(tx, [...(dto.driverIds ?? []), ...(dto.supervisorIds ?? [])]);
+      await this.assertNoScheduleConflict(tx, {
+        busId: dto.busId,
+        driverIds: dto.driverIds ?? [],
+        supervisorIds: dto.supervisorIds ?? [],
+        start: departure,
+        end: arrival,
+      });
+
+
+      const pickedServices = [...new Set(dto.serviceIds ?? [])];
+      const serviceRows = [
+        ...pickedServices.map((serviceId) => ({ serviceId })),
+        ...(await busServiceRows(tx, dto.busId)).filter((row) => !pickedServices.includes(row.serviceId)),
+      ];
+
+      const trip = await tx.trip.create({
+        data: {
+          tripCode: dto.tripCode,
+          title: dto.title || 'رحلة عمرة',
+          origin: dto.origin,
+          destination: dto.destination,
+          departureStation: dto.departureStation?.trim() || null,
+          departureTime: departure,
+          arrivalTime: arrival,
+          estimatedArrivalAt,
+          hijriDate: dto.hijriDate || toHijriLabel(departure),
+          busType: dto.busType || 'VIP 2+1',
+          price: dto.price,
+          totalSeats: BUS_SEAT_COUNT,
+          availableSeats: BUS_SEAT_COUNT,
+          maxSeatsPerBooking: dto.maxSeatsPerBooking ?? 5,
+          ...crewWindowSettings,
+          miqat: dto.miqat || 'ميقات قرن المنازل',
+          tripStatus: dto.tripStatus || 'DRAFT',
+          ...schedule,
+          direction: dto.direction || 'ONE_WAY',
+          bookingType: dto.bookingType || 'TRANSPORT_ONLY',
+          busId: dto.busId || null,
+          packageId: dto.packageId || null,
+          busRentalPrice: dto.busRentalPrice ?? (await this.contractRent(tx, dto.busId, dto.origin, dto.destination)),
+          housingPrice: dto.housingPrice ?? null,
+          privateRoomPrice: dto.privateRoomPrice ?? null,
+          privateRoomCapacity: dto.privateRoomCapacity ?? null,
+          sharedRoomCapacity: dto.sharedRoomCapacity,
+          housingPriceMode: dto.housingPriceMode,
+          privateRoomPriceBasis: dto.privateRoomPriceBasis,
+          housingPricePeriod: dto.housingPricePeriod,
+          reverseEnabled: !!dto.reverseEnabled,
+          reverseOpenPercent: dto.reverseOpenPercent ?? 80,
+          reverseDepartureAt,
+          reversePrice: dto.reversePrice ?? null,
+          channelApp: dto.channelApp ?? true,
+          channelBranch: dto.channelBranch ?? true,
+          seats: {
+            createMany: { data: BUS_SEAT_NUMBERS.map((seatNumber) => ({ seatNumber })) },
+          },
+          images: dto.images?.length ? { create: dto.images.map((url) => ({ url })) } : undefined,
+          boardingPoints: dto.boardingPoints?.length
+            ? { create: dto.boardingPoints.map((bp) => this.toBoardingPoint(bp)) }
+            : undefined,
+          itineraryStops: dto.itineraryStops?.length
+            ? { create: dto.itineraryStops.map((st, idx) => this.toItineraryStop(st, idx)) }
+            : undefined,
+          services: serviceRows.length ? { create: serviceRows } : undefined,
+          visits: dto.visits?.length ? { create: dto.visits.map((v, idx) => this.toVisit(v, idx)) } : undefined,
+          accommodations: accommodation ? { create: this.toAccommodation(accommodation) } : undefined,
+          drivers: dto.driverIds?.length
+            ? { create: dto.driverIds.map((userId, idx) => ({ userId, isPrimary: idx === 0 })) }
+            : undefined,
+          supervisors: dto.supervisorIds?.length
+            ? { create: dto.supervisorIds.map((userId, idx) => ({ userId, isPrimary: idx === 0 })) }
+            : undefined,
+        },
+        include: ADMIN_TRIP_INCLUDE,
+      });
+      if (accommodation?.hotelId && includesHousing(trip.bookingType)) {
+        await this.rooms.openForTrip(tx, trip, accommodation.hotelId, accommodation.nights ?? 1);
+      }
+      await this.logCrew(tx, trip.id, { drivers: [], supervisors: [] }, { drivers: dto.driverIds ?? [], supervisors: dto.supervisorIds ?? [] }, actor);
+      // Crew only see published trips, so a draft is announced when it is published.
+      if (trip.tripStatus === 'PUBLISHED') await this.notifications.toTripCrew(tx, 'CREW_TRIP_ASSIGNED', trip.id);
+      return withSeatPrice(trip);
+    }, TRIP_TX_OPTIONS);
+  }
+
+  private toBoardingPoint(bp: CreateTripDto['boardingPoints'][number]) {
+    return { name: bp.name, time: bp.time, address: bp.address || '', lat: bp.lat ?? null, lng: bp.lng ?? null };
+  }
+
+  private toItineraryStop(st: CreateTripDto['itineraryStops'][number], sortOrder: number) {
+    return { title: st.title, time: st.time, desc: st.desc || '', kind: st.kind ?? 'STOP', sortOrder };
+  }
+
+  private toVisit(v: CreateTripDto['visits'][number], sortOrder: number) {
+    return {
+      title: v.title,
+      desc: v.desc || '',
+      imageUrl: v.imageUrl || null,
+      lat: v.lat ?? null,
+      lng: v.lng ?? null,
+      visitDate: v.visitDate ? new Date(v.visitDate) : null,
+      expectedTime: v.expectedTime || null,
+      duration: v.duration || null,
+      sortOrder,
+    };
+  }
+
+  private assertHousingTerms(bookingType: string, terms: HousingTerms) {
+    if (!includesHousing(bookingType)) return;
+    if (terms.privateRoomPrice !== null && terms.privateRoomPriceBasis === 'PER_ROOM' && !terms.privateRoomCapacity) {
+      throw new BadRequestException('حدد سعة الغرفة الخاصة ليُحسب عدد الغرف');
+    }
+    if (terms.housingPriceMode === 'ADDED_TO_BASE' && terms.housingPrice === null && terms.privateRoomPrice === null) {
+      throw new BadRequestException('أدخل سعر السكن، لأنه يضاف إلى السعر الأساسي');
+    }
+  }
+
+  private toAccommodation(a: CreateTripDto['accommodation']) {
+    return {
+      nights: a.nights ?? 1,
+      name: a.name,
+      details: a.details || '',
+      checkInDate: a.checkInDate ? new Date(a.checkInDate) : null,
+      checkOutDate: a.checkOutDate ? new Date(a.checkOutDate) : null,
+    };
+  }
+
+  /**
+   * The only status moves an edit may make. Cancelling has its own action that handles the bookings, and the sweep
+   * completes trips on its own once they arrive; an employee may complete one early, but only after it has left.
+   */
+  private async assertStatusChange(
+    existing: { tripStatus: string; departureTime: Date; _count: { boardingPoints: number } },
+    dto: UpdateTripDto,
+    now: Date,
+    hasSales: () => Promise<boolean>,
+  ) {
+    const from = existing.tripStatus;
+    const to = dto.tripStatus ?? from;
+    const pointsAfter = dto.boardingPoints ? dto.boardingPoints.length : existing._count.boardingPoints;
+    if (to === 'PUBLISHED' && pointsAfter === 0 && (from !== 'PUBLISHED' || dto.boardingPoints)) {
+      throw new BadRequestException('أضف نقطة صعود واحدة على الأقل قبل نشر الرحلة');
+    }
+    if (to === from) return;
+    if (from === 'COMPLETED') throw new ConflictException('لا يمكن تغيير حالة رحلة مكتملة');
+    if (from === 'DRAFT' && to === 'PUBLISHED') return;
+    if (from === 'PUBLISHED' && to === 'DRAFT') {
+      if (await hasSales()) throw new ConflictException('لا يمكن إرجاع رحلة لها حجوزات إلى مسودة. ألغِ الرحلة أو أغلق قنوات الحجز بدلًا من ذلك');
+      return;
+    }
+    if (from === 'PUBLISHED' && to === 'COMPLETED') {
+      if (existing.departureTime > now) throw new ConflictException('لا يمكن إكمال رحلة قبل انطلاقها');
+      return;
+    }
+    throw new BadRequestException('لا يمكن نقل الرحلة إلى هذه الحالة');
+  }
+
+  async updateTrip(id: string, dto: UpdateTripDto, actor?: CrewActor, reason?: string) {
+    if (dto.tripStatus === 'CANCELLED') {
+      throw new BadRequestException('استخدم إجراء إلغاء الرحلة حتى تُعالج حجوزاتها');
+    }
+
+    return this.prisma.$transaction(async (tx) => {
+      // Bookings take this lock too, so none can be sold between the checks below and the save.
+      await lockTripsWithLinked(tx, [id]);
+      const existing = await tx.trip.findUnique({
+        where: { id },
+        include: {
+          drivers: true,
+          supervisors: true,
+          accommodations: true,
+          reverseTrip: { include: { drivers: true, supervisors: true } },
+          reverseOf: { select: { direction: true, departureTime: true, arrivalTime: true, estimatedArrivalAt: true } },
+          _count: { select: { boardingPoints: true } },
+        },
+      });
+      if (!existing) throw new NotFoundException('Trip not found');
+      if (existing.tripStatus === 'CANCELLED') {
+        throw new ConflictException('لا يمكن تعديل رحلة ملغاة');
+      }
+      // A cancelled reverse sells nothing, so the outbound is free again: its direction can be corrected and the reverse opened anew.
+      const openReverse = existing.reverseTrip && existing.reverseTrip.tripStatus !== 'CANCELLED' ? existing.reverseTrip : null;
+      const now = new Date();
+      let soldCount: number | undefined;
+      const hasSales = async () => (soldCount ??= await tx.booking.count({ where: { tripId: id, status: { not: 'CANCELLED' } } })) > 0;
+      await this.assertStatusChange(existing, dto, now, hasSales);
+      // What was sold depends on these: a stay that was or was not included, and whether the seats are held for the way back.
+      if (dto.bookingType && includesHousing(dto.bookingType) !== includesHousing(existing.bookingType) && (await hasSales())) {
+        throw new ConflictException('لا يمكن تغيير نوع الحجز بين سكن وبدون سكن بعد بيع مقاعد في الرحلة');
+      }
+      if (dto.direction && dto.direction !== existing.direction && (await hasSales())) {
+        throw new ConflictException('لا يمكن تغيير اتجاه الرحلة بعد بيع مقاعد فيها');
+      }
+      // Until the outbound leaves, the bus is the same one both ways. Once it has left, a breakdown can leave the way back on another bus.
+      if (existing.reverseOf && dto.busId !== undefined && dto.busId !== existing.busId && existing.reverseOf.departureTime > now) {
+        throw new ConflictException('باص الرحلة العكسية يتبع رحلة الذهاب حتى انطلاقها، غيّره من رحلة الذهاب');
+      }
+      // The direction decides whether the two trips share seats, and sales already made depend on that.
+      if (openReverse && dto.direction && dto.direction !== existing.direction) {
+        throw new ConflictException('لا يمكن تغيير اتجاه رحلة لها رحلة عكسية مفتوحة. ألغِ الرحلة العكسية أولًا ثم غيّر الاتجاه وأعد فتحها');
+      }
+      if (existing.reverseOfTripId && dto.scheduleType === 'FIXED') {
+        throw new BadRequestException('الرحلة العكسية لا يمكن أن تكون ثابتة، فهي تتبع رحلة الذهاب');
+      }
+      const schedule = dto.scheduleType || dto.recurrenceCalendar
+        ? this.resolveSchedule(dto.scheduleType ?? existing.scheduleType, dto.recurrenceCalendar ?? existing.recurrenceCalendar)
+        : {};
+
+      const departure = dto.departureTime ? new Date(dto.departureTime) : existing.departureTime;
+      // A new departure with no new arrival keeps the trip's length, so moving a trip later needs only one date.
+      const arrival = dto.arrivalTime
+        ? new Date(dto.arrivalTime)
+        : new Date(existing.arrivalTime.getTime() + departure.getTime() - existing.departureTime.getTime());
+      if (arrival <= departure) {
+        throw new BadRequestException('وقت الوصول يجب أن يكون بعد وقت الانطلاق');
+      }
+      // Like the arrival, a moved departure carries the expected arrival along unless a new one was given.
+      const estimatedArrivalAt = dto.estimatedArrivalAt !== undefined
+        ? (dto.estimatedArrivalAt ? new Date(dto.estimatedArrivalAt) : null)
+        : existing.estimatedArrivalAt && new Date(existing.estimatedArrivalAt.getTime() + departure.getTime() - existing.departureTime.getTime());
+      this.assertEstimatedArrival(estimatedArrivalAt, departure, arrival);
+      const nextStatus = dto.tripStatus ?? existing.tripStatus;
+      // Only publishing or moving a trip into the past is refused. A trip already under way can still get a replacement bus or crew.
+      const departureMoved = departure.getTime() !== existing.departureTime.getTime();
+      if (nextStatus === 'PUBLISHED' && departure <= now && (existing.tripStatus !== 'PUBLISHED' || departureMoved)) {
+        throw new BadRequestException('لا يمكن نشر رحلة موعدها في الماضي');
+      }
+      if (existing.reverseOf && departureMoved) this.assertReverseAfterOutbound(departure, existing.reverseOf);
+      const crewWindowSettings = {
+        crewOpensBeforeMinutes: dto.crewOpensBeforeMinutes ?? existing.crewOpensBeforeMinutes,
+        boardingOpensBeforeMinutes: dto.boardingOpensBeforeMinutes ?? existing.boardingOpensBeforeMinutes,
+        boardingClosesAfterMinutes: dto.boardingClosesAfterMinutes ?? existing.boardingClosesAfterMinutes,
+        unpaidBoarding: dto.unpaidBoarding ?? existing.unpaidBoarding,
+      };
+      this.assertCrewWindowSettings(crewWindowSettings);
+      // New times mean new moments, so the crew hears about them again.
+      const crewWindowMoved =
+        departure.getTime() !== existing.departureTime.getTime() ||
+        crewWindowSettings.crewOpensBeforeMinutes !== existing.crewOpensBeforeMinutes ||
+        crewWindowSettings.boardingOpensBeforeMinutes !== existing.boardingOpensBeforeMinutes ||
+        crewWindowSettings.boardingClosesAfterMinutes !== existing.boardingClosesAfterMinutes;
+
+      const packageId = dto.packageId !== undefined ? dto.packageId || null : existing.packageId;
+      if (packageId && (packageId !== existing.packageId || departureMoved)) await assertTripFitsPackage(tx, packageId, departure);
+
+      const busId = dto.busId !== undefined ? dto.busId || null : existing.busId;
+      if (dto.busId !== undefined) await this.resolveBus(tx, busId);
+      // The bus may arrive after the trip went on sale, so what it allows is checked against who already booked.
+      if (busId !== existing.busId) await assertSinglesFitRange(tx, { id }, await this.appSettings.singlesRange(busId));
+      const driverIds = dto.driverIds ?? existing.drivers.map((d) => d.userId);
+      const supervisorIds = dto.supervisorIds ?? existing.supervisors.map((s) => s.userId);
+      // Only people joining the crew now are checked: someone already on it who was since suspended, or was approved
+      // leave knowing of the trip, must not stop every later edit of it.
+      const current = new Set([...existing.drivers, ...existing.supervisors].map((member) => member.userId));
+      const added = [...(dto.driverIds ?? []), ...(dto.supervisorIds ?? [])].filter((userId) => !current.has(userId));
+      await this.assertAssignableStaff(tx, added);
+      // A trip and its reverse share the bus and crew by design, so they never clash with each other.
+      const excludeTripIds = [id, existing.reverseOfTripId, existing.reverseTrip?.id].filter(Boolean);
+      await this.assertNoScheduleConflict(tx, { busId, driverIds, supervisorIds, start: departure, end: arrival, excludeTripIds, leaveCheckIds: added });
+
+      const reverseEnabled = dto.reverseEnabled ?? existing.reverseEnabled;
+      const outboundAfter = { direction: dto.direction ?? existing.direction, departureTime: departure, arrivalTime: arrival, estimatedArrivalAt };
+      const moved = departure.getTime() - existing.departureTime.getTime();
+      // Moving the outbound carries the way back along with it, unless a new time for it was given.
+      const reverseDepartureAt = dto.reverseDepartureAt
+        ? new Date(dto.reverseDepartureAt)
+        : existing.reverseDepartureAt && new Date(existing.reverseDepartureAt.getTime() + moved);
+      if (!openReverse) {
+        this.assertReverseSettings(
+          { enabled: reverseEnabled, departureAt: reverseDepartureAt, price: dto.reversePrice ?? existing.reversePrice },
+          outboundAfter,
+        );
+      }
+
+      this.assertHousingTerms(dto.bookingType ?? existing.bookingType, {
+        housingPrice: dto.housingPrice === undefined ? existing.housingPrice : dto.housingPrice,
+        privateRoomPrice: dto.privateRoomPrice === undefined ? existing.privateRoomPrice : dto.privateRoomPrice,
+        privateRoomCapacity: dto.privateRoomCapacity === undefined ? existing.privateRoomCapacity : dto.privateRoomCapacity,
+        housingPriceMode: dto.housingPriceMode ?? existing.housingPriceMode,
+        privateRoomPriceBasis: dto.privateRoomPriceBasis ?? existing.privateRoomPriceBasis,
+        housingPricePeriod: dto.housingPricePeriod ?? existing.housingPricePeriod,
+      });
+
+
+      await tx.trip.update({
+        where: { id },
+        data: {
+          tripCode: dto.tripCode,
+          title: dto.title,
+          origin: dto.origin,
+          destination: dto.destination,
+          departureStation: dto.departureStation === undefined ? undefined : dto.departureStation?.trim() || null,
+          departureTime: departure,
+          arrivalTime: arrival,
+          estimatedArrivalAt,
+          ...schedule,
+          hijriDate: dto.hijriDate ?? (dto.departureTime ? toHijriLabel(departure) : undefined),
+          busType: dto.busType,
+          price: dto.price,
+          maxSeatsPerBooking: dto.maxSeatsPerBooking,
+          ...crewWindowSettings,
+          ...(crewWindowMoved && { crewOpenAnnouncedAt: null, boardingOpenAnnouncedAt: null, boardingCloseAnnouncedAt: null }),
+          miqat: dto.miqat,
+          tripStatus: dto.tripStatus,
+          direction: dto.direction,
+          bookingType: dto.bookingType,
+          busId: dto.busId !== undefined ? busId : undefined,
+          packageId: dto.packageId !== undefined ? dto.packageId || null : undefined,
+          // An empty price picks up the contract when a bus is first chosen; a price already set is never overwritten.
+          busRentalPrice:
+            dto.busRentalPrice ??
+            (dto.busId !== undefined && existing.busRentalPrice === null
+              ? (await this.contractRent(tx, busId, dto.origin ?? existing.origin, dto.destination ?? existing.destination)) ?? undefined
+              : undefined),
+          housingPrice: dto.housingPrice,
+          privateRoomPrice: dto.privateRoomPrice,
+          privateRoomCapacity: dto.privateRoomCapacity,
+          sharedRoomCapacity: dto.sharedRoomCapacity,
+          housingPriceMode: dto.housingPriceMode,
+          privateRoomPriceBasis: dto.privateRoomPriceBasis,
+          housingPricePeriod: dto.housingPricePeriod,
+          reverseEnabled: dto.reverseEnabled,
+          reverseOpenPercent: dto.reverseOpenPercent,
+          reverseDepartureAt: reverseDepartureAt ?? undefined,
+          reversePrice: dto.reversePrice,
+          channelApp: dto.channelApp,
+          channelBranch: dto.channelBranch,
+        },
+      });
+
+      // The admin's new capacity also governs shared rooms already in use, or the supervisor would stay refused at the old one.
+      if (dto.sharedRoomCapacity !== undefined && dto.sharedRoomCapacity !== existing.sharedRoomCapacity) {
+        await tx.hotelRoom.updateMany({ where: { type: 'SHARED', hotelBooking: { tripId: id } }, data: { capacity: dto.sharedRoomCapacity } });
+      }
+
+      if (dto.boardingPoints) {
+        // Recreating the points must not make the crew lose where the bus is standing, or every ticket would start warning.
+        const standing = await tx.trip.findUnique({ where: { id }, select: { currentBoardingPoint: { select: { name: true } } } });
+        await tx.boardingPoint.deleteMany({ where: { tripId: id } });
+        await tx.boardingPoint.createMany({ data: dto.boardingPoints.map((bp) => ({ tripId: id, ...this.toBoardingPoint(bp) })) });
+        if (standing?.currentBoardingPoint) {
+          const same = await tx.boardingPoint.findFirst({ where: { tripId: id, name: standing.currentBoardingPoint.name } });
+          if (same) await tx.trip.update({ where: { id }, data: { currentBoardingPointId: same.id } });
+        }
+      }
+      if (dto.itineraryStops) {
+        await tx.itineraryStop.deleteMany({ where: { tripId: id } });
+        await tx.itineraryStop.createMany({
+          data: dto.itineraryStops.map((st, idx) => ({ tripId: id, ...this.toItineraryStop(st, idx) })),
+        });
+      }
+      if (dto.images) {
+        await tx.tripImage.deleteMany({ where: { tripId: id } });
+        await tx.tripImage.createMany({ data: dto.images.map((url) => ({ tripId: id, url })) });
+      }
+      if (busId !== existing.busId) await applyBusServices(tx, id, busId);
+      if (dto.serviceIds) {
+        // What the bus provides is not the editor's to remove, so only hand-picked services are replaced.
+        await tx.tripService.deleteMany({ where: { tripId: id, fromBus: false } });
+        await tx.tripService.createMany({ data: dto.serviceIds.map((serviceId) => ({ tripId: id, serviceId })), skipDuplicates: true });
+      }
+      if (dto.visits) {
+        await tx.tripVisit.deleteMany({ where: { tripId: id } });
+        await tx.tripVisit.createMany({ data: dto.visits.map((v, idx) => ({ tripId: id, ...this.toVisit(v, idx) })) });
+      }
+      if (dto.accommodation) {
+        await tx.accommodation.deleteMany({ where: { tripId: id } });
+        await tx.accommodation.create({ data: { tripId: id, ...this.toAccommodation(dto.accommodation) } });
+      }
+      await this.syncHotelStay(tx, existing, {
+        bookingType: dto.bookingType ?? existing.bookingType,
+        departure,
+        accommodation: dto.accommodation,
+      });
+      if (dto.driverIds) {
+        await tx.tripDriver.deleteMany({ where: { tripId: id } });
+        await tx.tripDriver.createMany({ data: dto.driverIds.map((userId, idx) => ({ tripId: id, userId, isPrimary: idx === 0 })) });
+      }
+      if (dto.supervisorIds) {
+        await tx.tripSupervisor.deleteMany({ where: { tripId: id } });
+        await tx.tripSupervisor.createMany({
+          data: dto.supervisorIds.map((userId, idx) => ({ tripId: id, userId, isPrimary: idx === 0 })),
+        });
+      }
+
+      await this.logCrew(
+        tx,
+        id,
+        { drivers: existing.drivers.map((row) => row.userId), supervisors: existing.supervisors.map((row) => row.userId) },
+        { drivers: driverIds, supervisors: supervisorIds },
+        actor,
+        reason,
+      );
+      await this.notifyTripChanges(tx, existing, { nextStatus, crewIds: [...driverIds, ...supervisorIds] });
+
+      if (openReverse?.tripStatus === 'PUBLISHED' && existing.tripStatus === 'PUBLISHED' && openReverse.departureTime > now) {
+        await this.carryOverToReverse(tx, existing, openReverse, { outboundAfter, moved, busId, driverIds, supervisorIds }, actor);
+      }
+
+      const updated = await tx.trip.findUniqueOrThrow({ where: { id }, include: ADMIN_TRIP_INCLUDE });
+      return withSeatPrice(updated);
+    }, TRIP_TX_OPTIONS);
+  }
+
+  /**
+   * An open reverse runs on the outbound's bus, so what changes there changes here too: the time moves by the same amount,
+   * and the bus and crew follow unless someone picked their own for the way back.
+   */
+  private async carryOverToReverse(
+    tx: Prisma.TransactionClient,
+    outbound: { id: string; busId: string | null; drivers: { userId: string }[]; supervisors: { userId: string }[] },
+    reverse: Prisma.TripGetPayload<{ include: { drivers: true; supervisors: true } }>,
+    change: {
+      outboundAfter: OutboundTimes;
+      moved: number;
+      busId: string | null;
+      driverIds: string[];
+      supervisorIds: string[];
+    },
+    actor?: CrewActor,
+  ) {
+    const departure = new Date(reverse.departureTime.getTime() + change.moved);
+    const arrival = new Date(reverse.arrivalTime.getTime() + change.moved);
+    const estimatedArrivalAt = reverse.estimatedArrivalAt && new Date(reverse.estimatedArrivalAt.getTime() + change.moved);
+    this.assertReverseAfterOutbound(departure, change.outboundAfter);
+
+    const followsCrew =
+      sameMembers(reverse.drivers.map((d) => d.userId), outbound.drivers.map((d) => d.userId)) &&
+      sameMembers(reverse.supervisors.map((s) => s.userId), outbound.supervisors.map((s) => s.userId));
+    const driverIds = followsCrew ? change.driverIds : reverse.drivers.map((d) => d.userId);
+    const supervisorIds = followsCrew ? change.supervisorIds : reverse.supervisors.map((s) => s.userId);
+    // A way back already moved to its own bus stays on it, like a crew picked for it.
+    const busChanged = change.busId !== outbound.busId && reverse.busId === outbound.busId;
+    const busId = busChanged ? change.busId : reverse.busId;
+    if (busChanged) await assertSinglesFitRange(tx, { id: reverse.id }, await this.appSettings.singlesRange(busId));
+
+    await this.assertNoScheduleConflict(tx, {
+      busId,
+      driverIds,
+      supervisorIds,
+      start: departure,
+      end: arrival,
+      excludeTripIds: [outbound.id, reverse.id],
+    });
+
+    const crewChanged = !sameMembers(driverIds, reverse.drivers.map((d) => d.userId)) || !sameMembers(supervisorIds, reverse.supervisors.map((s) => s.userId));
+    await tx.trip.update({
+      where: { id: reverse.id },
+      data: {
+        departureTime: departure,
+        arrivalTime: arrival,
+        estimatedArrivalAt,
+        ...(change.moved !== 0 && { hijriDate: toHijriLabel(departure), crewOpenAnnouncedAt: null, boardingOpenAnnouncedAt: null, boardingCloseAnnouncedAt: null }),
+        ...(busChanged && {
+          busId: change.busId,
+          busRentalPrice: reverse.busRentalPrice ?? (await this.contractRent(tx, change.busId, reverse.origin, reverse.destination)) ?? undefined,
+        }),
+      },
+    });
+    if (busChanged) await applyBusServices(tx, reverse.id, change.busId);
+    if (crewChanged) {
+      await tx.tripDriver.deleteMany({ where: { tripId: reverse.id } });
+      await tx.tripDriver.createMany({ data: driverIds.map((userId, idx) => ({ tripId: reverse.id, userId, isPrimary: idx === 0 })) });
+      await tx.tripSupervisor.deleteMany({ where: { tripId: reverse.id } });
+      await tx.tripSupervisor.createMany({ data: supervisorIds.map((userId, idx) => ({ tripId: reverse.id, userId, isPrimary: idx === 0 })) });
+      await this.logCrew(
+        tx,
+        reverse.id,
+        { drivers: reverse.drivers.map((row) => row.userId), supervisors: reverse.supervisors.map((row) => row.userId) },
+        { drivers: driverIds, supervisors: supervisorIds },
+        actor,
+        'تبعًا لطاقم رحلة الذهاب',
+      );
+    }
+    await this.notifyTripChanges(tx, reverse, { nextStatus: 'PUBLISHED', crewIds: [...driverIds, ...supervisorIds] });
+  }
+
+  /** Keeps the trip's hotel stay in step with an edit. A stay with guests is never dropped: they have to be moved first. */
+  private async syncHotelStay(
+    tx: Prisma.TransactionClient,
+    before: { id: string; departureTime: Date; accommodations: { nights: number }[] },
+    after: { bookingType: string; departure: Date; accommodation?: UpdateTripDto['accommodation'] },
+  ) {
+    const stays = await tx.hotelBooking.findMany({
+      where: { tripId: before.id, status: 'CONFIRMED' },
+      orderBy: { number: 'asc' },
+      include: { hotel: { select: { name: true } }, rooms: { select: { _count: { select: { occupants: true } } } } },
+    });
+    const release = async (stay: (typeof stays)[number], reason: string) => {
+      if (stay.rooms.some((room) => room._count.occupants > 0)) {
+        throw new ConflictException(`يوجد نزلاء في ${stay.hotel.name}، انقلهم من شاشة الفنادق أولًا`);
+      }
+      await tx.hotelRoom.deleteMany({ where: { hotelBookingId: stay.id } });
+      await tx.hotelBooking.update({ where: { id: stay.id }, data: { status: 'CANCELLED', cancelReason: reason } });
+    };
+
+    if (!includesHousing(after.bookingType)) {
+      for (const stay of stays) await release(stay, 'تعديل الرحلة إلى نوع بدون سكن');
+      await tx.accommodation.deleteMany({ where: { tripId: before.id } });
+      return;
+    }
+
+    const nights = after.accommodation?.nights ?? before.accommodations[0]?.nights ?? 1;
+    const hotelId = after.accommodation?.hotelId;
+    const main = stays[0];
+    // Left out means the edit is not about the hotel; null means the trip no longer uses a contracted one.
+    if (hotelId !== undefined && main?.hotelId !== hotelId) {
+      if (main) await release(main, 'تغيير فندق الرحلة');
+      if (hotelId && !stays.some((stay) => stay.hotelId === hotelId)) await this.rooms.openForTrip(tx, { id: before.id, departureTime: after.departure }, hotelId, nights);
+    }
+
+    const datesMoved = after.departure.getTime() !== before.departureTime.getTime() || nights !== (before.accommodations[0]?.nights ?? nights);
+    const current = hotelId === undefined ? main : stays.find((stay) => stay.hotelId === hotelId);
+    if (datesMoved && current) {
+      await tx.hotelBooking.update({ where: { id: current.id }, data: this.rooms.stayDates(after.departure, nights) });
+    }
+  }
+
+  /** Runs after the trip is saved, so the messages carry the new time and the new crew. */
+  private async notifyTripChanges(
+    tx: Prisma.TransactionClient,
+    before: { id: string; tripStatus: string; departureTime: Date; reverseOfTripId: string | null; drivers: { userId: string }[]; supervisors: { userId: string }[] },
+    after: { nextStatus: string; crewIds: string[] },
+  ) {
+    const wasLive = before.tripStatus === 'PUBLISHED';
+    const isLive = after.nextStatus === 'PUBLISHED';
+    const crewBefore = new Set([...before.drivers, ...before.supervisors].map((member) => member.userId));
+    const crewAfter = [...new Set(after.crewIds)];
+
+    const added = isLive ? crewAfter.filter((userId) => !wasLive || !crewBefore.has(userId)) : [];
+    const removed = wasLive ? [...crewBefore].filter((userId) => !crewAfter.includes(userId)) : [];
+    await this.notifications.toTripCrew(tx, 'CREW_TRIP_ASSIGNED', before.id, { userIds: added });
+    await this.notifications.toTripCrew(tx, 'CREW_TRIP_UNASSIGNED', before.id, { userIds: removed });
+
+    const current = await tx.trip.findUniqueOrThrow({ where: { id: before.id }, select: { departureTime: true, tripCode: true, origin: true, destination: true, hijriDate: true } });
+    const { departureTime } = current;
+    if (!wasLive || !isLive || departureTime.getTime() === before.departureTime.getTime()) return;
+
+    const previous = { oldDepartureDate: formatRiyadhDate(before.departureTime), oldDepartureTime: formatRiyadhTime(before.departureTime) };
+    const bookings = await tx.booking.findMany({
+      where: { tripId: before.id, status: { in: ['CONFIRMED', 'BOARDED', 'PENDING_CANCELLATION_REVIEW'] } },
+      select: { id: true },
+    });
+    await this.notifications.toBookingOwners(tx, 'TRIP_TIME_CHANGED', bookings.map((booking) => booking.id), previous);
+    // Passengers riding back hold outbound bookings, so they read this trip's route and time, not their booking's.
+    if (before.reverseOfTripId) {
+      await this.notifications.toBookingOwners(tx, 'TRIP_TIME_CHANGED', await returningBookingIds(tx, before.reverseOfTripId), { ...tripValues(current), ...previous });
+    }
+    // Someone just assigned already reads the new time in their assignment message.
+    await this.notifications.toTripCrew(tx, 'CREW_TRIP_TIME_CHANGED', before.id, { userIds: crewAfter.filter((userId) => !added.includes(userId)), extra: previous });
+  }
+
+  async getReverseTrips(range: 'week' | 'month' = 'week') {
+    const now = new Date();
+    const trips = await this.prisma.trip.findMany({
+      where: {
+        reverseEnabled: true,
+        OR: [
+          { tripStatus: 'PUBLISHED', departureTime: { gt: now, lt: addDays(now, range === 'week' ? 7 : 30) } },
+          // The outbound has left, but its way back is still ahead: selling, or still waiting to be opened.
+          {
+            tripStatus: { in: ['PUBLISHED', 'COMPLETED'] },
+            departureTime: { lte: now },
+            OR: [
+              { reverseTrip: { tripStatus: 'PUBLISHED', departureTime: { gt: now } } },
+              { reverseDepartureAt: { gt: now }, OR: [{ reverseTrip: null }, { reverseTrip: { tripStatus: 'CANCELLED' } }] },
+            ],
+          },
+        ],
+      },
+      orderBy: { departureTime: 'asc' },
+      include: {
+        bus: { select: { plateNumber: true } },
+        drivers: { where: { isPrimary: true }, select: { user: { select: { name: true } } } },
+        reverseTrip: { include: { bus: { select: { plateNumber: true } }, boardingPoints: { select: { name: true }, take: 1 } } },
+      },
+    });
+
+    const { seatsByTrip } = await goOnlyBookings(this.prisma, trips.map((trip) => trip.id));
+    const booked = await bookedOnTrips(this.prisma, trips.flatMap((trip) => [trip.id, ...(trip.reverseTrip ? [trip.reverseTrip.id] : [])]));
+    const returning = new Map(
+      await Promise.all(trips.filter((trip) => trip.direction === 'ROUND_TRIP').map(async (trip) => {
+        const bookingIds = await returningBookingIds(this.prisma, trip.id);
+        return [trip.id, await this.prisma.bookingPassenger.count({ where: { bookingId: { in: bookingIds } } })] as const;
+      })),
+    );
+
+    return trips.map((trip) => {
+      // A cancelled reverse is out of the picture: this trip can open one again.
+      const reverse = trip.reverseTrip?.tripStatus === 'CANCELLED' ? null : trip.reverseTrip;
+      // With an open reverse the seat count includes seats closed by the link, so only real passengers count. Before that the two agree.
+      const seatsTaken = trip.totalSeats - trip.availableSeats;
+      const bookedSeats = reverse ? booked.get(trip.id)?.seats ?? 0 : seatsTaken;
+      const occupancyPercent = trip.totalSeats ? Math.round((bookedSeats / trip.totalSeats) * 100) : 0;
+      const canOpen = trip.totalSeats > 0 && (seatsTaken / trip.totalSeats) * 100 >= trip.reverseOpenPercent;
+      const isSelling = reverse?.channelApp || reverse?.channelBranch;
+      return {
+        id: trip.id,
+        tripCode: trip.tripCode,
+        origin: trip.origin,
+        destination: trip.destination,
+        departureTime: trip.departureTime,
+        totalSeats: trip.totalSeats,
+        bookedSeats,
+        direction: trip.direction,
+        goOnlySeats: seatsByTrip.get(trip.id) ?? 0,
+        returningSeats: returning.get(trip.id) ?? 0,
+        wasCancelled: trip.reverseTrip?.tripStatus === 'CANCELLED',
+        hasDeparted: trip.departureTime <= now,
+        // What opening it now would put on sale; see openReverseTrip.
+        reverseSeats: trip.direction === 'ONE_WAY' ? trip.totalSeats : trip.availableSeats,
+        occupancyPercent,
+        openPercent: trip.reverseOpenPercent,
+        reverseDepartureAt: trip.reverseDepartureAt,
+        reversePrice: trip.reversePrice === null ? null : Number(trip.reversePrice),
+        busPlate: trip.bus?.plateNumber ?? null,
+        driverName: trip.drivers[0]?.user.name ?? null,
+        status: reverse
+          ? reverse.tripStatus !== 'PUBLISHED' ? 'CLOSED' : isSelling ? 'OPEN' : 'PAUSED'
+          : canOpen ? 'READY' : 'NOT_REACHED',
+        reverse: reverse && {
+          id: reverse.id,
+          tripCode: reverse.tripCode,
+          departureTime: reverse.departureTime,
+          price: Number(reverse.price),
+          totalSeats: reverse.totalSeats,
+          availableSeats: reverse.availableSeats,
+          bookedSeats: booked.get(reverse.id)?.seats ?? 0,
+          bookedRevenue: booked.get(reverse.id)?.revenue ?? 0,
+          busPlate: reverse.bus?.plateNumber ?? null,
+          rentMissing: reverse.busId !== null && reverse.busRentalPrice === null,
+          channelApp: reverse.channelApp,
+          channelBranch: reverse.channelBranch,
+          boardingPointName: reverse.boardingPoints[0]?.name ?? null,
+        },
+      };
+    });
+  }
+
+  async openReverseTrip(id: string, dto: OpenReverseTripDto, actor?: CrewActor) {
+    return this.prisma.$transaction(async (tx) => {
+      // A seat sold while this copies them would be on sale on both trips.
+      await lockTripsWithLinked(tx, [id]);
+      const trip = await tx.trip.findUnique({
+        where: { id },
+        include: {
+          seats: { select: { seatNumber: true, isBooked: true } },
+          images: { select: { url: true } },
+          drivers: true,
+          supervisors: true,
+          reverseTrip: { select: { id: true, tripStatus: true, busId: true } },
+        },
+      });
+      if (!trip) throw new NotFoundException('Trip not found');
+      if (!trip.reverseEnabled) throw new ConflictException('الرحلة العكسية غير مفعلة لهذه الرحلة');
+      if (trip.reverseTrip && trip.reverseTrip.tripStatus !== 'CANCELLED') throw new ConflictException('فُتحت الرحلة العكسية مسبقًا');
+      // A completed outbound still counts: the bus has arrived and the way back is ahead of it.
+      if (!['PUBLISHED', 'COMPLETED'].includes(trip.tripStatus)) throw new ConflictException('يجب أن تكون رحلة الذهاب منشورة');
+      if (dto.channelApp === false && dto.channelBranch === false) throw new BadRequestException('اختر قناة حجز واحدة على الأقل');
+      if (!trip.reverseDepartureAt || trip.reversePrice === null) {
+        throw new BadRequestException('حدد موعد انطلاق الرحلة العكسية وسعر مقعدها');
+      }
+      if (trip.reverseDepartureAt <= new Date()) throw new BadRequestException('موعد الرحلة العكسية قد مضى');
+      this.assertReverseAfterOutbound(trip.reverseDepartureAt, trip);
+
+      const occupancyPercent = ((trip.totalSeats - trip.availableSeats) / trip.totalSeats) * 100;
+      if (occupancyPercent < trip.reverseOpenPercent) {
+        throw new ConflictException(`لم يصل إشغال الذهاب إلى ${trip.reverseOpenPercent}%`);
+      }
+      // Only a round trip's passengers are still aboard coming back, so only their seats stay closed.
+      const seatNumbers = trip.seats.filter((seat) => trip.direction === 'ONE_WAY' || !seat.isBooked).map((seat) => seat.seatNumber);
+      if (seatNumbers.length === 0) throw new ConflictException('لا توجد مقاعد متبقية');
+
+      const departure = trip.reverseDepartureAt;
+      // The road back takes as long as the road there, when that is known.
+      const reached = reachesDestinationAt(trip);
+      const arrival = new Date(departure.getTime() + (reached > trip.departureTime ? reached.getTime() - trip.departureTime.getTime() : DEFAULT_TRIP_DURATION_MS));
+      const driverIds = trip.drivers.map((d) => d.userId);
+      const supervisorIds = trip.supervisors.map((s) => s.userId);
+      await this.assertNoScheduleConflict(tx, {
+        busId: trip.busId,
+        driverIds,
+        supervisorIds,
+        start: departure,
+        end: arrival,
+        excludeTripIds: [trip.id],
+      });
+
+      if (trip.reverseTrip) {
+        return this.reopenReverse(tx, trip.reverseTrip, trip, { departure, arrival, seatNumbers, dto }, actor);
+      }
+
+      const reverse = await tx.trip.create({
+        data: {
+          tripCode: `${trip.tripCode}-R`,
+          title: 'رحلة عكسية',
+          origin: trip.destination,
+          destination: trip.origin,
+          departureTime: departure,
+          arrivalTime: arrival,
+          hijriDate: toHijriLabel(departure),
+          busType: trip.busType,
+          price: trip.reversePrice,
+          totalSeats: seatNumbers.length,
+          availableSeats: seatNumbers.length,
+          maxSeatsPerBooking: trip.maxSeatsPerBooking,
+          crewOpensBeforeMinutes: trip.crewOpensBeforeMinutes,
+          boardingOpensBeforeMinutes: trip.boardingOpensBeforeMinutes,
+          boardingClosesAfterMinutes: trip.boardingClosesAfterMinutes,
+          unpaidBoarding: trip.unpaidBoarding,
+          miqat: trip.miqat,
+          tripStatus: 'PUBLISHED',
+          direction: 'ONE_WAY',
+          busId: trip.busId,
+          busRentalPrice: await this.contractRent(tx, trip.busId, trip.destination, trip.origin),
+          reverseOfTripId: trip.id,
+          channelApp: dto.channelApp ?? true,
+          channelBranch: dto.channelBranch ?? true,
+          seats: { createMany: { data: seatNumbers.map((seatNumber) => ({ seatNumber })) } },
+          // Same bus, same photos; the route and station belong to the outbound direction, so they do not carry over.
+          images: { create: trip.images },
+          boardingPoints: {
+            create: { name: dto.boardingPointName.trim(), time: formatRiyadhTime(departure), address: '' },
+          },
+          services: { create: await busServiceRows(tx, trip.busId) },
+          drivers: { create: trip.drivers.map(({ userId, isPrimary }) => ({ userId, isPrimary })) },
+          supervisors: { create: trip.supervisors.map(({ userId, isPrimary }) => ({ userId, isPrimary })) },
+        },
+        include: ADMIN_TRIP_INCLUDE,
+      });
+      await this.logCrew(
+        tx,
+        reverse.id,
+        { drivers: [], supervisors: [] },
+        { drivers: trip.drivers.map((row) => row.userId), supervisors: trip.supervisors.map((row) => row.userId) },
+        actor,
+        'فتح الرحلة العكسية بطاقم الذهاب',
+      );
+      await this.notifications.toTripCrew(tx, 'CREW_TRIP_ASSIGNED', reverse.id);
+      return withSeatPrice(reverse);
+    }, TRIP_TX_OPTIONS);
+  }
+
+  /** A cancelled reverse comes back as the same trip, so its code and its history stay in one place. Its seats start over from where the outbound stands today. */
+  private async reopenReverse(
+    tx: Prisma.TransactionClient,
+    cancelled: { id: string; busId: string | null },
+    outbound: { busId: string | null; reversePrice: Prisma.Decimal | null; destination: string; origin: string; drivers: { userId: string; isPrimary: boolean }[]; supervisors: { userId: string; isPrimary: boolean }[] },
+    opening: { departure: Date; arrival: Date; seatNumbers: string[]; dto: OpenReverseTripDto },
+    actor?: CrewActor,
+  ) {
+    const { departure, arrival, seatNumbers, dto } = opening;
+    const previous = await tx.trip.findUniqueOrThrow({ where: { id: cancelled.id }, select: { drivers: { select: { userId: true } }, supervisors: { select: { userId: true } } } });
+    await tx.seat.deleteMany({ where: { tripId: cancelled.id } });
+    await tx.seat.createMany({ data: seatNumbers.map((seatNumber) => ({ tripId: cancelled.id, seatNumber })) });
+    await tx.boardingPoint.deleteMany({ where: { tripId: cancelled.id } });
+    await tx.boardingPoint.create({ data: { tripId: cancelled.id, name: dto.boardingPointName.trim(), time: formatRiyadhTime(departure), address: '' } });
+    await tx.tripDriver.deleteMany({ where: { tripId: cancelled.id } });
+    await tx.tripDriver.createMany({ data: outbound.drivers.map(({ userId, isPrimary }) => ({ tripId: cancelled.id, userId, isPrimary })) });
+    await tx.tripSupervisor.deleteMany({ where: { tripId: cancelled.id } });
+    await tx.tripSupervisor.createMany({ data: outbound.supervisors.map(({ userId, isPrimary }) => ({ tripId: cancelled.id, userId, isPrimary })) });
+    await this.logCrew(
+      tx,
+      cancelled.id,
+      { drivers: previous.drivers.map((row) => row.userId), supervisors: previous.supervisors.map((row) => row.userId) },
+      { drivers: outbound.drivers.map((row) => row.userId), supervisors: outbound.supervisors.map((row) => row.userId) },
+      actor,
+      'إعادة فتح الرحلة العكسية بطاقم الذهاب',
+    );
+    if (cancelled.busId !== outbound.busId) await applyBusServices(tx, cancelled.id, outbound.busId);
+
+    const reverse = await tx.trip.update({
+      where: { id: cancelled.id },
+      data: {
+        tripStatus: 'PUBLISHED',
+        departureTime: departure,
+        arrivalTime: arrival,
+        hijriDate: toHijriLabel(departure),
+        price: outbound.reversePrice!,
+        totalSeats: seatNumbers.length,
+        availableSeats: seatNumbers.length,
+        busId: outbound.busId,
+        channelApp: dto.channelApp ?? true,
+        channelBranch: dto.channelBranch ?? true,
+        liveStatus: 'NOT_STARTED',
+        liveStatusAt: null,
+        currentBoardingPointId: null,
+        crewOpenAnnouncedAt: null,
+        boardingOpenAnnouncedAt: null,
+        boardingCloseAnnouncedAt: null,
+      },
+      include: ADMIN_TRIP_INCLUDE,
+    });
+    await this.notifications.toTripCrew(tx, 'CREW_TRIP_ASSIGNED', reverse.id);
+    return withSeatPrice(reverse);
+  }
+
+  async cancelTrip(id: string, adminId: string, reason?: string, acknowledgeReturning = false) {
+    return this.prisma.$transaction(
+      async (tx) => {
+        // Bookings take these locks too, so none can confirm after this lists them; it would see the cancelled status instead.
+        await lockTripsWithLinked(tx, [id]);
+        const trip = await tx.trip.findUnique({ where: { id }, include: { reverseTrip: { select: { id: true, tripStatus: true } } } });
+        if (!trip) throw new NotFoundException('Trip not found');
+        if (trip.tripStatus === 'CANCELLED') throw new ConflictException('الرحلة ملغاة مسبقًا');
+        if (trip.tripStatus === 'COMPLETED') throw new ConflictException('لا يمكن إلغاء رحلة مكتملة');
+
+        // Their money sits in the outbound booking and no rule splits it between the two ways, so nobody is refunded blindly: staff must say they know.
+        const returning = trip.reverseOfTripId ? await returningBookingIds(tx, trip.reverseOfTripId) : [];
+        if (returning.length > 0 && !acknowledgeReturning) {
+          throw new ConflictException(`عليها ${returning.length} حجز ذهاب وعودة يرجع ركابه بها. لإيقاف البيع فقط اقفل قنوات الحجز، وللإلغاء أكّد أن الإدارة ستعالج حجوزاتهم`);
+        }
+
+        // The reverse trip runs on the same bus, so it cannot outlive its outbound.
+        const tripIds = [id];
+        if (trip.reverseTrip && ['DRAFT', 'PUBLISHED'].includes(trip.reverseTrip.tripStatus)) tripIds.push(trip.reverseTrip.id);
+
+        const boarded = await tx.booking.count({ where: { tripId: { in: tripIds }, status: 'BOARDED' } });
+        if (boarded > 0) throw new ConflictException('لا يمكن إلغاء رحلة بدأ صعود ركابها');
+
+        // Room assignment locks the stay before its bookings, so the stays are locked here before any booking is.
+        await tx.$queryRaw`SELECT "id" FROM "HotelBooking" WHERE "tripId" IN (${Prisma.join(tripIds)}) ORDER BY "id" FOR UPDATE`;
+
+        const bookings = await tx.booking.findMany({
+          where: { tripId: { in: tripIds }, status: { in: ['PENDING', 'CONFIRMED', 'PENDING_CANCELLATION_REVIEW'] } },
+          select: { id: true },
+        });
+        for (const booking of bookings) {
+          await this.cancellation.cancel(tx, booking.id, { reviewedById: adminId, note: reason || 'إلغاء الرحلة من الإدارة', notifyAs: 'TRIP_CANCELLED' });
+        }
+
+        // A draft was never announced to its crew, so there is nothing to take back.
+        if (trip.tripStatus === 'PUBLISHED') await this.notifications.toTripCrew(tx, 'CREW_TRIP_CANCELLED', id);
+        if (tripIds.length > 1 && trip.reverseTrip.tripStatus === 'PUBLISHED') await this.notifications.toTripCrew(tx, 'CREW_TRIP_CANCELLED', trip.reverseTrip.id);
+
+        await this.notifications.toBookingOwners(tx, 'RETURN_RIDE_CANCELLED', returning, tripValues(trip));
+
+        // The cancelled bookings have left their rooms, so the hotel stays go too and stop counting as the trip's cost.
+        const stays = await tx.hotelBooking.findMany({ where: { tripId: { in: tripIds }, status: 'CONFIRMED' }, select: { id: true } });
+        if (stays.length > 0) {
+          const stayIds = stays.map((stay) => stay.id);
+          await tx.bookingPassenger.updateMany({ where: { hotelRoom: { hotelBookingId: { in: stayIds } } }, data: { hotelRoomId: null, roomNote: null } });
+          await tx.hotelRoom.deleteMany({ where: { hotelBookingId: { in: stayIds } } });
+          await tx.hotelBooking.updateMany({ where: { id: { in: stayIds } }, data: { status: 'CANCELLED', cancelReason: reason || 'إلغاء الرحلة من الإدارة' } });
+        }
+
+        await tx.trip.updateMany({ where: { id: { in: tripIds } }, data: { tripStatus: 'CANCELLED' } });
+        return { success: true, cancelledBookings: bookings.length, returningBookings: returning.length };
+      },
+      { timeout: 60_000 },
+    );
+  }
+
+  async deleteTrip(id: string) {
+    const trip = await this.prisma.trip.findUnique({ where: { id } });
+    if (!trip) throw new NotFoundException('Trip not found');
+    const bookingsCount = await this.prisma.booking.count({ where: { tripId: id } });
+    if (bookingsCount > 0) {
+      throw new ConflictException('Cannot delete trip with bookings');
+    }
+    if (trip.reverseOfTripId && trip.tripStatus !== 'CANCELLED' && (await returningBookingIds(this.prisma, trip.reverseOfTripId)).length > 0) {
+      throw new ConflictException('لا يمكن حذف رحلة عكسية يرجع بها ركاب ذهاب وعودة');
+    }
+    const reverseCount = await this.prisma.trip.count({ where: { reverseOfTripId: id } });
+    if (reverseCount > 0) {
+      throw new ConflictException('لا يمكن حذف رحلة فُتحت لها رحلة عكسية');
+    }
+    // With no bookings nobody was ever placed in its rooms, so its hotel stays go with it; they would otherwise hold the trip in place.
+    await this.prisma.$transaction(async (tx) => {
+      await tx.hotelBooking.deleteMany({ where: { tripId: id } });
+      await tx.trip.delete({ where: { id } });
+    }, TRIP_TX_OPTIONS);
+    return { success: true };
+  }
+}
