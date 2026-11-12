@@ -893,7 +893,37 @@ export class HotelsService {
       await this.notifications.toBookingOwners(tx, 'ROOM_ASSIGNED', [passenger.booking.id], { passengerName: passenger.fullName, hotelName: hotelBooking.hotel.name, roomNumber: number });
     }
     for (const bookingId of bookingIds) await tx.booking.update({ where: { id: bookingId }, data: { updatedAt: new Date() } });
+    const arrived = passengers.filter((p) => p.hotelRoom?.id !== room.id).map((p) => p.id);
+    await this.tellRoommates(tx, room.id, number, hotelBooking.hotel.name, arrived);
     await this.removeEmptyRooms(tx, passengers.map((p) => p.hotelRoom?.id).filter((id): id is string => !!id && id !== room.id));
+  }
+
+  /**
+   * Gives everyone in a shared room the names of the people from other bookings who share it with them. Only the
+   * bookings that just moved in, and those already there when someone new arrives, hear about it, so nobody is told twice.
+   */
+  private async tellRoommates(tx: Prisma.TransactionClient, roomId: string, roomNumber: string, hotelName: string, arrivedIds: string[]) {
+    if (arrivedIds.length === 0) return;
+    const occupants = await tx.bookingPassenger.findMany({
+      where: { hotelRoomId: roomId, booking: { status: { in: HOUSED_STATUSES } } },
+      orderBy: { fullName: 'asc' },
+      select: { id: true, fullName: true, bookingId: true },
+    });
+    const arrived = new Set(arrivedIds);
+    const extras = new Map<string, { passengerName: string; roomNumber: string; hotelName: string; roommates: string }>();
+    for (const bookingId of new Set(occupants.map((o) => o.bookingId))) {
+      const own = occupants.filter((o) => o.bookingId === bookingId);
+      const others = occupants.filter((o) => o.bookingId !== bookingId);
+      if (others.length === 0) continue;
+      if (!occupants.some((o) => arrived.has(o.id))) continue;
+      extras.set(bookingId, {
+        passengerName: own.map((o) => o.fullName).join('، '),
+        roomNumber,
+        hotelName,
+        roommates: others.map((o) => o.fullName).join('، '),
+      });
+    }
+    await this.notifications.toBookingOwnersEach(tx, 'ROOMMATES_UPDATED', extras);
   }
 
   private removeEmptyRooms(tx: Prisma.TransactionClient, roomIds: string[]) {

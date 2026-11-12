@@ -20,6 +20,27 @@ export class CreatePackageDto {
   @Max(1000000)
   price: number;
 
+  /** The total for two people together. Left out, it is the one-person price twice. */
+  @IsOptional()
+  @IsNumber({ maxDecimalPlaces: 2 })
+  @Min(1, { message: 'سعر الباقة لشخصين يجب أن يكون أكبر من صفر' })
+  @Max(1000000)
+  price2?: number;
+
+  /** The total for three people together. */
+  @IsOptional()
+  @IsNumber({ maxDecimalPlaces: 2 })
+  @Min(1, { message: 'سعر الباقة لثلاثة أشخاص يجب أن يكون أكبر من صفر' })
+  @Max(1000000)
+  price3?: number;
+
+  /** The total for four people together. */
+  @IsOptional()
+  @IsNumber({ maxDecimalPlaces: 2 })
+  @Min(1, { message: 'سعر الباقة لأربعة أشخاص يجب أن يكون أكبر من صفر' })
+  @Max(1000000)
+  price4?: number;
+
   @IsOptional()
   @IsInt()
   @Min(0)

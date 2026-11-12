@@ -24,11 +24,12 @@ import { paymentFigures } from '../../common/utils/payment.util';
 import { normalizeSaudiPhone } from '../../common/utils/phone.util';
 import { signTicketToken } from '../../common/utils/ticket-token.util';
 import { AppSettingsService } from '../../common/services/app-settings.service';
-import { BUS_SEAT_LAYOUT } from '../../common/utils/bus-layout.util';
+import { tripSeatLayout } from '../../common/utils/bus-layout.util';
 import { describeSinglesRange, isSinglesSeat } from '../../common/utils/singles-seats.util';
 import { holdLinkedSeats, lockTripsWithLinked, releaseLinkedHolds, returnRideOf, takeLinkedSeats } from '../../common/utils/linked-seats.util';
 import { boardingOfBookings } from '../../common/utils/ticket-boarding.util';
 import { tripDayWindow } from '../../common/utils/trip-day.util';
+import { PACKAGE_MAX_PERSONS, PACKAGE_PRICE_SELECT, packageGroupTotal, packagePriceTiers } from '../../common/utils/package-price.util';
 import { BookingLegDto, CreateBookingDto, HoldSeatsDto, QuoteDto, ReviewCancellationDto } from './bookings.dto';
 import { PublicService, SERVICE_SELECT, withHotelServices } from '../../common/utils/services.util';
 
@@ -187,11 +188,14 @@ export class BookingsService {
 
   /** The same seat rules everywhere; the branch screen and the customer's app differ only in who may buy. */
   async assertSeatRules(
-    trip: { maxSeatsPerBooking: number; busId: string | null },
+    trip: { maxSeatsPerBooking: number; busId: string | null; packageId?: string | null; package?: unknown },
     seats: string[],
     category: BookingCategory = 'FAMILY',
   ) {
     if (new Set(seats).size !== seats.length) throw new BadRequestException('يوجد مقعد مكرر في الطلب');
+    if ((trip.packageId || trip.package) && seats.length > PACKAGE_MAX_PERSONS) {
+      throw new BadRequestException(`الباقة تُحجز من شخص واحد إلى ${PACKAGE_MAX_PERSONS} أشخاص`);
+    }
     if (seats.length > trip.maxSeatsPerBooking) {
       throw new BadRequestException(`الحد الأقصى ${trip.maxSeatsPerBooking} مقاعد في الحجز الواحد`);
     }
@@ -207,7 +211,7 @@ export class BookingsService {
     const now = new Date();
     const trip = await this.prisma.trip.findFirst({
       where: { id: tripId, tripStatus: 'PUBLISHED', channelApp: true, OR: [{ packageId: null }, { package: { status: 'PUBLISHED' } }] },
-      include: { seats: true, package: { select: { price: true } } },
+      include: { seats: true, package: { select: PACKAGE_PRICE_SELECT } },
     });
     if (!trip) throw new NotFoundException('الرحلة غير موجودة');
     const singles = await this.appSettings.singlesRange(trip.busId);
@@ -226,9 +230,11 @@ export class BookingsService {
       tripId: trip.id,
       busType: trip.busType,
       totalSeats: trip.totalSeats,
-      layout: BUS_SEAT_LAYOUT,
+      layout: tripSeatLayout(trip),
       availableSeats: trip.availableSeats,
-      maxSeatsPerBooking: trip.maxSeatsPerBooking,
+      maxSeatsPerBooking: trip.package ? Math.min(trip.maxSeatsPerBooking, PACKAGE_MAX_PERSONS) : trip.maxSeatsPerBooking,
+      // A package is priced per group size, so the app shows the total for the seats picked rather than seat price × seats.
+      packagePriceTiers: trip.package ? packagePriceTiers(trip.package) : null,
       singlesFromSeat: singles.from,
       singlesToSeat: singles.to,
       pricePerSeat: Number(trip.package?.price ?? trip.price),
@@ -294,7 +300,7 @@ export class BookingsService {
     const trips = await db.trip.findMany({
       where: { id: { in: tripIds } },
       include: {
-        package: { select: { price: true, status: true } },
+        package: { select: { ...PACKAGE_PRICE_SELECT, status: true } },
         accommodations: { select: { nights: true } },
         // The customer reads about the place and picks a room type; room counts and numbers stay with staff.
         hotelBookings: {
@@ -309,9 +315,10 @@ export class BookingsService {
       const trip = trips.find((t) => t.id === leg.tripId);
       this.assertBookable(trip);
       const seats = normalizeSeats(leg.seats);
-      const unitPrice = toHalalas(trip.package?.price ?? trip.price);
+      // A package charges its total for the group's size; an ordinary trip charges each seat.
+      const seatsSubtotal = trip.package ? packageGroupTotal(trip.package, seats.length) : toHalalas(trip.price) * seats.length;
+      const unitPrice = seats.length ? Math.round(seatsSubtotal / seats.length) : toHalalas(trip.price);
       const stay = this.priceStay(trip, leg, seats.length);
-      const seatsSubtotal = unitPrice * seats.length;
       const housingAmount = stay?.amount ?? 0;
       return { leg, trip, seats, unitPrice, stay, seatsSubtotal, housingAmount, subtotal: seatsSubtotal + housingAmount };
     });
@@ -387,6 +394,8 @@ export class BookingsService {
           destination: leg.trip.destination,
           seats: leg.seats,
           pricePerSeat: toSar(leg.unitPrice),
+          // A package's seatsSubtotal is its total for the group's size, so the app shows it as such, not seats × price.
+          isPackage: !!leg.trip.package,
           seatsSubtotal: toSar(leg.seatsSubtotal),
           housingAmount: toSar(leg.housingAmount),
           subtotal: toSar(leg.subtotal),
@@ -684,6 +693,29 @@ export class BookingsService {
     return tripDayWindow({ ...booking.trip, bookingStatus: booking.status }, closesAfterHours).isOpen;
   }
 
+  /**
+   * The names of whoever shares each passenger's hotel room, from this booking or another. Names only: another
+   * booking's ids, phones and details never reach this customer.
+   */
+  private async roommatesOf(bookingId: string) {
+    const housed = await this.prisma.bookingPassenger.findMany({
+      where: { bookingId, hotelRoomId: { not: null } },
+      select: {
+        id: true,
+        hotelRoom: {
+          select: {
+            occupants: {
+              where: { booking: { status: { in: ['CONFIRMED', 'BOARDED', 'PENDING_CANCELLATION_REVIEW'] } } },
+              orderBy: { fullName: 'asc' },
+              select: { id: true, fullName: true },
+            },
+          },
+        },
+      },
+    });
+    return new Map(housed.map((p) => [p.id, (p.hotelRoom?.occupants ?? []).filter((o) => o.id !== p.id).map((o) => o.fullName)]));
+  }
+
   async getBookingById(userId: string, bookingId: string, canViewAll: boolean, canViewBranch = false) {
     const booking = await this.prisma.booking.findUnique({
       where: { id: bookingId },
@@ -714,7 +746,12 @@ export class BookingsService {
     });
 
     const cancellationEstimate = booking.userId === userId ? await this.cancellationEstimate(booking) : null;
-    const withBoarding = booking.passengers.map((p) => ({ ...p, boardedByName: p.ticket?.isBoarded ? boardedBy.get(p.ticket.ticketNumber) ?? null : null }));
+    const roommates = await this.roommatesOf(booking.id);
+    const withBoarding = booking.passengers.map((p) => ({
+      ...p,
+      boardedByName: p.ticket?.isBoarded ? boardedBy.get(p.ticket.ticketNumber) ?? null : null,
+      roommates: roommates.get(p.id) ?? [],
+    }));
     const tripDayOpen = this.isTripDayOpen(booking, await this.appSettings.number('trackingClosesAfterHours'));
     const returnRide = await returnRideOf(this.prisma, booking);
     const boarding = (await boardingOfBookings(this.prisma, [booking])).get(booking.id) ?? null;

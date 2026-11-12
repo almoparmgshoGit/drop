@@ -40,6 +40,7 @@ import { RealtimeModule } from './modules/realtime/realtime.module';
 import { SupervisorsModule } from './modules/supervisors/supervisors.module';
 import { CrewRequestsModule } from './modules/crew-requests/crew-requests.module';
 import { HrModule } from './modules/hr/hr.module';
+import { ComplaintsModule } from './modules/complaints/complaints.module';
 
 @Module({
   imports: [
@@ -84,6 +85,7 @@ import { HrModule } from './modules/hr/hr.module';
     SupervisorsModule,
     CrewRequestsModule,
     HrModule,
+    ComplaintsModule,
   ],
   providers: [
     { provide: APP_GUARD, useClass: ThrottlerGuard },

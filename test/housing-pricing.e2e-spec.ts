@@ -107,7 +107,7 @@ describe('Housing prices chosen by the admin', () => {
   });
 
   it('charges nothing more on a trip sold through an all-inclusive package', async () => {
-    const pkg = await prisma.package.create({ data: { name: 'باقة شاملة', price: 900, nights: 3 } });
+    const pkg = await prisma.package.create({ data: { name: 'باقة شاملة', price: 900, price2: 1800, price3: 2700, price4: 3600, nights: 3 } });
     const trip = await createTrip(await createHotel(), { ...ADDED, packageId: pkg.id });
     const body = await quote(trip, ['1', '2'], 'PRIVATE');
     expect(body.legs[0].housingAmount).toBe(0);

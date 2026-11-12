@@ -6,7 +6,8 @@ import {
   OnModuleDestroy,
   OnModuleInit,
 } from '@nestjs/common';
-import { Prisma } from '@prisma/client';
+import { randomUUID } from 'crypto';
+import { Prisma, TripCalendar, TripScheduleType } from '@prisma/client';
 import { PrismaService } from '../../common/services/prisma.service';
 import { BookingCancellationService } from '../../common/services/booking-cancellation.service';
 import { LoyaltyService } from '../../common/services/loyalty.service';
@@ -18,15 +19,18 @@ import { BOOKING_TYPES, includesHousing } from '../../common/utils/booking-types
 import { BOOKING_TYPE_LABELS } from '../../common/booking-type-labels';
 import { HousingTerms, startingSeatPrice } from '../../common/utils/housing-price.util';
 import { CREW_WINDOW_SELECT, MAX_CREW_OPENS_BEFORE_MINUTES, crewWindow } from '../../common/utils/crew-window.util';
-import { BUS_SEAT_COUNT, BUS_SEAT_NUMBERS } from '../../common/utils/bus-layout.util';
+import { seatLayoutFor, seatNumbersOf, storedSeatLayout, tripSeatLayout } from '../../common/utils/bus-layout.util';
 import { assertSinglesFitRange } from '../../common/utils/singles-seats.util';
+import { applySeatLayout } from '../../common/utils/trip-seats.util';
 import { bookedOnTrips, goOnlyBookings, lockTripsWithLinked, returningBookingIds } from '../../common/utils/linked-seats.util';
 import { addDays, formatRiyadhDate, formatRiyadhTime, riyadhDate, riyadhDayRange, toHijriLabel } from '../../common/utils/time.util';
 import { applyBusServices, busServiceRows } from '../../common/utils/bus-services.util';
-import { nextYearlyDate } from '../../common/utils/recurrence.util';
+import { WEEKLY_HORIZON_DAYS, nextWeeklyDate, nextYearlyDate } from '../../common/utils/recurrence.util';
 import { AppSettingsService } from '../../common/services/app-settings.service';
+import { imageTypeOf } from '../../common/utils/image-type.util';
 import { CreateTripDto, OpenReverseTripDto, UpdateTripDto } from './trips.dto';
 import { assertTripFitsPackage } from '../../common/utils/package-window.util';
+import { PACKAGE_PRICE_SELECT, PackagePrices, packagePriceTiers } from '../../common/utils/package-price.util';
 import { PublicService, SERVICE_SELECT, withHotelServices } from '../../common/utils/services.util';
 
 const DEFAULT_TRIP_DURATION_MS = 8 * 60 * 60 * 1000;
@@ -34,6 +38,9 @@ const COMPLETION_SWEEP_MS = 5 * 60 * 1000;
 const CREW_WINDOW_SWEEP_MS = 60 * 1000;
 // Trip writes touch many tables over a remote database, well past Prisma's 5s default.
 const TRIP_TX_OPTIONS = { maxWait: 10_000, timeout: 30_000 };
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+type Schedule = { scheduleType: TripScheduleType; recurrenceCalendar: TripCalendar | null; repeatWeekdays: number[]; repeatUntil: Date | null };
 
 export const MAX_PUBLIC_IMAGE_BYTES = 5 * 1024 * 1024;
 export const MAX_PUBLIC_IMAGES_PER_UPLOAD = 10;
@@ -43,20 +50,12 @@ export interface UploadedImage {
   size: number;
 }
 
-// The declared type comes from the client, so the stored type is decided by the file's own bytes. No SVG: these open without signing in.
-const publicImageType = (file: Buffer) => {
-  if (file.subarray(0, 3).equals(Buffer.from([0xff, 0xd8, 0xff]))) return 'image/jpeg';
-  if (file.subarray(0, 4).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47]))) return 'image/png';
-  if (file.subarray(0, 4).toString('latin1') === 'RIFF' && file.subarray(8, 12).toString('latin1') === 'WEBP') return 'image/webp';
-  return null;
-};
-
 export const PUBLIC_TRIP_INCLUDE = {
   boardingPoints: true,
   itineraryStops: { orderBy: { sortOrder: 'asc' } },
   images: true,
   bus: { select: { model: true, color: true, imageUrl: true, company: true, services: SERVICE_SELECT } },
-  package: { select: { id: true, name: true, description: true, price: true, nights: true, type: true, terms: true } },
+  package: { select: { id: true, name: true, description: true, ...PACKAGE_PRICE_SELECT, nights: true, type: true, terms: true } },
   services: { include: { service: true } },
   visits: { orderBy: { sortOrder: 'asc' } },
   accommodations: true,
@@ -120,6 +119,10 @@ const INTERNAL_TRIP_FIELDS = [
   'scheduleType',
   'recurrenceCalendar',
   'recurrenceDoneAt',
+  'repeatWeekdays',
+  'repeatUntil',
+  'seriesId',
+  'seatLayout',
 ] as const;
 
 /** Costs and planning settings stay out of the customer-facing API. */
@@ -135,7 +138,18 @@ export const toPublicTrip = <T extends object>(trip: T) => {
   return copy as unknown as Omit<T, (typeof INTERNAL_TRIP_FIELDS)[number]>;
 };
 
-type PricedTrip = HousingTerms & { price: Prisma.Decimal; bookingType: string; package?: { price: Prisma.Decimal } | null; accommodations?: { nights: number | null }[] };
+type PricedTrip = HousingTerms & {
+  price: Prisma.Decimal;
+  bookingType: string;
+  package?: ({ price: Prisma.Decimal } & Partial<PackagePrices>) | null;
+  accommodations?: { nights: number | null }[];
+};
+
+/** A package's totals for one to four people, when the query loaded them. */
+const tiersOf = (pkg: PricedTrip['package']) =>
+  pkg && pkg.price2 != null && pkg.price3 != null && pkg.price4 != null
+    ? packagePriceTiers({ price: pkg.price, price2: pkg.price2, price3: pkg.price3, price4: pkg.price4 })
+    : null;
 
 /** A package's price is all-inclusive, so its trips charge nothing more for housing. */
 const housingOfferOf = (trip: PricedTrip) => {
@@ -157,6 +171,7 @@ const withSeatPrice = <T extends PricedTrip>(trip: T) => {
   return {
     ...trip,
     pricePerSeat,
+    packagePriceTiers: tiersOf(trip.package),
     housingOffer: offer,
     startingPrice: offer ? startingSeatPrice(pricePerSeat, trip, trip.accommodations?.[0]?.nights ?? 1) : pricePerSeat,
   };
@@ -318,7 +333,81 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
     await this.loyalty.settleCompletedTrips();
     await this.compensation.compensateFinishedTrips();
     await this.draftNextFixedTrips();
+    await this.extendWeeklySeries();
     return completed;
+  }
+
+  /** Keeps every weekly schedule drafted to its horizon; it also finishes a series whose first drafting was interrupted. */
+  async extendWeeklySeries() {
+    const rows = await this.prisma.trip.findMany({
+      where: { seriesId: { not: null }, repeatWeekdays: { isEmpty: false } },
+      distinct: ['seriesId'],
+      select: { seriesId: true },
+    });
+    for (const { seriesId } of rows) {
+      try {
+        await this.extendSeries(seriesId, true);
+      } catch (err) {
+        console.error(`Could not extend weekly trips ${seriesId}:`, err.message);
+      }
+    }
+  }
+
+  /**
+   * Drafts the series' next departures, one transaction each, up to its horizon: a year ahead for a fixed trip, its last
+   * day for a temporary one. The office publishes the drafts. Returns how many were made.
+   */
+  async extendSeries(seriesId: string, announce = false) {
+    let made = 0;
+    for (;;) {
+      const draft = await this.prisma.$transaction(async (tx) => {
+        // Two runs over one series, from a create and from the sweep, take turns so neither drafts a date twice.
+        await tx.$queryRaw`SELECT 1 AS locked FROM pg_advisory_xact_lock(hashtext(${seriesId}))`;
+        const next = await this.draftNextInSeries(tx, seriesId);
+        if (next && announce && made === 0) await this.notifications.toStaff(tx, 'STAFF_FIXED_TRIP_DRAFTED', ['trips.manage'], {}, { tripId: next.id });
+        return next;
+      }, TRIP_TX_OPTIONS);
+      if (!draft) return made;
+      made++;
+    }
+  }
+
+  /** The series follows the trip that started it, or its latest trip once that one is gone. */
+  private async draftNextInSeries(tx: Prisma.TransactionClient, seriesId: string) {
+    const latest = await tx.trip.findFirst({ where: { seriesId }, orderBy: { departureTime: 'desc' }, select: { id: true, departureTime: true } });
+    if (!latest) return null;
+    const template = await tx.trip.findFirst({
+      where: { id: { in: [seriesId, latest.id] } },
+      orderBy: { departureTime: 'asc' },
+      select: { id: true, departureTime: true, scheduleType: true, repeatWeekdays: true, repeatUntil: true },
+    });
+    if (!template?.repeatWeekdays.length) return null;
+    const now = new Date();
+    const horizon = template.scheduleType === 'FIXED' ? new Date(now.getTime() + WEEKLY_HORIZON_DAYS * DAY_MS) : template.repeatUntil;
+    if (!horizon) return null;
+    const departure = nextWeeklyDate(latest.departureTime, template.repeatWeekdays, template.departureTime, now);
+    if (!departure || departure > horizon) return null;
+    return this.cloneTrip(tx, template.id, departure, {
+      schedule: { scheduleType: template.scheduleType, recurrenceCalendar: null, repeatWeekdays: template.repeatWeekdays, repeatUntil: template.repeatUntil },
+      seriesId,
+      keepBusAndCrew: true,
+    });
+  }
+
+  /** Whether the bus and crew are free and allowed at that time; a copy that cannot keep them waits for the office to assign. */
+  private async canAssign(tx: Prisma.TransactionClient, assignment: { busId: string | null; driverIds: string[]; supervisorIds: string[]; start: Date; end: Date }) {
+    try {
+      if (assignment.busId) {
+        const bus = await tx.bus.findUnique({ where: { id: assignment.busId }, select: { status: true } });
+        if (bus?.status !== 'ACTIVE') return false;
+      }
+      await this.assertAssignableStaff(tx, [...assignment.driverIds, ...assignment.supervisorIds]);
+      await this.assertNoScheduleConflict(tx, { ...assignment, leaveCheckIds: [...assignment.driverIds, ...assignment.supervisorIds] });
+      return true;
+    } catch (err) {
+      if (err instanceof ConflictException || err instanceof BadRequestException) return false;
+      throw err;
+    }
   }
 
   /**
@@ -346,14 +435,35 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
     return `R${String(highest + 1).padStart(3, '0')}`;
   }
 
-  /** Copies everything except the bus and crew, which are assigned for each year, and the rent that came with the bus. */
+  /** Next year's copy: everything except the bus and crew, which are assigned for each year, and the rent that came with the bus. */
   private async draftNextOccurrence(tx: Prisma.TransactionClient, id: string) {
     // Claiming first keeps a second server instance from drafting the same trip again, and a deleted draft from coming back.
     const claimed = await tx.trip.updateMany({ where: { id, recurrenceDoneAt: null }, data: { recurrenceDoneAt: new Date() } });
     if (claimed.count === 0) return;
 
+    const source = await tx.trip.findUniqueOrThrow({ where: { id }, select: { departureTime: true, recurrenceCalendar: true } });
+    let departure = source.departureTime;
+    do departure = nextYearlyDate(departure, source.recurrenceCalendar);
+    while (departure <= new Date());
+    const draft = await this.cloneTrip(tx, id, departure, {
+      schedule: { scheduleType: 'FIXED', recurrenceCalendar: source.recurrenceCalendar, repeatWeekdays: [], repeatUntil: null },
+      keepBusAndCrew: false,
+    });
+    await this.notifications.toStaff(tx, 'STAFF_FIXED_TRIP_DRAFTED', ['trips.manage'], {}, { tripId: draft.id });
+  }
+
+  /**
+   * A draft of the trip at another departure, with every date in it moved by the same amount. A weekly copy keeps the bus
+   * and crew when they are free then; otherwise the office assigns them before publishing.
+   */
+  private async cloneTrip(
+    tx: Prisma.TransactionClient,
+    sourceId: string,
+    departure: Date,
+    options: { schedule: Schedule; keepBusAndCrew: boolean; seriesId?: string },
+  ) {
     const source = await tx.trip.findUniqueOrThrow({
-      where: { id },
+      where: { id: sourceId },
       include: {
         images: true,
         boardingPoints: true,
@@ -361,15 +471,28 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
         services: { where: { fromBus: false } },
         visits: { orderBy: { sortOrder: 'asc' } },
         accommodations: true,
+        drivers: true,
+        supervisors: true,
+        bus: { select: { kind: true, seatCount: true } },
         hotelBookings: { where: { status: 'CONFIRMED' }, orderBy: { number: 'asc' }, include: { hotel: { select: { isActive: true } } } },
       },
     });
 
-    let departure = source.departureTime;
-    do departure = nextYearlyDate(departure, source.recurrenceCalendar);
-    while (departure <= new Date());
     const moved = departure.getTime() - source.departureTime.getTime();
     const shift = <T extends Date | null>(date: T) => (date ? new Date(date.getTime() + moved) : null) as T;
+    const primaryFirst = (rows: { userId: string; isPrimary: boolean }[]) => [...rows].sort((a, b) => Number(b.isPrimary) - Number(a.isPrimary)).map((row) => row.userId);
+    let crew = { busId: null as string | null, driverIds: [] as string[], supervisorIds: [] as string[] };
+    if (options.keepBusAndCrew) {
+      const window = { start: departure, end: shift(source.arrivalTime) };
+      const full = { busId: source.busId, driverIds: primaryFirst(source.drivers), supervisorIds: primaryFirst(source.supervisors) };
+      const busOnly = { ...full, driverIds: [], supervisorIds: [] };
+      if (await this.canAssign(tx, { ...full, ...window })) crew = full;
+      else if (await this.canAssign(tx, { ...busOnly, ...window })) crew = busOnly;
+    }
+    // The copy keeps the source's seats, unless it rides the source's bus, whose seats may have changed since.
+    const layout = crew.busId ? seatLayoutFor(source.bus) : tripSeatLayout(source);
+    const seatNumbers = seatNumbersOf(layout);
+    const busServices = await busServiceRows(tx, crew.busId);
 
     const draft = await tx.trip.create({
       data: {
@@ -384,8 +507,9 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
         hijriDate: toHijriLabel(departure),
         busType: source.busType,
         price: source.price,
-        totalSeats: BUS_SEAT_COUNT,
-        availableSeats: BUS_SEAT_COUNT,
+        totalSeats: seatNumbers.length,
+        availableSeats: seatNumbers.length,
+        seatLayout: storedSeatLayout(layout),
         maxSeatsPerBooking: source.maxSeatsPerBooking,
         miqat: source.miqat,
         crewOpensBeforeMinutes: source.crewOpensBeforeMinutes,
@@ -393,11 +517,13 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
         boardingClosesAfterMinutes: source.boardingClosesAfterMinutes,
         unpaidBoarding: source.unpaidBoarding,
         tripStatus: 'DRAFT',
-        scheduleType: 'FIXED',
-        recurrenceCalendar: source.recurrenceCalendar,
+        ...options.schedule,
+        seriesId: options.seriesId ?? null,
         direction: source.direction,
         bookingType: source.bookingType,
         packageId: source.packageId,
+        busId: crew.busId,
+        busRentalPrice: crew.busId ? source.busRentalPrice : null,
         housingPrice: source.housingPrice,
         privateRoomPrice: source.privateRoomPrice,
         privateRoomCapacity: source.privateRoomCapacity,
@@ -411,11 +537,16 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
         reversePrice: source.reversePrice,
         channelApp: source.channelApp,
         channelBranch: source.channelBranch,
-        seats: { createMany: { data: BUS_SEAT_NUMBERS.map((seatNumber) => ({ seatNumber })) } },
+        seats: { createMany: { data: seatNumbers.map((seatNumber) => ({ seatNumber })) } },
         images: { create: source.images.map(({ url }) => ({ url })) },
         boardingPoints: { create: source.boardingPoints.map(({ name, time, address, lat, lng }) => ({ name, time, address, lat, lng })) },
         itineraryStops: { create: source.itineraryStops.map(({ title, time, desc, kind, sortOrder }) => ({ title, time, desc, kind, sortOrder })) },
-        services: { create: source.services.map(({ serviceId }) => ({ serviceId })) },
+        services: {
+          create: [
+            ...source.services.map(({ serviceId }) => ({ serviceId })),
+            ...busServices.filter((row) => !source.services.some((picked) => picked.serviceId === row.serviceId)),
+          ],
+        },
         visits: {
           create: source.visits.map(({ title, desc, imageUrl, lat, lng, visitDate, expectedTime, duration, sortOrder }) => ({
             title, desc, imageUrl, lat, lng, expectedTime, duration, sortOrder, visitDate: shift(visitDate),
@@ -426,21 +557,40 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
             name, nights, details, checkInDate: shift(checkInDate), checkOutDate: shift(checkOutDate),
           })),
         },
+        drivers: { create: crew.driverIds.map((userId, idx) => ({ userId, isPrimary: idx === 0 })) },
+        supervisors: { create: crew.supervisorIds.map((userId, idx) => ({ userId, isPrimary: idx === 0 })) },
       },
     });
 
     for (const stay of source.hotelBookings) {
       if (!stay.hotel.isActive) continue;
-      const nights = Math.round((stay.checkOut.getTime() - stay.checkIn.getTime()) / (24 * 60 * 60 * 1000));
+      const nights = Math.round((stay.checkOut.getTime() - stay.checkIn.getTime()) / DAY_MS);
       await this.rooms.openForTrip(tx, draft, stay.hotelId, nights);
     }
-    await this.notifications.toStaff(tx, 'STAFF_FIXED_TRIP_DRAFTED', ['trips.manage'], {}, { tripId: draft.id });
+    if (crew.driverIds.length || crew.supervisorIds.length) {
+      await this.logCrew(tx, draft.id, { drivers: [], supervisors: [] }, { drivers: crew.driverIds, supervisors: crew.supervisorIds }, undefined, 'نسخة من جدول الرحلة الأسبوعي');
+    }
+    return draft;
   }
 
-  private resolveSchedule(scheduleType: 'TEMPORARY' | 'FIXED', calendar: 'HIJRI' | 'GREGORIAN' | null | undefined) {
-    if (scheduleType === 'TEMPORARY') return { scheduleType, recurrenceCalendar: null };
-    if (!calendar) throw new BadRequestException('حدد تقويم تكرار الرحلة الثابتة: هجري أو ميلادي');
-    return { scheduleType, recurrenceCalendar: calendar };
+  /**
+   * One-off, temporary weekly until a last day, fixed yearly on a calendar, or fixed weekly kept a year ahead.
+   * Only the weekly kinds keep weekdays, and only the temporary weekly one a last day.
+   */
+  private resolveSchedule(input: { scheduleType: TripScheduleType; calendar?: TripCalendar | null; weekdays?: number[]; until?: Date | null; departure: Date }): Schedule {
+    const weekdays = [...new Set(input.weekdays ?? [])].sort((a, b) => a - b);
+    if (weekdays.length === 0) {
+      if (input.scheduleType === 'TEMPORARY') return { scheduleType: 'TEMPORARY', recurrenceCalendar: null, repeatWeekdays: [], repeatUntil: null };
+      if (!input.calendar) throw new BadRequestException('حدد تقويم تكرار الرحلة الثابتة: هجري أو ميلادي');
+      return { scheduleType: 'FIXED', recurrenceCalendar: input.calendar, repeatWeekdays: [], repeatUntil: null };
+    }
+    if (input.scheduleType === 'FIXED') return { scheduleType: 'FIXED', recurrenceCalendar: null, repeatWeekdays: weekdays, repeatUntil: null };
+    if (!input.until) throw new BadRequestException('حدد آخر يوم تتكرر فيه الرحلة المؤقتة');
+    if (input.until <= input.departure) throw new BadRequestException('آخر يوم للتكرار يجب أن يكون بعد موعد الرحلة الأولى');
+    if (input.until.getTime() - input.departure.getTime() > WEEKLY_HORIZON_DAYS * DAY_MS) {
+      throw new BadRequestException('الرحلة المؤقتة تتكرر سنة على الأكثر، وللأطول اجعلها ثابتة');
+    }
+    return { scheduleType: 'TEMPORARY', recurrenceCalendar: null, repeatWeekdays: weekdays, repeatUntil: input.until };
   }
 
   async searchTrips(filters: TripSearchFilters) {
@@ -575,10 +725,10 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
     const people = [...window.driverIds, ...window.supervisorIds];
     const resources: Prisma.TripWhereInput[] = [];
     if (window.busId) resources.push({ busId: window.busId });
-    if (people.length > 0) {
-      resources.push({ drivers: { some: { userId: { in: people } } } });
-      resources.push({ supervisors: { some: { userId: { in: people } } } });
-    }
+    // A supervisor may look after several trips at once, but a driver is behind one wheel: whoever drives a trip at
+    // that time cannot join another, and whoever is to drive this one cannot be on another trip.
+    if (people.length > 0) resources.push({ drivers: { some: { userId: { in: people } } } });
+    if (window.driverIds.length > 0) resources.push({ supervisors: { some: { userId: { in: window.driverIds } } } });
     if (resources.length === 0) return;
 
     const clash = await db.trip.findFirst({
@@ -639,7 +789,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
   async saveImages(uploadedById: string, files: UploadedImage[] = []) {
     if (files.length === 0) throw new BadRequestException('اختر صورة واحدة على الأقل');
     const rows = files.map((file) => {
-      const mimeType = publicImageType(file.buffer);
+      const mimeType = imageTypeOf(file.buffer);
       if (!mimeType) throw new BadRequestException('الصور المقبولة: JPG أو PNG أو WEBP');
       return { mimeType, size: file.size, data: file.buffer, uploadedById };
     });
@@ -722,15 +872,26 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
       unpaidBoarding: dto.unpaidBoarding ?? 'BLOCK',
     };
     this.assertCrewWindowSettings(crewWindowSettings);
-    const schedule = this.resolveSchedule(dto.scheduleType ?? 'TEMPORARY', dto.recurrenceCalendar);
+    const schedule = this.resolveSchedule({
+      scheduleType: dto.scheduleType ?? 'TEMPORARY',
+      calendar: dto.recurrenceCalendar,
+      weekdays: dto.repeatWeekdays,
+      until: dto.repeatUntil ? new Date(dto.repeatUntil) : null,
+      departure,
+    });
+    // The first trip of a weekly schedule names the series, so it can be found from any of its copies.
+    const id = randomUUID();
+    const seriesId = schedule.repeatWeekdays.length ? id : null;
 
-    return this.prisma.$transaction(async (tx) => {
+    const created = await this.prisma.$transaction(async (tx) => {
       const existing = await tx.trip.findUnique({ where: { tripCode: dto.tripCode } });
       if (existing) {
         throw new ConflictException(`Trip code ${dto.tripCode} already exists`);
       }
 
-      await this.resolveBus(tx, dto.busId);
+      const bus = await this.resolveBus(tx, dto.busId);
+      const layout = seatLayoutFor(bus);
+      const seatNumbers = seatNumbersOf(layout);
       const pkg = dto.packageId ? await assertTripFitsPackage(tx, dto.packageId, departure) : null;
       // A stay with no nights given lasts as long as the package it is sold under.
       const accommodation = dto.accommodation && { ...dto.accommodation, nights: dto.accommodation.nights ?? pkg?.nights ?? undefined };
@@ -752,6 +913,8 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
 
       const trip = await tx.trip.create({
         data: {
+          id,
+          seriesId,
           tripCode: dto.tripCode,
           title: dto.title || 'رحلة عمرة',
           origin: dto.origin,
@@ -763,8 +926,9 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
           hijriDate: dto.hijriDate || toHijriLabel(departure),
           busType: dto.busType || 'VIP 2+1',
           price: dto.price,
-          totalSeats: BUS_SEAT_COUNT,
-          availableSeats: BUS_SEAT_COUNT,
+          totalSeats: seatNumbers.length,
+          availableSeats: seatNumbers.length,
+          seatLayout: storedSeatLayout(layout),
           maxSeatsPerBooking: dto.maxSeatsPerBooking ?? 5,
           ...crewWindowSettings,
           miqat: dto.miqat || 'ميقات قرن المنازل',
@@ -789,7 +953,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
           channelApp: dto.channelApp ?? true,
           channelBranch: dto.channelBranch ?? true,
           seats: {
-            createMany: { data: BUS_SEAT_NUMBERS.map((seatNumber) => ({ seatNumber })) },
+            createMany: { data: seatNumbers.map((seatNumber) => ({ seatNumber })) },
           },
           images: dto.images?.length ? { create: dto.images.map((url) => ({ url })) } : undefined,
           boardingPoints: dto.boardingPoints?.length
@@ -818,6 +982,16 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
       if (trip.tripStatus === 'PUBLISHED') await this.notifications.toTripCrew(tx, 'CREW_TRIP_ASSIGNED', trip.id);
       return withSeatPrice(trip);
     }, TRIP_TX_OPTIONS);
+    if (seriesId) this.extendSeriesLater(seriesId);
+    return { ...created, seriesDrafting: !!seriesId };
+  }
+
+  /**
+   * A year of weekly trips takes a while to copy, so the response does not wait for it. If the server stops halfway,
+   * the sweep finishes the series.
+   */
+  private extendSeriesLater(seriesId: string) {
+    this.extendSeries(seriesId).catch((err) => console.error(`Could not draft weekly trips ${seriesId}:`, err.message));
   }
 
   private toBoardingPoint(bp: CreateTripDto['boardingPoints'][number]) {
@@ -897,7 +1071,8 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
       throw new BadRequestException('استخدم إجراء إلغاء الرحلة حتى تُعالج حجوزاتها');
     }
 
-    return this.prisma.$transaction(async (tx) => {
+    let startsSeries = false;
+    const result = await this.prisma.$transaction(async (tx) => {
       // Bookings take this lock too, so none can be sold between the checks below and the save.
       await lockTripsWithLinked(tx, [id]);
       const existing = await tx.trip.findUnique({
@@ -939,11 +1114,26 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
       if (existing.reverseOfTripId && dto.scheduleType === 'FIXED') {
         throw new BadRequestException('الرحلة العكسية لا يمكن أن تكون ثابتة، فهي تتبع رحلة الذهاب');
       }
-      const schedule = dto.scheduleType || dto.recurrenceCalendar
-        ? this.resolveSchedule(dto.scheduleType ?? existing.scheduleType, dto.recurrenceCalendar ?? existing.recurrenceCalendar)
-        : {};
+      if (existing.reverseOfTripId && dto.repeatWeekdays?.length) {
+        throw new BadRequestException('الرحلة العكسية لا تتكرر، فهي تتبع رحلة الذهاب');
+      }
 
       const departure = dto.departureTime ? new Date(dto.departureTime) : existing.departureTime;
+      const scheduleTouched = [dto.scheduleType, dto.recurrenceCalendar, dto.repeatWeekdays, dto.repeatUntil].some((value) => value !== undefined);
+      const schedule: Partial<Schedule> & { seriesId?: string } = scheduleTouched
+        ? this.resolveSchedule({
+            scheduleType: dto.scheduleType ?? existing.scheduleType,
+            calendar: dto.recurrenceCalendar ?? existing.recurrenceCalendar,
+            weekdays: dto.repeatWeekdays ?? existing.repeatWeekdays,
+            until: dto.repeatUntil === undefined ? existing.repeatUntil : dto.repeatUntil ? new Date(dto.repeatUntil) : null,
+            departure,
+          })
+        : {};
+      // A one-off trip made weekly starts its own series; a trip already in one stays in it.
+      if (schedule.repeatWeekdays?.length && !existing.seriesId) {
+        schedule.seriesId = id;
+        startsSeries = true;
+      }
       // A new departure with no new arrival keeps the trip's length, so moving a trip later needs only one date.
       const arrival = dto.arrivalTime
         ? new Date(dto.arrivalTime)
@@ -981,9 +1171,11 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
       if (packageId && (packageId !== existing.packageId || departureMoved)) await assertTripFitsPackage(tx, packageId, departure);
 
       const busId = dto.busId !== undefined ? dto.busId || null : existing.busId;
-      if (dto.busId !== undefined) await this.resolveBus(tx, busId);
+      const bus = dto.busId !== undefined ? await this.resolveBus(tx, busId) : null;
       // The bus may arrive after the trip went on sale, so what it allows is checked against who already booked.
       if (busId !== existing.busId) await assertSinglesFitRange(tx, { id }, await this.appSettings.singlesRange(busId));
+      // A van or minibus brings its own seats. Taking the vehicle off leaves the seats as they are until another is chosen.
+      if (bus && busId !== existing.busId) await applySeatLayout(tx, id, seatLayoutFor(bus));
       const driverIds = dto.driverIds ?? existing.drivers.map((d) => d.userId);
       const supervisorIds = dto.supervisorIds ?? existing.supervisors.map((s) => s.userId);
       // Only people joining the crew now are checked: someone already on it who was since suspended, or was approved
@@ -1137,6 +1329,8 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
       const updated = await tx.trip.findUniqueOrThrow({ where: { id }, include: ADMIN_TRIP_INCLUDE });
       return withSeatPrice(updated);
     }, TRIP_TX_OPTIONS);
+    if (startsSeries) this.extendSeriesLater(id);
+    return { ...result, seriesDrafting: startsSeries };
   }
 
   /**
@@ -1440,6 +1634,8 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
           price: trip.reversePrice,
           totalSeats: seatNumbers.length,
           availableSeats: seatNumbers.length,
+          // Same vehicle, so the same plan; the seats on sale are the ones the outbound left free.
+          seatLayout: storedSeatLayout(tripSeatLayout(trip)),
           maxSeatsPerBooking: trip.maxSeatsPerBooking,
           crewOpensBeforeMinutes: trip.crewOpensBeforeMinutes,
           boardingOpensBeforeMinutes: trip.boardingOpensBeforeMinutes,
@@ -1482,7 +1678,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
   private async reopenReverse(
     tx: Prisma.TransactionClient,
     cancelled: { id: string; busId: string | null },
-    outbound: { busId: string | null; reversePrice: Prisma.Decimal | null; destination: string; origin: string; drivers: { userId: string; isPrimary: boolean }[]; supervisors: { userId: string; isPrimary: boolean }[] },
+    outbound: { busId: string | null; seatLayout: Prisma.JsonValue; reversePrice: Prisma.Decimal | null; destination: string; origin: string; drivers: { userId: string; isPrimary: boolean }[]; supervisors: { userId: string; isPrimary: boolean }[] },
     opening: { departure: Date; arrival: Date; seatNumbers: string[]; dto: OpenReverseTripDto },
     actor?: CrewActor,
   ) {
@@ -1516,6 +1712,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
         price: outbound.reversePrice!,
         totalSeats: seatNumbers.length,
         availableSeats: seatNumbers.length,
+        seatLayout: storedSeatLayout(tripSeatLayout(outbound)),
         busId: outbound.busId,
         channelApp: dto.channelApp ?? true,
         channelBranch: dto.channelBranch ?? true,
@@ -1586,6 +1783,53 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
       },
       { timeout: 60_000 },
     );
+  }
+
+  /** Publishes the series' drafts that are still ahead. One that cannot go out yet is listed with why, and the rest still go. */
+  async publishSeries(seriesId: string, actor?: CrewActor) {
+    const drafts = await this.prisma.trip.findMany({
+      where: { seriesId, tripStatus: 'DRAFT', departureTime: { gt: new Date() } },
+      orderBy: { departureTime: 'asc' },
+      select: { id: true, tripCode: true },
+    });
+    if (drafts.length === 0) throw new NotFoundException('لا توجد مسودات قادمة في هذا الجدول');
+    let published = 0;
+    const failed: { tripCode: string; reason: string }[] = [];
+    for (const draft of drafts) {
+      try {
+        await this.updateTrip(draft.id, { tripStatus: 'PUBLISHED' }, actor);
+        published++;
+      } catch (err) {
+        if (!(err instanceof ConflictException || err instanceof BadRequestException)) throw err;
+        failed.push({ tripCode: draft.tripCode, reason: err.message });
+      }
+    }
+    return { published, failed };
+  }
+
+  /** No more weekly copies are drafted. Trips already made stay; with deleteDrafts, the unpublished ones still ahead go. */
+  async stopSeries(seriesId: string, deleteDrafts = false) {
+    const stopped = await this.prisma.$transaction(async (tx) => {
+      // Waits for a drafting run on this series to finish its current copy.
+      await tx.$queryRaw`SELECT 1 AS locked FROM pg_advisory_xact_lock(hashtext(${seriesId}))`;
+      return tx.trip.updateMany({
+        where: { seriesId },
+        data: { scheduleType: 'TEMPORARY', recurrenceCalendar: null, repeatWeekdays: [], repeatUntil: null },
+      });
+    }, TRIP_TX_OPTIONS);
+    if (stopped.count === 0) throw new NotFoundException('الجدول غير موجود');
+    let deleted = 0;
+    if (deleteDrafts) {
+      const drafts = await this.prisma.trip.findMany({
+        where: { seriesId, tripStatus: 'DRAFT', departureTime: { gt: new Date() }, bookings: { none: {} }, reverseTrip: null },
+        select: { id: true },
+      });
+      for (const draft of drafts) {
+        await this.deleteTrip(draft.id);
+        deleted++;
+      }
+    }
+    return { stopped: true, deleted };
   }
 
   async deleteTrip(id: string) {

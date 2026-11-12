@@ -7,7 +7,7 @@ import { lockBookingWithTrip } from '../../common/services/booking-cancellation.
 import { NotificationsService } from '../../common/services/notifications.service';
 import { AppSettingsService, withinHours } from '../../common/services/app-settings.service';
 import { csvCell } from '../../common/utils/csv.util';
-import { BUS_SEAT_LAYOUT } from '../../common/utils/bus-layout.util';
+import { tripSeatLayout } from '../../common/utils/bus-layout.util';
 import { goOnlyBookings, lockTripsWithLinked, releaseLinkedSeats, returnRideOf, reverseSeatsSummary, takeLinkedSeats } from '../../common/utils/linked-seats.util';
 import { paymentFigures } from '../../common/utils/payment.util';
 import { normalizeSaudiPhone } from '../../common/utils/phone.util';
@@ -323,14 +323,14 @@ export class BookingsAdminService {
   async seatMap(id: string) {
     const booking = await this.prisma.booking.findUnique({
       where: { id },
-      select: { category: true, trip: { select: { busType: true, busId: true, seats: true } } },
+      select: { category: true, trip: { select: { busType: true, busId: true, seatLayout: true, seats: true } } },
     });
     if (!booking) throw new NotFoundException('Booking not found');
     const now = new Date();
     return {
       category: booking.category,
       busType: booking.trip.busType,
-      layout: BUS_SEAT_LAYOUT,
+      layout: tripSeatLayout(booking.trip),
       // A singles booking may only move within this range.
       singlesRange: booking.category === 'SINGLES' ? await this.appSettings.singlesRange(booking.trip.busId) : null,
       seats: booking.trip.seats

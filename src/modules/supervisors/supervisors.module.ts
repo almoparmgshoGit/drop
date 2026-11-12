@@ -71,10 +71,13 @@ class SupervisorsService {
     }));
   }
 
-  /** Upcoming trips this person is not on, each marked when it overlaps a trip they already have. */
+  /**
+   * Upcoming trips this person is not on, each marked when it overlaps a trip they drive. A supervisor may look after
+   * several trips on the same day, so only driving ties them to one bus.
+   */
   async assignable(supervisorId: string) {
     const now = new Date();
-    const own = await this.prisma.tripSupervisor.findMany({
+    const own = await this.prisma.tripDriver.findMany({
       where: { userId: supervisorId, trip: { ...LIVE_TRIP, arrivalTime: { gte: now } } },
       select: { trip: { select: { id: true, tripCode: true, departureTime: true, arrivalTime: true, reverseOfTripId: true, reverseTrip: { select: { id: true } } } } },
     });

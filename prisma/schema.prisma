@@ -69,6 +69,13 @@ enum BusStatus {
   INACTIVE
 }
 
+/// A bus has the company's fixed plan; a van or a minibus has its seats drawn from the count entered for it.
+enum VehicleKind {
+  BUS
+  VAN
+  MINIBUS
+}
+
 enum BookingCategory {
   FAMILY
   SINGLES
@@ -169,6 +176,19 @@ enum HotelComplaintSource {
 }
 
 enum HotelComplaintStatus {
+  OPEN
+  RESOLVED
+}
+
+/// What a customer complains about from the app; hotel complaints have their own table.
+enum CustomerComplaintCategory {
+  APP
+  TRIP
+  SUPERVISOR
+  OTHER
+}
+
+enum CustomerComplaintStatus {
   OPEN
   RESOLVED
 }
@@ -372,6 +392,10 @@ model User {
   finalSettlements    FinalSettlement[]
   documents           EmployeeDocument[]
   crewAssignments     CrewAssignmentLog[]
+  /// When the customer's photo last changed; null while they have none. The bytes live in UserPhoto.
+  photoUpdatedAt      DateTime?
+  photo               UserPhoto?
+  customerComplaints  CustomerComplaint[]
 
   @@unique([idType, idNumber])
   @@index([idNumber])
@@ -477,6 +501,14 @@ model Trip {
   recurrenceCalendar         TripCalendar?
   /// Set once next year's draft was made, so deleting that draft does not bring it back.
   recurrenceDoneAt           DateTime?
+  /// Weekdays the trip repeats on, 0 for Sunday to 6 for Saturday in Riyadh. Empty for a one-off or a yearly trip.
+  repeatWeekdays             Int[]                 @default([])
+  /// The last day a temporary weekly trip repeats; a fixed weekly trip keeps going a year ahead.
+  repeatUntil                DateTime?
+  /// The trips made from one weekly schedule share this: the id of the trip that started it.
+  seriesId                   String?
+  /// The seat plan of the vehicle the trip was set up for. Null is the company's standard bus plan.
+  seatLayout                 Json?
   /// Where the crew says the bus is, as opposed to tripStatus, which is the trip's place in the office's workflow.
   liveStatus                 TripLiveStatus        @default(NOT_STARTED)
   liveStatusAt               DateTime?
@@ -531,6 +563,7 @@ model Trip {
   boardingPoints             BoardingPoint[]
   itineraryStops             ItineraryStop[]
   images                     TripImage[]
+  customerComplaints         CustomerComplaint[]
   services                   TripService[]
   visits                     TripVisit[]
   accommodations             Accommodation[]
@@ -541,6 +574,7 @@ model Trip {
   staffPenalties             StaffPenalty[]
 
   @@index([origin, destination, departureTime])
+  @@index([seriesId])
 }
 
 model TripImage {
@@ -690,7 +724,14 @@ model Package {
   id          String           @id @default(uuid())
   name        String
   description String?
+  /// What one person pays for the whole package. A package is sold to one to four people, each size at its own total.
   price       Decimal          @db.Decimal(10, 2)
+  /// The total for two people together, not each.
+  price2      Decimal          @db.Decimal(10, 2)
+  /// The total for three people together.
+  price3      Decimal          @db.Decimal(10, 2)
+  /// The total for four people together, the most one package booking takes.
+  price4      Decimal          @db.Decimal(10, 2)
   nights      Int              @default(1)
   type        String           @default("OMRA")
   startDate   DateTime?
@@ -775,6 +816,9 @@ model Bus {
   color           String       @default("أبيض")
   imageUrl        String?
   company         String       @default("دروب الهجرة للنقل")
+  kind            VehicleKind  @default(BUS)
+  /// Fixed at the standard plan's count for a bus; entered when a van or minibus is added.
+  seatCount       Int          @default(49)
   officeId        String?
   office          BusOffice?   @relation(fields: [officeId], references: [id], onDelete: Restrict)
   /// Where singles may sit on this bus, from seat to seat. Families may sit anywhere.
@@ -936,6 +980,7 @@ model Booking {
   payment             Payment?
   events              BookingEvent[]
   hotelComplaints     HotelComplaint[]
+  customerComplaints  CustomerComplaint[]
   cashMovements       CashMovement[]
   collections         BookingCollection[]
   paymentTransactions PaymentTransaction[]
@@ -1258,6 +1303,44 @@ model HotelRoomBlock {
   @@index([hotelId, roomNumber])
 }
 
+/// A customer's photo, apart from User so loading a user never carries the image.
+model UserPhoto {
+  userId    String   @id
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  mimeType  String
+  size      Int
+  data      Bytes
+  updatedAt DateTime @updatedAt
+}
+
+/// A complaint a customer sends from the app about the app, a trip, a supervisor or anything else.
+/// The customer's name, the trip code and the supervisors' names are copied in, since crews change and accounts can be deleted.
+model CustomerComplaint {
+  id              String                    @id @default(uuid())
+  number          Int                       @unique @default(autoincrement())
+  userId          String?
+  user            User?                     @relation(fields: [userId], references: [id], onDelete: SetNull)
+  category        CustomerComplaintCategory
+  status          CustomerComplaintStatus   @default(OPEN)
+  details         String
+  bookingId       String?
+  booking         Booking?                  @relation(fields: [bookingId], references: [id], onDelete: SetNull)
+  tripId          String?
+  trip            Trip?                     @relation(fields: [tripId], references: [id], onDelete: SetNull)
+  tripCode        String?
+  supervisorNames String?
+  customerName    String?
+  customerPhone   String?
+  resolution      String?
+  resolvedAt      DateTime?
+  resolvedByName  String?
+  createdAt       DateTime                  @default(now())
+  updatedAt       DateTime                  @updatedAt
+
+  @@index([status, category])
+  @@index([userId])
+}
+
 /// Append-only history of a booking; a database trigger rejects UPDATE and DELETE.
 model BookingEvent {
   id        String   @id @default(uuid())
@@ -1350,19 +1433,19 @@ model AuditLog {
 }
 
 model Coupon {
-  id           String     @id @default(uuid())
-  code         String     @unique
-  type         CouponType @default(FIXED_PER_SEAT)
-  value        Decimal    @db.Decimal(10, 2)
+  id           String       @id @default(uuid())
+  code         String       @unique
+  type         CouponType   @default(FIXED_PER_SEAT)
+  value        Decimal      @db.Decimal(10, 2)
   maxUses      Int?
-  usedCount    Int        @default(0)
+  usedCount    Int          @default(0)
   perUserLimit Int?
   validFrom    DateTime?
   validUntil   DateTime?
-  isActive     Boolean    @default(true)
+  isActive     Boolean      @default(true)
   ownerUserId  String?
-  owner        User?      @relation(fields: [ownerUserId], references: [id], onDelete: Cascade)
-  createdAt    DateTime   @default(now())
+  owner        User?        @relation(fields: [ownerUserId], references: [id], onDelete: Cascade)
+  createdAt    DateTime     @default(now())
   bookings     Booking[]
   campaigns    Campaign[]
   promoOffers  PromoOffer[]

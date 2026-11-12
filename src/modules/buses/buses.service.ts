@@ -1,9 +1,11 @@
 import { Injectable, NotFoundException, ConflictException, BadRequestException } from '@nestjs/common';
-import { BusStatus, Prisma } from '@prisma/client';
+import { BusStatus, Prisma, VehicleKind } from '@prisma/client';
 import { PrismaService } from '../../common/services/prisma.service';
 import { AppSettingsService } from '../../common/services/app-settings.service';
 import { applyBusServices } from '../../common/utils/bus-services.util';
+import { BUS_SEAT_COUNT, seatLayoutFor } from '../../common/utils/bus-layout.util';
 import { assertSinglesFitRange, assertValidSinglesRange } from '../../common/utils/singles-seats.util';
+import { applySeatLayout } from '../../common/utils/trip-seats.util';
 import { PublicService, SERVICE_SELECT } from '../../common/utils/services.util';
 
 interface BusInput {
@@ -15,8 +17,17 @@ interface BusInput {
   serviceIds?: string[];
   officeId?: string | null;
   status?: BusStatus;
+  kind?: VehicleKind;
+  seatCount?: number;
   singlesFromSeat?: number;
   singlesToSeat?: number;
+}
+
+/** A bus always has the fixed plan's seats; a van or minibus has the count entered for it. */
+function vehicleCapacity(kind: VehicleKind, seatCount: number | undefined) {
+  if (kind === 'BUS') return BUS_SEAT_COUNT;
+  if (!seatCount) throw new BadRequestException('أدخل عدد مقاعد المركبة');
+  return seatCount;
 }
 
 const OFFICE_SELECT = { select: { id: true, name: true } };
@@ -85,12 +96,18 @@ export class BusesService {
       throw new ConflictException(`Bus with plate number ${dto.plateNumber} already exists`);
     }
 
-    const defaults = await this.appSettings.singlesRange(null);
+    const kind = dto.kind ?? 'BUS';
+    const seatCount = vehicleCapacity(kind, dto.seatCount);
+    const settings = await this.appSettings.singlesRange(null);
+    // The settings follow the standard bus; a smaller vehicle they do not fit starts with singles at the back half.
+    const defaults = settings.to <= seatCount ? settings : { from: Math.floor(seatCount / 2) + 1, to: seatCount };
     const singles = { from: dto.singlesFromSeat ?? defaults.from, to: dto.singlesToSeat ?? defaults.to };
-    assertValidSinglesRange(singles);
+    assertValidSinglesRange(singles, seatCount);
     const serviceIds = await this.knownServices(dto.serviceIds);
     const bus = await this.prisma.bus.create({
       data: {
+        kind,
+        seatCount,
         singlesFromSeat: singles.from,
         singlesToSeat: singles.to,
         plateNumber: dto.plateNumber,
@@ -117,8 +134,11 @@ export class BusesService {
 
   async updateBus(id: string, dto: BusInput) {
     const bus = await this.getBusById(id);
+    const kind = dto.kind ?? bus.kind;
+    const seatCount = vehicleCapacity(kind, dto.seatCount ?? (kind === bus.kind ? bus.seatCount : undefined));
+    const capacityChanges = kind !== bus.kind || seatCount !== bus.seatCount;
     const singles = { from: dto.singlesFromSeat ?? bus.singlesFromSeat, to: dto.singlesToSeat ?? bus.singlesToSeat };
-    assertValidSinglesRange(singles);
+    assertValidSinglesRange(singles, seatCount);
     if (singles.from !== bus.singlesFromSeat || singles.to !== bus.singlesToSeat) {
       await assertSinglesFitRange(this.prisma, { busId: id, ...openTripsWhere() }, singles);
     }
@@ -142,9 +162,17 @@ export class BusesService {
         const openTrips = await tx.trip.findMany({ where: { busId: id, ...openTripsWhere() }, select: { id: true } });
         for (const trip of openTrips) await applyBusServices(tx, trip.id, id);
       }
+      if (capacityChanges) {
+        // Trips still to run take the new seats; one with a passenger on a seat that goes away stops the change.
+        const layout = seatLayoutFor({ kind, seatCount });
+        const openTrips = await tx.trip.findMany({ where: { busId: id, ...openTripsWhere() }, select: { id: true } });
+        for (const trip of openTrips) await applySeatLayout(tx, trip.id, layout);
+      }
       const updated = await tx.bus.update({
         where: { id },
         data: {
+          kind,
+          seatCount,
           plateNumber: dto.plateNumber,
           model: dto.model,
           color: dto.color,

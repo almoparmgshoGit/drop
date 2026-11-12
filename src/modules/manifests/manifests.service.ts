@@ -3,7 +3,7 @@ import { BookingStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../../common/services/prisma.service';
 import { BOOKING_KIND_LABELS } from '../../common/utils/booking-kinds.util';
 import { bookingHasStay, includesHousing } from '../../common/utils/booking-types.util';
-import { BUS_SEAT_LAYOUT } from '../../common/utils/bus-layout.util';
+import { tripSeatLayout } from '../../common/utils/bus-layout.util';
 import { goOnlyBookings, returningBookingIds, reverseSeatsSummary } from '../../common/utils/linked-seats.util';
 import { hotelBookingCost, paymentFigures } from '../../common/utils/payment.util';
 import { allocate, toHalalas, toSar } from '../bookings/bookings.service';
@@ -186,7 +186,7 @@ export class ManifestsService {
         ],
       },
       passengers,
-      layout: BUS_SEAT_LAYOUT,
+      layout: tripSeatLayout(trip),
       seats,
       reverse,
       summary: {

@@ -11,10 +11,10 @@ export const isSinglesSeat = (seat: string | number, range: SinglesRange) => Num
 
 export const describeSinglesRange = (range: SinglesRange) => `من ${range.from} إلى ${range.to}`;
 
-/** Checked against the fixed plan wherever a range is saved, on a bus or in the settings. */
-export function assertValidSinglesRange(range: SinglesRange) {
-  if (!Number.isInteger(range.from) || !Number.isInteger(range.to) || range.from < 1 || range.to > BUS_SEAT_COUNT || range.from > range.to) {
-    throw new BadRequestException(`نطاق مقاعد العزّاب يجب أن يكون بين 1 و${BUS_SEAT_COUNT}، وبدايته لا تتجاوز نهايته`);
+/** Checked against the vehicle's seats wherever a range is saved, on a bus or in the settings (which follow the standard bus). */
+export function assertValidSinglesRange(range: SinglesRange, capacity = BUS_SEAT_COUNT) {
+  if (!Number.isInteger(range.from) || !Number.isInteger(range.to) || range.from < 1 || range.to > capacity || range.from > range.to) {
+    throw new BadRequestException(`نطاق مقاعد العزّاب يجب أن يكون بين 1 و${capacity}، وبدايته لا تتجاوز نهايته`);
   }
 }
 

@@ -3,7 +3,7 @@ import { FilesInterceptor } from '@nestjs/platform-express';
 import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
 import { IsBoolean, IsOptional, IsString, MaxLength } from 'class-validator';
 import { MAX_PUBLIC_IMAGE_BYTES, MAX_PUBLIC_IMAGES_PER_UPLOAD, TripsService, UploadedImage } from './trips.service';
-import { CreateTripDto, OpenReverseTripDto, ReverseTripsQuery, UpdateTripDto } from './trips.dto';
+import { CreateTripDto, OpenReverseTripDto, ReverseTripsQuery, StopSeriesDto, UpdateTripDto } from './trips.dto';
 import { Public, RequirePermission } from '../../common/decorators/auth.decorators';
 
 class TripSearchQuery {
@@ -71,6 +71,22 @@ export class TripsController {
   @ApiOperation({ summary: 'Upcoming trips with a reverse trip on their remaining seats' })
   async getReverseTrips(@Query() query: ReverseTripsQuery) {
     return this.tripsService.getReverseTrips(query.range);
+  }
+
+  @Post('series/:seriesId/publish')
+  @RequirePermission('trips.manage')
+  @ApiBearerAuth()
+  @ApiOperation({ summary: "Publish a weekly schedule's upcoming drafts" })
+  async publishSeries(@Req() req, @Param('seriesId') seriesId: string) {
+    return this.tripsService.publishSeries(seriesId, req.user);
+  }
+
+  @Post('series/:seriesId/stop')
+  @RequirePermission('trips.manage')
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Stop drafting a weekly schedule, optionally removing its unpublished drafts' })
+  async stopSeries(@Param('seriesId') seriesId: string, @Body() dto: StopSeriesDto) {
+    return this.tripsService.stopSeries(seriesId, dto.deleteDrafts);
   }
 
   @Get('admin/:id')

@@ -3,6 +3,7 @@ import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../common/services/prisma.service';
 import { riyadhDayRange } from '../../common/utils/time.util';
 import { packageWindowProblem } from '../../common/utils/package-window.util';
+import { PACKAGE_MAX_PERSONS, PackagePrices, packagePriceTiers } from '../../common/utils/package-price.util';
 import { appTripWhere, PUBLIC_TRIP_INCLUDE, toPublicTrip } from '../trips/trips.service';
 import { CreatePackageDto, PackageSearchQuery, UpdatePackageDto } from './packages.controller';
 
@@ -16,10 +17,20 @@ const publicPackageArgs = (tripWhere: Prisma.TripWhereInput) => ({
   },
 });
 
-const toPublicPackage = <T extends { price: Prisma.Decimal; trips: object[] }>(pkg: T) => ({
+const toPublicPackage = <T extends PackagePrices & { trips: object[] }>(pkg: T) => ({
   ...pkg,
-  trips: pkg.trips.map((trip) => toPublicTrip({ ...trip, pricePerSeat: Number(pkg.price) })),
+  maxPersons: PACKAGE_MAX_PERSONS,
+  priceTiers: packagePriceTiers(pkg),
+  trips: pkg.trips.map((trip) => toPublicTrip({ ...trip, pricePerSeat: Number(pkg.price), packagePriceTiers: packagePriceTiers(pkg) })),
 });
+
+/** A bigger group paying less in total than a smaller one is almost always a typing slip. */
+function assertGroupPrices(prices: { price: number; price2: number; price3: number; price4: number }) {
+  const totals = [prices.price, prices.price2, prices.price3, prices.price4];
+  if (totals.some((total, index) => index > 0 && total < totals[index - 1])) {
+    throw new BadRequestException('سعر الباقة لعدد أكبر من الأشخاص لا يقل عن سعرها لعدد أقل');
+  }
+}
 
 /** undefined leaves the saved date alone, null or an empty value clears it. */
 const dateInput = (value: string | null | undefined) => (value === undefined ? undefined : value ? new Date(value) : null);
@@ -77,11 +88,13 @@ export class PackagesService {
 
   async createPackage(dto: CreatePackageDto) {
     this.assertDateOrder(dateInput(dto.startDate) ?? null, dateInput(dto.endDate) ?? null);
+    const prices = { price: dto.price, price2: dto.price2 ?? dto.price * 2, price3: dto.price3 ?? dto.price * 3, price4: dto.price4 ?? dto.price * 4 };
+    assertGroupPrices(prices);
     return this.prisma.package.create({
       data: {
         name: dto.name,
         description: dto.description,
-        price: dto.price,
+        ...prices,
         nights: dto.nights ?? 1,
         type: dto.type || 'OMRA',
         startDate: dto.startDate ? new Date(dto.startDate) : null,
@@ -104,6 +117,12 @@ export class PackagesService {
       const endDate = dateInput(dto.endDate);
       const window = { startDate: startDate === undefined ? existing.startDate : startDate, endDate: endDate === undefined ? existing.endDate : endDate };
       this.assertDateOrder(window.startDate, window.endDate);
+      assertGroupPrices({
+        price: dto.price ?? Number(existing.price),
+        price2: dto.price2 ?? Number(existing.price2),
+        price3: dto.price3 ?? Number(existing.price3),
+        price4: dto.price4 ?? Number(existing.price4),
+      });
       if (startDate !== undefined || endDate !== undefined) {
         // Narrowing the dates must not strand a trip that is still to run outside them.
         const trips = await tx.trip.findMany({
@@ -130,6 +149,9 @@ export class PackagesService {
           name: dto.name,
           description: dto.description,
           price: dto.price,
+          price2: dto.price2,
+          price3: dto.price3,
+          price4: dto.price4,
           nights: dto.nights,
           type: dto.type,
           startDate,

@@ -1,4 +1,4 @@
-import { BUS_SEAT_COUNT } from '../../common/utils/bus-layout.util';
+import { BUS_SEAT_COUNT, MAX_SMALL_VEHICLE_SEATS, MIN_SMALL_VEHICLE_SEATS } from '../../common/utils/bus-layout.util';
 import { PartialType } from '@nestjs/swagger';
 import { Transform, Type } from 'class-transformer';
 import {
@@ -19,7 +19,7 @@ import {
   MinLength,
   ValidateNested,
 } from 'class-validator';
-import { BusStatus } from '@prisma/client';
+import { BusStatus, VehicleKind } from '@prisma/client';
 import { toEnglishDigits } from '../../common/utils/phone.util';
 
 const trimmed = () => Transform(({ value }) => (typeof value === 'string' ? value.trim() : value));
@@ -50,6 +50,18 @@ export class CreateBusDto {
   @IsString()
   @MaxLength(500)
   imageUrl?: string;
+
+  /** A bus seats passengers on the fixed plan; a van or minibus on one drawn from seatCount. */
+  @IsOptional()
+  @IsEnum(VehicleKind, { message: 'اختر نوع المركبة: باص أو فان أو باص صغير' })
+  kind?: VehicleKind;
+
+  /** Required for a van or minibus; a bus always has the fixed plan's seats. */
+  @IsOptional()
+  @IsInt({ message: 'عدد المقاعد رقم صحيح' })
+  @Min(MIN_SMALL_VEHICLE_SEATS, { message: `عدد المقاعد لا يقل عن ${MIN_SMALL_VEHICLE_SEATS}` })
+  @Max(MAX_SMALL_VEHICLE_SEATS, { message: `عدد المقاعد لا يزيد عن ${MAX_SMALL_VEHICLE_SEATS}، وللأكثر اختر باص` })
+  seatCount?: number;
 
   /** Where singles sit on this bus. Left out, it starts from the settings. */
   @IsOptional()

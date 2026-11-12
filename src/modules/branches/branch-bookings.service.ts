@@ -8,7 +8,7 @@ import { PrismaService } from '../../common/services/prisma.service';
 import { BOOKING_KIND_LABELS, BOOKING_KIND_PARTS } from '../../common/utils/booking-kinds.util';
 import { housingCharge, HousingTerms, isRoomSellable } from '../../common/utils/housing-price.util';
 import { vatInside } from '../../common/utils/invoice.util';
-import { BUS_SEAT_LAYOUT } from '../../common/utils/bus-layout.util';
+import { tripSeatLayout } from '../../common/utils/bus-layout.util';
 import { lockTripsWithLinked, takeLinkedSeats } from '../../common/utils/linked-seats.util';
 import { halalas, netBookingFigures, paymentFigures } from '../../common/utils/payment.util';
 import { normalizeSaudiPhone } from '../../common/utils/phone.util';
@@ -17,12 +17,14 @@ import { allocate, BookingsService, holdAvailableTo, randomCode, toSar } from '.
 import { CashActor, CashService } from '../cash/cash.service';
 import { CollectionsService } from '../cash/collections.service';
 import { CreateJourneyDto, JourneyQuoteDto, TripSearchQuery } from './branches.dto';
+import { PACKAGE_PRICE_SELECT, packageGroupTotal, packagePriceTiers } from '../../common/utils/package-price.util';
 
 type Db = Prisma.TransactionClient;
 
 const TX_OPTIONS = { maxWait: 10_000, timeout: 30_000 };
 const MAX_NIGHTS = 60;
 const RECENT_LIMIT = 10;
+const CUSTOMER_HISTORY_LIMIT = 15;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const RIYADH_OFFSET_MS = 3 * 60 * 60 * 1000;
 
@@ -51,7 +53,7 @@ const JOURNEY_TRIP = {
   housingPriceMode: true,
   privateRoomPriceBasis: true,
   housingPricePeriod: true,
-  package: { select: { price: true, status: true } },
+  package: { select: { ...PACKAGE_PRICE_SELECT, status: true } },
   hotelBookings: { where: { status: 'CONFIRMED' as const }, select: { hotelId: true } },
 } satisfies Prisma.TripSelect;
 
@@ -153,14 +155,18 @@ export class BranchBookingsService {
           totalSeats: true,
           price: true,
           bookingType: true,
-          package: { select: { price: true } },
+          package: { select: PACKAGE_PRICE_SELECT },
           boardingPoints: { select: { id: true, name: true, time: true } },
         },
       }),
       this.prisma.trip.findMany({ where: open, distinct: ['origin', 'destination'], select: { origin: true, destination: true } }),
     ]);
     return {
-      items: items.map(({ package: pack, price, ...trip }) => ({ ...trip, price: Number(pack?.price ?? price) })),
+      items: items.map(({ package: pack, price, ...trip }) => ({
+        ...trip,
+        price: Number(pack?.price ?? price),
+        packagePriceTiers: pack ? packagePriceTiers(pack) : null,
+      })),
       origins: [...new Set(places.map((place) => place.origin))].sort(),
       destinations: [...new Set(places.map((place) => place.destination))].sort(),
     };
@@ -169,13 +175,13 @@ export class BranchBookingsService {
   async seatMap(tripId: string) {
     const trip = await this.prisma.trip.findFirst({
       where: { id: tripId, tripStatus: 'PUBLISHED', channelBranch: true, OR: [{ packageId: null }, { package: { status: 'PUBLISHED' } }] },
-      select: { totalSeats: true, availableSeats: true, seats: { select: { seatNumber: true, isBooked: true, heldUntil: true } } },
+      select: { totalSeats: true, availableSeats: true, seatLayout: true, seats: { select: { seatNumber: true, isBooked: true, heldUntil: true } } },
     });
     if (!trip) throw new NotFoundException('الرحلة غير موجودة');
     const now = new Date();
     return {
       totalSeats: trip.totalSeats,
-      layout: BUS_SEAT_LAYOUT,
+      layout: tripSeatLayout(trip),
       availableSeats: trip.availableSeats,
       seats: trip.seats
         .map((seat) => ({ seatNumber: seat.seatNumber, status: seat.isBooked ? 'booked' : seat.heldUntil && seat.heldUntil > now ? 'held' : 'available' }))
@@ -201,18 +207,96 @@ export class BranchBookingsService {
     return hotels.map((hotel) => ({ ...hotel, bedPrice: hotel.bedPrice === null ? null : Number(hotel.bedPrice), privateRoomPrice: hotel.privateRoomPrice === null ? null : Number(hotel.privateRoomPrice) }));
   }
 
+  /** Everything the counter needs about a returning customer: their details to fill the form, and their bookings so far. */
   async findCustomer(phoneText: string) {
     const phone = normalizeSaudiPhone(phoneText);
-    const user = await this.prisma.user.findUnique({ where: { phone }, select: { name: true, idType: true, idNumber: true } });
-    if (!user) return { found: false, name: null, nationalId: null, idType: null };
+    const local = phone.slice(4);
+    // A companion booked under someone else's account can still be found by the phone typed for them.
+    const where: Prisma.BookingWhereInput = { OR: [{ user: { phone } }, { passengers: { some: { phone: { in: [phone, `0${local}`, local, `966${local}`] } } } }] };
+    const [user, bookings, total, cancelled, boarded] = await Promise.all([
+      this.prisma.user.findUnique({ where: { phone }, select: { name: true, idType: true, idNumber: true, createdAt: true } }),
+      this.prisma.booking.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        take: CUSTOMER_HISTORY_LIMIT,
+        select: {
+          id: true,
+          bookingReference: true,
+          status: true,
+          kind: true,
+          source: true,
+          createdAt: true,
+          totalPrice: true,
+          refundAmount: true,
+          externalRefunded: true,
+          boardingPointName: true,
+          stayNights: true,
+          stayHotel: { select: { name: true } },
+          branch: { select: { name: true } },
+          trip: { select: { tripCode: true, origin: true, destination: true, departureTime: true } },
+          passengers: { select: { fullName: true, nationalId: true, phone: true, seatNumber: true, ticket: { select: { boardedAt: true, isBoarded: true } } } },
+          user: { select: { phone: true } },
+          payment: { select: { amount: true, walletAmount: true, status: true } },
+          collections: { select: { amount: true } },
+          cashMovements: { where: { type: 'BOOKING_REFUND' }, select: { amount: true } },
+        },
+      }),
+      this.prisma.booking.count({ where }),
+      this.prisma.booking.count({ where: { AND: [where, { status: 'CANCELLED' }] } }),
+      // A trip counts as ridden once anyone on the booking was scanned onto the bus.
+      this.prisma.booking.count({ where: { AND: [where, { OR: [{ status: 'BOARDED' }, { tickets: { some: { isBoarded: true } } }] }] } }),
+    ]);
+    if (!user && bookings.length === 0) return { found: false, name: null, nationalId: null, idType: null, lastBoardingPoint: null, stats: null, history: [] };
+
+    // This phone's own passenger row comes first; the account holder is the fallback.
+    const own = (booking: (typeof bookings)[number]) =>
+      booking.passengers.find((p) => p.phone && p.phone.replace(/\D/g, '').endsWith(local)) ??
+      (booking.user.phone === phone ? [...booking.passengers].sort((a, b) => Number(a.seatNumber) - Number(b.seatNumber))[0] : undefined);
+    const lastNamed = bookings.map(own).find((p) => p?.fullName);
     // The document the customer registered with comes first; a number typed on an earlier booking only fills in for it.
-    if (user.idNumber) return { found: true, name: user.name, nationalId: user.idNumber, idType: user.idType };
-    const last = await this.prisma.bookingPassenger.findFirst({
-      where: { booking: { user: { phone } }, nationalId: { not: null } },
-      orderBy: { booking: { createdAt: 'desc' } },
-      select: { nationalId: true },
-    });
-    return { found: true, name: user.name, nationalId: last?.nationalId ?? null, idType: null };
+    const nationalId = user?.idNumber ?? bookings.map(own).find((p) => p?.nationalId)?.nationalId ?? null;
+    const lastBoardingPoint = bookings.find((b) => b.status !== 'CANCELLED' && b.boardingPointName)?.boardingPointName ?? null;
+    const now = Date.now();
+
+    return {
+      found: true,
+      name: user?.name || lastNamed?.fullName || null,
+      nationalId,
+      idType: user?.idNumber ? user.idType : null,
+      lastBoardingPoint,
+      stats: {
+        total,
+        boarded,
+        cancelled,
+        upcoming: bookings.filter((b) => b.status !== 'CANCELLED' && b.trip.departureTime.getTime() > now).length,
+        customerSince: user?.createdAt ?? bookings[bookings.length - 1]?.createdAt ?? null,
+      },
+      history: bookings.map((booking) => {
+        const { remaining } = netBookingFigures(booking);
+        const boardedAt = booking.passengers.map((p) => p.ticket?.boardedAt).find(Boolean) ?? null;
+        return {
+          id: booking.id,
+          reference: booking.bookingReference,
+          status: booking.status,
+          kindLabel: booking.kind ? BOOKING_KIND_LABELS[booking.kind] : null,
+          source: booking.source,
+          branchName: booking.branch?.name ?? null,
+          createdAt: booking.createdAt,
+          tripCode: booking.trip.tripCode,
+          route: `${booking.trip.origin} ← ${booking.trip.destination}`,
+          departureTime: booking.trip.departureTime,
+          seats: booking.passengers.map((p) => p.seatNumber).sort((a, b) => Number(a) - Number(b)),
+          passengers: booking.passengers.map((p) => p.fullName),
+          boardingPoint: booking.boardingPointName,
+          stay: booking.stayHotel ? `${booking.stayHotel.name}${booking.stayNights ? ` · ${booking.stayNights} ليالٍ` : ''}` : null,
+          total: Number(booking.totalPrice),
+          remaining: toSar(remaining),
+          boarded: booking.status === 'BOARDED' || booking.passengers.some((p) => p.ticket?.isBoarded),
+          boardedAt,
+          upcoming: booking.status !== 'CANCELLED' && booking.trip.departureTime.getTime() > now,
+        };
+      }),
+    };
   }
 
   async recent(actor: CashActor, branchId?: string) {
@@ -310,8 +394,10 @@ export class BranchBookingsService {
       const trip = trips.find((row) => row.id === leg.tripId);
       this.assertSellable(trip);
       const seats = normalizeSeats(leg.seats);
-      const unitPrice = halalas(trip.package?.price ?? trip.price);
-      return { leg, trip, seats, unitPrice, transport: unitPrice * seats.length };
+      // A package charges its total for the group's size, the same rule as the app.
+      const transport = trip.package ? packageGroupTotal(trip.package, seats.length) : halalas(trip.price) * seats.length;
+      const unitPrice = seats.length ? Math.round(transport / seats.length) : halalas(trip.price);
+      return { leg, trip, seats, unitPrice, transport };
     });
     const outboundTrip = priced.find((row) => row.leg.leg === 'OUTBOUND')?.trip;
     const returnTrip = priced.find((row) => row.leg.leg === 'RETURN')?.trip;

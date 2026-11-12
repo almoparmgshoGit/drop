@@ -14,6 +14,7 @@ import { permissionsOf } from '../../common/permissions';
 import { NATIONALITIES } from '../../common/profile-options';
 import { CustomerLookupService, LOOKUP_RESULT_LIMIT, LookupActor } from '../../common/services/customer-lookup.service';
 import { CustomerLookup, identityData, parseCustomerLookup } from '../../common/utils/identity.util';
+import { imageTypeOf } from '../../common/utils/image-type.util';
 import { legacyIdentity, staffIdentityData, StaffIdentityInput } from '../../common/utils/staff-identity.util';
 
 export interface UserActor {
@@ -78,6 +79,13 @@ const driverProfileData = (data: { iqamaNumber?: string; nationality?: string; l
 
 const EMPLOYEE_SELECT = { driverProfile: { select: { iqamaNumber: true } } } as const;
 
+export interface UploadedPhoto {
+  buffer: Buffer;
+  size: number;
+}
+
+export const MAX_PHOTO_BYTES = 5 * 1024 * 1024;
+
 const USER_SELECT = {
   id: true,
   phone: true,
@@ -98,6 +106,7 @@ const USER_SELECT = {
   birthDate: true,
   messageLanguage: true,
   marketingOptOutAt: true,
+  photoUpdatedAt: true,
   createdAt: true,
 } as const;
 
@@ -510,6 +519,49 @@ export class UsersService implements OnModuleInit, OnModuleDestroy {
       take: 10,
     });
     return users.map(({ passwordHash, ...user }) => ({ ...user, hasPassword: !!passwordHash }));
+  }
+
+  /** Replaces the account's photo; the bytes decide whether it is an image, not the name or type the phone sent. */
+  async setPhoto(userId: string, file?: UploadedPhoto) {
+    if (!file?.buffer?.length) throw new BadRequestException('اختر صورة');
+    const mimeType = imageTypeOf(file.buffer);
+    if (!mimeType) throw new BadRequestException('الصور المقبولة: JPG أو PNG أو WEBP');
+    const exists = await this.prisma.user.count({ where: { id: userId } });
+    if (!exists) throw new NotFoundException('User not found');
+    const photoUpdatedAt = new Date();
+    await this.prisma.$transaction([
+      this.prisma.userPhoto.upsert({
+        where: { userId },
+        create: { userId, mimeType, size: file.buffer.length, data: file.buffer },
+        update: { mimeType, size: file.buffer.length, data: file.buffer },
+      }),
+      this.prisma.user.update({ where: { id: userId }, data: { photoUpdatedAt } }),
+    ]);
+    return { photoUpdatedAt };
+  }
+
+  async removePhoto(userId: string) {
+    await this.prisma.$transaction([
+      this.prisma.userPhoto.deleteMany({ where: { userId } }),
+      this.prisma.user.updateMany({ where: { id: userId }, data: { photoUpdatedAt: null } }),
+    ]);
+    return { photoUpdatedAt: null };
+  }
+
+  async getPhoto(userId: string) {
+    const photo = await this.prisma.userPhoto.findUnique({ where: { userId } });
+    if (!photo) throw new NotFoundException('لا توجد صورة');
+    return photo;
+  }
+
+  /** Staff reach a customer's photo with the same right that opens the customer; an employee's photo is HR's. */
+  async assertCustomerPhotoAccess(actor: UserActor, userId: string, write: boolean) {
+    const user = await this.prisma.user.findUnique({ where: { id: userId }, select: { role: true } });
+    if (!user) throw new NotFoundException('User not found');
+    if (user.role !== 'PASSENGER') {
+      if (write) throw new ForbiddenException('صورة الموظف تُدار من ملفه في الموارد البشرية');
+      if (!actor.permissions.includes('employees.view')) throw new ForbiddenException('ليست لديك صلاحية لعرض هذا الحساب');
+    }
   }
 
   async getUserDetails(actor: UserActor, userId: string) {

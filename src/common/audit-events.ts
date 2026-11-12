@@ -110,6 +110,9 @@ export const AUDIT_EVENTS: Record<string, Event> = {
   'POST /hotels/:id/complaints/:complaintId/resolve': on('hotels', 'إغلاق شكوى فندق'),
   'POST /hotels/:id/complaints/:complaintId/reopen': on('hotels', 'إعادة فتح شكوى فندق'),
   'POST /bookings/:bookingId/hotel-complaints': on('hotels', 'إرسال شكوى عن فندق'),
+  'POST /complaints': on('customers', 'إرسال شكوى من التطبيق'),
+  'POST /complaints/:id/resolve': on('customers', 'الرد على شكوى عميل وإغلاقها'),
+  'POST /complaints/:id/reopen': on('customers', 'إعادة فتح شكوى عميل'),
 
   'POST /trip-accounts/categories': on('accounts', 'إضافة بند لحساب الرحلات'),
   'PATCH /trip-accounts/categories/:id': on('accounts', 'تعديل بند في حساب الرحلات'),
@@ -139,6 +142,10 @@ export const AUDIT_EVENTS: Record<string, Event> = {
   'PUT /users/:id/wallet/reset': on('customers', 'تصفير رصيد محفظة'),
   'DELETE /users/:id': on('customers', 'حذف مستخدم'),
   'PUT /users/profile': on('account', 'تعديل الملف الشخصي'),
+  'PUT /users/profile/photo': on('account', 'تغيير الصورة الشخصية'),
+  'DELETE /users/profile/photo': on('account', 'حذف الصورة الشخصية'),
+  'PUT /users/:id/photo': on('customers', 'تغيير صورة عميل'),
+  'DELETE /users/:id/photo': on('customers', 'حذف صورة عميل'),
   'POST /users/profile/loyalty/referral': on('account', 'إدخال رمز دعوة'),
   'POST /users/profile/loyalty/vouchers/:id/redeem': on('account', 'استبدال قسيمة بالنقاط'),
 

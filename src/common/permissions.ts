@@ -46,6 +46,13 @@ export const PERMISSION_GROUPS = [
     ],
   },
   {
+    title: 'شكاوى العملاء',
+    items: [
+      { key: 'complaints.view', label: 'عرض الشكاوى التي يرسلها العملاء من التطبيق' },
+      { key: 'complaints.manage', label: 'الرد على شكاوى العملاء وإغلاقها وإعادة فتحها' },
+    ],
+  },
+  {
     title: 'الفنادق والسكن',
     items: [
       { key: 'hotels.view', label: 'عرض الفنادق والتسكين والشكاوى' },

@@ -38,3 +38,26 @@ function nextHijri(from: Date) {
 export function nextYearlyDate(from: Date, calendar: TripCalendar) {
   return calendar === 'HIJRI' ? nextHijri(from) : nextGregorian(from);
 }
+
+/** How far ahead a fixed weekly trip is kept drafted, and the longest a temporary weekly one may run. */
+export const WEEKLY_HORIZON_DAYS = 365;
+
+const riyadhMsOfDay = (date: Date) => (((date.getTime() + RIYADH_OFFSET_MS) % DAY_MS) + DAY_MS) % DAY_MS;
+
+/** The weekday in Riyadh, 0 for Sunday to 6 for Saturday. */
+export const riyadhWeekday = (date: Date) => new Date(date.getTime() + RIYADH_OFFSET_MS).getUTCDay();
+
+/**
+ * The first departure after `after`, and after `notBefore`, that falls on one of the weekdays, at the Riyadh time of day of
+ * `timeOf`. Riyadh keeps one offset all year, so a day is always 24 hours.
+ */
+export function nextWeeklyDate(after: Date, weekdays: number[], timeOf: Date, notBefore = after): Date | null {
+  if (weekdays.length === 0) return null;
+  const start = new Date(Math.max(after.getTime(), notBefore.getTime()));
+  const dayStart = start.getTime() - riyadhMsOfDay(start);
+  for (let day = 0; day <= 7; day++) {
+    const candidate = new Date(dayStart + day * DAY_MS + riyadhMsOfDay(timeOf));
+    if (candidate > start && weekdays.includes(riyadhWeekday(candidate))) return candidate;
+  }
+  return null;
+}

@@ -214,6 +214,23 @@ export class CreateTripDto {
   @IsEnum(TripCalendar)
   recurrenceCalendar?: TripCalendar | null;
 
+  /**
+   * Weekdays to repeat on, 0 for Sunday to 6 for Saturday. A fixed trip then repeats every week for a year ahead; a
+   * temporary one until repeatUntil. The copies are saved as drafts for the office to publish.
+   */
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(7)
+  @IsInt({ each: true })
+  @Min(0, { each: true })
+  @Max(6, { each: true })
+  repeatWeekdays?: number[];
+
+  /** The last day a temporary weekly trip runs. */
+  @IsOptional()
+  @IsDateString()
+  repeatUntil?: string | null;
+
   @IsOptional()
   @IsEnum(TripDirection)
   direction?: TripDirection;
@@ -388,6 +405,13 @@ export class OpenReverseTripDto {
   @IsOptional()
   @IsBoolean()
   channelBranch?: boolean;
+}
+
+export class StopSeriesDto {
+  /** Also removes the series' drafts that have not been published yet. */
+  @IsOptional()
+  @IsBoolean()
+  deleteDrafts?: boolean;
 }
 
 export class ReverseTripsQuery {

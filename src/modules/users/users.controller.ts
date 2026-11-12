@@ -1,14 +1,19 @@
-import { Controller, Get, Post, Put, Delete, Param, Body, Query, Req } from '@nestjs/common';
+import { Controller, Get, Header, Post, Put, Delete, Param, Body, Query, Req, StreamableFile, UploadedFile, UseInterceptors } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
 import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
 import { Gender, IdType } from '@prisma/client';
 import { Type } from 'class-transformer';
 import { ArrayUnique, IsArray, IsBoolean, IsEmail, IsIn, IsInt, IsString, IsNotEmpty, IsNumber, IsOptional, Length, Matches, Max, MaxLength, Min, ValidateIf } from 'class-validator';
-import { UsersService } from './users.service';
+import { MAX_PHOTO_BYTES, UploadedPhoto, UsersService } from './users.service';
 import { RequirePermission } from '../../common/decorators/auth.decorators';
 import { MESSAGE_LANGUAGES } from '../../common/notification-catalog';
 import { ALL_PERMISSIONS } from '../../common/permissions';
 import { GENDERS, NATIONALITIES, NATIVE_LANGUAGE_KEYS, NATIVE_LANGUAGES } from '../../common/profile-options';
 import { ID_TYPES, ID_TYPE_LABELS } from '../../common/utils/identity.util';
+
+/** Shown in place, never downloaded; only ever an image, since the bytes were checked on upload. */
+const inlinePhoto = (photo: { data: Uint8Array; mimeType: string; size: number }) =>
+  new StreamableFile(Buffer.from(photo.data), { type: photo.mimeType, length: photo.size, disposition: 'inline' });
 
 /** The same fields whoever edits them; null clears one. */
 class ProfileDetailsDto {
@@ -386,6 +391,26 @@ export class UsersController {
     return this.usersService.updateProfile(req.user.userId, dto);
   }
 
+  @Get('profile/photo')
+  @Header('Cache-Control', 'private, max-age=86400')
+  @ApiOperation({ summary: 'My photo; the app adds photoUpdatedAt to the address so a new one is not served from cache' })
+  async getMyPhoto(@Req() req) {
+    return inlinePhoto(await this.usersService.getPhoto(req.user.userId));
+  }
+
+  @Put('profile/photo')
+  @UseInterceptors(FileInterceptor('photo', { limits: { fileSize: MAX_PHOTO_BYTES } }))
+  @ApiOperation({ summary: 'Set or replace my photo (multipart field "photo": JPG, PNG or WEBP)' })
+  async setMyPhoto(@Req() req, @UploadedFile() file?: UploadedPhoto) {
+    return this.usersService.setPhoto(req.user.userId, file);
+  }
+
+  @Delete('profile/photo')
+  @ApiOperation({ summary: 'Remove my photo' })
+  async removeMyPhoto(@Req() req) {
+    return this.usersService.removePhoto(req.user.userId);
+  }
+
   @Get('profile/options')
   @ApiOperation({ summary: 'The nationalities and native languages a profile can choose from' })
   getProfileOptions() {
@@ -482,6 +507,32 @@ export class UsersController {
   @ApiOperation({ summary: 'Get full user details with bookings and wallet history' })
   async getUserDetails(@Req() req, @Param('id') id: string) {
     return this.usersService.getUserDetails(req.user, id);
+  }
+
+  @Get(':id/photo')
+  @RequirePermission('customers.view', 'employees.view')
+  @Header('Cache-Control', 'private, max-age=86400')
+  @ApiOperation({ summary: "A customer's photo" })
+  async getUserPhoto(@Req() req, @Param('id') id: string) {
+    await this.usersService.assertCustomerPhotoAccess(req.user, id, false);
+    return inlinePhoto(await this.usersService.getPhoto(id));
+  }
+
+  @Put(':id/photo')
+  @RequirePermission('customers.manage')
+  @UseInterceptors(FileInterceptor('photo', { limits: { fileSize: MAX_PHOTO_BYTES } }))
+  @ApiOperation({ summary: "Set or replace a customer's photo (multipart field \"photo\")" })
+  async setUserPhoto(@Req() req, @Param('id') id: string, @UploadedFile() file?: UploadedPhoto) {
+    await this.usersService.assertCustomerPhotoAccess(req.user, id, true);
+    return this.usersService.setPhoto(id, file);
+  }
+
+  @Delete(':id/photo')
+  @RequirePermission('customers.manage')
+  @ApiOperation({ summary: "Remove a customer's photo" })
+  async removeUserPhoto(@Req() req, @Param('id') id: string) {
+    await this.usersService.assertCustomerPhotoAccess(req.user, id, true);
+    return this.usersService.removePhoto(id);
   }
 
   @Put(':id')

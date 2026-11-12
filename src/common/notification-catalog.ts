@@ -51,6 +51,8 @@ const VARIABLES = {
   complaintSubject: { label: 'موضوع الشكوى', example: 'نظافة الغرفة' },
   complaintAuthor: { label: 'مسجل الشكوى', example: 'منى الموظفة' },
   complaintResolution: { label: 'رد الإدارة على الشكوى', example: 'تم إصلاح التكييف والاعتذار من الفندق' },
+  complaintCategory: { label: 'نوع الشكوى', example: 'المشرف' },
+  roommates: { label: 'أسماء من يشاركون الغرفة', example: 'خالد سعيد، فهد علي' },
   boardingOpensTime: { label: 'وقت فتح الصعود', example: '19:30' },
   boardingClosesTime: { label: 'وقت إغلاق الصعود', example: '22:30' },
   senderName: { label: 'اسم المرسل', example: 'سالم المشرف' },
@@ -215,6 +217,32 @@ export const NOTIFICATION_CATALOG = {
     translations: {
       en: { title: 'Your room has changed', body: '{{passengerName}} is no longer assigned to room {{roomNumber}}. A new room will be assigned.' },
       ur: { title: 'آپ کی رہائش میں تبدیلی', body: 'کمرہ {{roomNumber}} میں {{passengerName}} کی رہائش منسوخ کر دی گئی ہے، نیا کمرہ جلد طے کیا جائے گا۔' },
+    },
+  },
+  ROOMMATES_UPDATED: {
+    audience: 'PASSENGER',
+    group: 'الحجوزات',
+    label: 'شركاء الغرفة',
+    trigger: 'عند تسكين مسافر في غرفة يشاركه فيها مسافرون من حجز آخر، ويصل لكل من في الغرفة',
+    title: 'من يشاركك الغرفة {{roomNumber}}',
+    body: 'يشارك {{passengerName}} الغرفة {{roomNumber}} بفندق {{hotelName}} مع: {{roommates}}. نتمنى لكم إقامة طيبة.',
+    variables: [...BOOKING, 'passengerName', 'hotelName', 'roomNumber', 'roommates'],
+    translations: {
+      en: { title: 'Who shares room {{roomNumber}} with you', body: '{{passengerName}} shares room {{roomNumber}} at {{hotelName}} with: {{roommates}}. We wish you a pleasant stay.' },
+      ur: { title: 'کمرہ {{roomNumber}} میں آپ کے ساتھی', body: 'ہوٹل {{hotelName}} کے کمرہ {{roomNumber}} میں {{passengerName}} کے ساتھ: {{roommates}}۔ آپ کا قیام خوشگوار ہو۔' },
+    },
+  },
+  CUSTOMER_COMPLAINT_RESOLVED: {
+    audience: 'PASSENGER',
+    group: 'الحجوزات',
+    label: 'الرد على شكوى من التطبيق',
+    trigger: 'عند رد الإدارة على شكوى أرسلها العميل عن التطبيق أو رحلة أو مشرف',
+    title: 'رددنا على شكواك',
+    body: 'شكواك {{complaintReference}} ({{complaintCategory}}): {{complaintResolution}}',
+    variables: ['userName', 'complaintReference', 'complaintCategory', 'complaintResolution'],
+    translations: {
+      en: { title: 'We have responded to your complaint', body: 'Your complaint {{complaintReference}}: {{complaintResolution}}' },
+      ur: { title: 'آپ کی شکایت کا جواب', body: 'آپ کی شکایت {{complaintReference}}: {{complaintResolution}}' },
     },
   },
   HOTEL_COMPLAINT_RESOLVED: {
@@ -983,6 +1011,19 @@ export const NOTIFICATION_CATALOG = {
     translations: {
       en: { title: 'Fixed trip draft {{tripCode}}', body: 'Trip {{tripCode}} from {{origin}} to {{destination}} on {{departureDate}} has been created as a draft. Review it, assign the bus and crew, then publish it.' },
       ur: { title: 'مستقل سفر کا مسودہ {{tripCode}}', body: 'سفر {{tripCode}}، {{origin}} سے {{destination}}، بتاریخ {{departureDate}}، مسودے کے طور پر بنایا گیا ہے۔ اس کا جائزہ لیں، بس اور عملہ مقرر کریں، پھر اسے شائع کریں۔' },
+    },
+  },
+  STAFF_CUSTOMER_COMPLAINT: {
+    audience: 'STAFF',
+    group: 'المكتب',
+    label: 'شكوى عميل من التطبيق',
+    trigger: 'عند إرسال عميل شكوى من التطبيق (لمن يملك عرض شكاوى العملاء)',
+    title: 'شكوى جديدة {{complaintReference}}: {{complaintCategory}}',
+    body: 'أرسل {{customerName}} شكوى عن {{complaintCategory}} من التطبيق. افتحها من صفحة الشكاوى للرد عليها.',
+    variables: ['userName', 'complaintReference', 'complaintCategory', 'customerName', 'customerPhone'],
+    translations: {
+      en: { title: 'New complaint {{complaintReference}}', body: '{{customerName}} sent a complaint ({{complaintCategory}}) from the app. Open it from the complaints page to reply.' },
+      ur: { title: 'نئی شکایت {{complaintReference}}', body: '{{customerName}} نے ایپ سے شکایت ({{complaintCategory}}) بھیجی ہے۔ جواب دینے کے لیے شکایات کا صفحہ کھولیں۔' },
     },
   },
   STAFF_HOTEL_COMPLAINT: {
