@@ -1,6 +1,6 @@
 import { BadRequestException, ConflictException, HttpException, HttpStatus, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
-import { NOTIFICATION_CATALOG, NotificationValues, renderTemplate } from '../notification-catalog';
+import { customerWording, NOTIFICATION_CATALOG, NotificationValues, renderNotification } from '../notification-catalog';
 import { isStationRuleKey, MANUAL_STATION_TYPES, ManualStationType, STATION_RULE_KEYS, STATION_RULES, StationRuleKey } from '../station-alert-rules';
 import { distanceInMeters } from '../utils/geo.util';
 import { returningBookingIds } from '../utils/linked-seats.util';
@@ -512,8 +512,8 @@ export class StationAlertsService {
     const custom = await this.prisma.notificationTemplate.findUnique({ where: { event } });
     const values = this.manualValues(trip, stopName, alert);
     return {
-      title: renderTemplate(custom?.title ?? entry.title, values),
-      body: renderTemplate(custom?.body ?? entry.body, values),
+      title: renderNotification(event, custom?.title ?? entry.title, values),
+      body: renderNotification(event, custom?.body ?? entry.body, values),
       recipients: new Set(bookingIds).size,
       whatsappReady: await this.whatsappReady(event),
     };
@@ -523,7 +523,7 @@ export class StationAlertsService {
     const entry = NOTIFICATION_CATALOG[event];
     const custom = await this.prisma.notificationTemplate.findUnique({ where: { event } });
     if (!custom?.whatsappEnabled) return false;
-    const approved = await approvedWhatsAppTemplates(this.prisma, event, (language) => (language === 'ar' ? custom.body : (entry as { translations?: Record<string, { body: string }> }).translations?.[language]?.body ?? custom.body));
+    const approved = await approvedWhatsAppTemplates(this.prisma, event, (language) => customerWording(event, language === 'ar' ? custom.body : (entry as { translations?: Record<string, { body: string }> }).translations?.[language]?.body ?? custom.body));
     return approved.size > 0;
   }
 
@@ -559,7 +559,7 @@ export class StationAlertsService {
           stopKey: alert.stopKey,
           stopName,
           manualType: alert.type,
-          message: renderTemplate(entry.body, values),
+          message: renderNotification(event, entry.body, values),
           recipients: unique.length,
           channels: alert.channels,
           senderId: actor.userId,

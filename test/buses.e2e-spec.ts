@@ -307,8 +307,9 @@ describe('Buses, drivers and office statements (e2e)', () => {
         reverseDepartureAt: new Date(Date.now() + 3000 * 24 * 3600000).toISOString(),
         reversePrice: 100,
       });
-      const reverse = await request(http()).post(`${API}/trips/${outbound.id}/open-reverse`).set(admin.auth).send({ boardingPointName: 'مكة' }).expect(201);
-      expect(reverse.body.services.map((s: any) => s.serviceId)).toEqual([charger.id]);
+      // Publishing the trip opened its way back with it.
+      const reverse = await prisma.trip.findFirstOrThrow({ where: { reverseOfTripId: outbound.id }, include: { services: true } });
+      expect(reverse.services.map((s) => s.serviceId)).toEqual([charger.id]);
     });
   });
 

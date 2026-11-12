@@ -1,6 +1,6 @@
 import { BadRequestException, ConflictException, Injectable, Logger, NotFoundException } from '@nestjs/common';
-import { paymentFigures } from '../utils/payment.util';
-import { LoyaltyTransactionType, Prisma } from '@prisma/client';
+import { halalas, paymentFigures } from '../utils/payment.util';
+import { BookingStatus, LoyaltyTransactionType, Prisma } from '@prisma/client';
 import * as crypto from 'crypto';
 import { formatSar, NotificationsService } from './notifications.service';
 import { PrismaService } from './prisma.service';
@@ -67,6 +67,42 @@ export interface EarnPlan {
 
 const toHalalas = (sar: number) => Math.round(sar * 100);
 
+/**
+ * The points a booking deserves for the money it has brought in and kept, in halalas, under the plan it was sold on.
+ * Only the tickets' share earns, the same rule as the checkout preview; a booking that kept no money earns no bonus either.
+ * The tiny allowance stops a float such as 114.99999999 losing a point the customer earned exactly.
+ */
+export function earnedPoints(keptHalalas: number, share: number, plan: Pick<EarnPlan, 'rate' | 'bonus'>) {
+  if (!(keptHalalas > 0)) return 0;
+  const transport = Math.round(keptHalalas * share);
+  const base = plan.rate > 0 ? Math.floor((transport * plan.rate) / 100 + 1e-9) : 0;
+  return Math.max(0, base + Math.floor(plan.bonus));
+}
+
+/** A booking still counts as sold in these; one under cancellation review waits for the decision. */
+const EARNING_STATUSES: BookingStatus[] = ['PENDING', 'CONFIRMED', 'BOARDED'];
+
+const EARN_SELECT = {
+  id: true,
+  userId: true,
+  bookingReference: true,
+  status: true,
+  loyaltyPlan: true,
+  subtotal: true,
+  housingAmount: true,
+  refundAmount: true,
+  externalRefunded: true,
+  trip: { select: { price: true, packageId: true } },
+  payment: { select: { amount: true, walletAmount: true, status: true } },
+  collections: { select: { amount: true } },
+  _count: { select: { passengers: true } },
+} satisfies Prisma.BookingSelect;
+
+type EarnBooking = Prisma.BookingGetPayload<{ select: typeof EARN_SELECT }>;
+
+/** Every write to a booking's points takes the booking's row first, the same lock its payments and cancellation hold. */
+const lockBooking = (tx: Db, bookingId: string) => tx.$queryRaw`SELECT "id" FROM "Booking" WHERE "id" = ${bookingId} FOR UPDATE`;
+
 @Injectable()
 export class LoyaltyService {
   private readonly logger = new Logger(LoyaltyService.name);
@@ -105,12 +141,25 @@ export class LoyaltyService {
     return next;
   }
 
+  /**
+   * Trips the customer travelled and earned on: settled when the trip completed, never cancelled since. Points are now
+   * credited at payment, so the EARNED rows alone would count bookings that never travelled.
+   */
+  private completedTrips(db: Db, userId: string, from: Date, to?: Date) {
+    return db.booking.count({
+      where: {
+        userId,
+        status: { not: 'CANCELLED' },
+        loyaltySettledAt: { gte: from, ...(to && { lt: to }) },
+        loyaltyTransactions: { some: { type: 'EARNED' } },
+      },
+    });
+  }
+
   /** The tier comes from trips actually completed in the last year. */
   async tierOf(db: Db, userId: string, program: LoyaltyProgram) {
     const { tiers } = program;
-    const trips = await db.loyaltyTransaction.count({
-      where: { userId, type: 'EARNED', createdAt: { gte: new Date(Date.now() - TIER_WINDOW_DAYS * DAY_MS) } },
-    });
+    const trips = await this.completedTrips(db, userId, new Date(Date.now() - TIER_WINDOW_DAYS * DAY_MS));
     if (!tiers.enabled) return { key: null, name: null, multiplier: 1, trips, nextName: null, tripsToNext: null };
     if (trips >= tiers.goldTrips) return { key: 'GOLD', name: 'ذهبي', multiplier: tiers.goldMultiplier, trips, nextName: null, tripsToNext: null };
     if (trips >= tiers.silverTrips) {
@@ -214,7 +263,7 @@ export class LoyaltyService {
     });
   }
 
-  /** Gives back the points a cancelled booking used. Runs inside the cancellation transaction. */
+  /** Gives back the points a cancelled booking used. Runs inside the cancellation transaction, before withdrawEarned, so the returned points count towards what can be taken back. */
   async restoreForCancelledBooking(tx: Db, booking: { id: string; userId: string; bookingReference: string; pointsRedeemed: number }) {
     if (booking.pointsRedeemed <= 0) return;
     await this.grant(tx, {
@@ -227,7 +276,98 @@ export class LoyaltyService {
     });
   }
 
-  /** Settles completed trips; repeat runs are harmless because a booking settles only once. */
+  /** The plan a booking earns on. Bookings sold without one (older ones, and the branches') earn at the base rate. */
+  private planOf(booking: Pick<EarnBooking, 'loyaltyPlan'>, program: LoyaltyProgram): EarnPlan {
+    return (booking.loyaltyPlan as unknown as EarnPlan | null) ?? { rate: program.enabled ? program.pointsPerRiyal : 0, bonus: 0, rules: [], tier: null };
+  }
+
+  /** What the booking deserves now: the money received less anything handed back, on the tickets' share only. */
+  private deserved(booking: EarnBooking, plan: EarnPlan) {
+    if (booking.status === 'CANCELLED') return 0;
+    const { received, wallet } = paymentFigures(booking.payment, booking.collections);
+    const kept = received + wallet - halalas(booking.refundAmount ?? 0) - halalas(booking.externalRefunded);
+    return earnedPoints(kept, transportShare({ ...booking, seats: booking._count.passengers }), plan);
+  }
+
+  /**
+   * Credits a booking's points once it is paid in full, online, from the wallet or at a branch counter. Runs inside the
+   * transaction that completed the payment, so the points can never exist without the money.
+   * A part-paid booking waits for its last payment: one EARNED record per booking keeps the history readable and is what
+   * the withdrawal on a refund measures against. Retries and repeat calls do nothing, held off by the booking's lock and
+   * the earn key, which is the same key the trip-completion settlement used, so a booking settled before this cannot earn again.
+   */
+  async creditPaidBooking(tx: Db, bookingId: string) {
+    await lockBooking(tx, bookingId);
+    const booking = await tx.booking.findUniqueOrThrow({ where: { id: bookingId }, select: EARN_SELECT });
+    if (!EARNING_STATUSES.includes(booking.status)) return 0;
+    if (!paymentFigures(booking.payment, booking.collections).isPaid) return 0;
+    const uniqueKey = `earn:${booking.id}`;
+    if (await tx.loyaltyTransaction.findUnique({ where: { uniqueKey }, select: { id: true } })) return 0;
+
+    const plan = this.planOf(booking, await this.getProgram(tx));
+    const points = this.deserved(booking, plan);
+    if (points <= 0) return 0;
+    // A booking sold without a plan keeps the rate it was credited at, so a refund later is measured on the same terms.
+    if (!booking.loyaltyPlan) await tx.booking.update({ where: { id: booking.id }, data: { loyaltyPlan: plan as unknown as Prisma.InputJsonValue } });
+    const earned = await this.grant(tx, {
+      userId: booking.userId,
+      points,
+      type: 'EARNED',
+      description: `نقاط الحجز • ${booking.bookingReference}`,
+      bookingId: booking.id,
+      uniqueKey,
+    });
+    await this.notifications.toBookingOwners(tx, 'POINTS_EARNED', [booking.id], { points, pointsBalance: earned.balanceAfter });
+    return points;
+  }
+
+  /**
+   * Takes back the points a booking earned beyond what it still deserves: all of them when it is cancelled, the refunded
+   * share when part of its money goes back. Runs inside the cancellation or refund transaction.
+   * Each withdrawal is measured against the total already withdrawn, so a repeat call takes nothing more.
+   * Points the customer has already spent cannot be taken back: the withdrawal stops at the balance, as a spend never
+   * overdraws, and its description records the shortfall. A later withdrawal on the same booking tries the rest again.
+   */
+  async withdrawEarned(tx: Db, bookingId: string, options: { cancelled?: boolean } = {}) {
+    await lockBooking(tx, bookingId);
+    const rows = await tx.loyaltyTransaction.findMany({
+      where: { bookingId, OR: [{ uniqueKey: `earn:${bookingId}` }, { uniqueKey: { startsWith: `unearn:${bookingId}:` } }] },
+      select: { type: true, points: true },
+    });
+    const earned = rows.filter((row) => row.type === 'EARNED').reduce((sum, row) => sum + row.points, 0);
+    if (earned <= 0) return 0;
+    const withdrawals = rows.filter((row) => row.type === 'REFUNDED');
+    const withdrawn = -withdrawals.reduce((sum, row) => sum + row.points, 0);
+
+    const booking = await tx.booking.findUniqueOrThrow({ where: { id: bookingId }, select: EARN_SELECT });
+    // The status changes only at the end of a cancellation, so the caller says so rather than the row.
+    const keep = options.cancelled ? 0 : Math.min(earned, this.deserved(booking, this.planOf(booking, await this.getProgram(tx))));
+    const due = earned - withdrawn - keep;
+    if (due <= 0) return 0;
+
+    const [owner] = await tx.$queryRaw<{ loyaltyPoints: number }[]>`SELECT "loyaltyPoints" FROM "User" WHERE "id" = ${booking.userId} FOR UPDATE`;
+    const taken = Math.min(due, Math.max(0, owner?.loyaltyPoints ?? 0));
+    if (taken < due) this.logger.warn(`Points of ${booking.bookingReference} already spent: withdrew ${taken} of ${due}`);
+    if (taken <= 0) return 0;
+    const reason = options.cancelled ? 'سحب نقاط حجز ملغى' : 'سحب نقاط مبلغ مسترد';
+    await this.spend(tx, {
+      userId: booking.userId,
+      points: taken,
+      type: 'REFUNDED',
+      description: `${reason} • ${booking.bookingReference}${taken < due ? ` (المتاح ${taken} من ${due})` : ''}`,
+      bookingId,
+      uniqueKey: `unearn:${bookingId}:${withdrawals.length}`,
+    });
+    return taken;
+  }
+
+  /**
+   * Runs as trips complete. Points are credited at payment now, so this no longer pays for the ride: it marks each
+   * travelled booking settled, which the tiers, the yearly challenge and the invite rewards count as a completed trip,
+   * and those rewards still wait for a real trip so a paid-then-cancelled booking cannot farm them.
+   * A booking paid before points moved to payment time has no EARNED record yet and is credited here, exactly once.
+   * Repeat runs are harmless: a booking settles only once and the earn key stops a second credit.
+   */
   async settleCompletedTrips() {
     const program = await this.getProgram();
     const bookings = await this.prisma.booking.findMany({
@@ -238,50 +378,24 @@ export class LoyaltyService {
         tickets: { some: { isBoarded: true } },
       },
       take: SWEEP_BATCH,
-      select: {
-        id: true,
-        userId: true,
-        bookingReference: true,
-        loyaltyPlan: true,
-        subtotal: true,
-        housingAmount: true,
-        trip: { select: { price: true, packageId: true } },
-        payment: { select: { amount: true, walletAmount: true, status: true } },
-        collections: { select: { amount: true } },
-        passengers: { select: { ticket: { select: { isBoarded: true } } } },
-      },
+      select: { id: true, userId: true, bookingReference: true },
     });
 
     let settled = 0;
     for (const booking of bookings) {
-      // Bookings made before plans existed earn at the current base rate.
-      const plan = (booking.loyaltyPlan as unknown as EarnPlan | null) ?? { rate: program.enabled ? program.pointsPerRiyal : 0, bonus: 0, rules: [], tier: null };
-      // Points follow money actually received, not what a booking still owes.
-      const { received, wallet } = paymentFigures(booking.payment, booking.collections);
-      // Only what was paid for the tickets earns: the hotel's share is left out.
-      const paid = ((received + wallet) / 100) * transportShare({ ...booking, seats: booking.passengers.length });
-      const travelled = booking.passengers.filter((p) => p.ticket?.isBoarded).length;
-      // Only seats that actually travelled earn points.
-      const points = Math.floor((paid * plan.rate * travelled) / Math.max(1, booking.passengers.length)) + plan.bonus;
       try {
-        await this.prisma.$transaction(async (tx) => {
-          await tx.booking.update({ where: { id: booking.id }, data: { loyaltySettledAt: new Date() } });
-          if (points > 0) {
-            const earned = await this.grant(tx, {
-              userId: booking.userId,
-              points,
-              type: 'EARNED',
-              description: `رحلة مكتملة • ${booking.bookingReference}`,
-              bookingId: booking.id,
-              uniqueKey: `earn:${booking.id}`,
-            });
-            await this.notifications.toBookingOwners(tx, 'POINTS_EARNED', [booking.id], { points, pointsBalance: earned.balanceAfter });
-          }
+        const done = await this.prisma.$transaction(async (tx) => {
+          await lockBooking(tx, booking.id);
+          const { count } = await tx.booking.updateMany({ where: { id: booking.id, loyaltySettledAt: null }, data: { loyaltySettledAt: new Date() } });
+          // Another sweep got there first.
+          if (count === 0) return false;
+          await this.creditPaidBooking(tx, booking.id);
           await this.applyMilestones(tx, booking.userId, program);
+          return true;
         }, TX_OPTIONS);
-        settled += 1;
+        if (done) settled += 1;
       } catch (err) {
-        // Another sweep got there first; the unique key rolled this one back.
+        // A reward another sweep issued at the same moment; the unique key rolled this one back.
         if (!(err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002')) {
           this.logger.error(`Loyalty settlement failed for ${booking.bookingReference}: ${(err as Error).message}`);
         }
@@ -338,13 +452,7 @@ export class LoyaltyService {
   private async applyMilestones(tx: Db, userId: string, program: LoyaltyProgram) {
     if (program.enabled && program.challenge.enabled) {
       const year = new Date(Date.now() + RIYADH_OFFSET_MS).getUTCFullYear();
-      const trips = await tx.loyaltyTransaction.count({
-        where: {
-          userId,
-          type: 'EARNED',
-          createdAt: { gte: new Date(Date.UTC(year, 0, 1) - RIYADH_OFFSET_MS), lt: new Date(Date.UTC(year + 1, 0, 1) - RIYADH_OFFSET_MS) },
-        },
-      });
+      const trips = await this.completedTrips(tx, userId, new Date(Date.UTC(year, 0, 1) - RIYADH_OFFSET_MS), new Date(Date.UTC(year + 1, 0, 1) - RIYADH_OFFSET_MS));
       if (trips >= program.challenge.trips) {
         await this.grantOnce(tx, {
           userId,
@@ -484,9 +592,7 @@ export class LoyaltyService {
       challenge = {
         target: program.challenge.trips,
         points: program.challenge.points,
-        done: await this.prisma.loyaltyTransaction.count({
-          where: { userId, type: 'EARNED', createdAt: { gte: new Date(Date.UTC(year, 0, 1) - RIYADH_OFFSET_MS) } },
-        }),
+        done: await this.completedTrips(this.prisma, userId, new Date(Date.UTC(year, 0, 1) - RIYADH_OFFSET_MS)),
       };
     }
 

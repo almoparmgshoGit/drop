@@ -10,8 +10,11 @@ const RECEIPT_CHUNK = 1000;
 /** Expo asks for receipts to be read no sooner than this; by then Firebase and Apple have answered. */
 const RECEIPT_DELAY_MS = 15 * 60_000;
 const REQUEST_TIMEOUT_MS = 15_000;
-/** Shared with the app, which creates this Android channel before asking for the token. */
-const ANDROID_CHANNEL_ID = 'default';
+/**
+ * Shared with the app, which creates this Android channel (with the app's own sound) before asking for the token.
+ * An app build older than the channel shows the message on Expo's fallback channel instead.
+ */
+const ANDROID_CHANNEL_ID = 'durob_alerts';
 const BODY_LIMIT = 500;
 
 export const EXPO_TOKEN_PATTERN = /^Expo(nent)?PushToken\[[\w-]+\]$/;

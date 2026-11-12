@@ -251,9 +251,12 @@ describe('Customer screens data (e2e)', () => {
       expect(profile.body.loyaltyPoints).toBe(0);
     });
 
-    it('awards once for a completed trip, only for seats that travelled', async () => {
+    it('awards once when the booking is paid, and not again when the trip completes', async () => {
       const trip = await createTrip({ price: 100 });
       const { user, booking } = await book(trip, ['5', '6']);
+      const paid = await request(http()).get(`${API}/users/profile/loyalty`).set(user.auth).expect(200);
+      expect(paid.body.points).toBe(Math.floor(Number(booking.totalPrice)));
+
       const { session } = await crewFor(trip);
       await openBoarding(prisma, trip.id);
       await request(http()).post(`${API}/tickets/${booking.passengers[0].ticket.ticketNumber}/board`).set(session.auth).send({ tripId: trip.id }).expect(201);
@@ -264,29 +267,21 @@ describe('Customer screens data (e2e)', () => {
       await trips.completeFinishedTrips();
 
       const res = await request(http()).get(`${API}/users/profile/loyalty`).set(user.auth).expect(200);
-      expect(res.body.points).toBe(Math.floor(Number(booking.totalPrice) / 2));
+      expect(res.body.points).toBe(Math.floor(Number(booking.totalPrice)));
       expect(res.body.transactions).toHaveLength(1);
       expect(res.body.transactions[0].type).toBe('EARNED');
       expect(res.body.transactions[0].booking.bookingReference).toBe(booking.bookingReference);
       expect(res.body.transactions[0].balanceAfter).toBe(res.body.points);
     });
 
-    it('awards nothing to a no-show, a cancelled booking, or an unfinished trip', async () => {
-      const finished = await createTrip();
-      const noShow = await book(finished);
-      await complete(finished.id);
-
-      const running = await createTrip();
-      const early = await book(running);
-      const { session } = await crewFor(running);
-      await openBoarding(prisma, running.id);
-      await request(http()).post(`${API}/tickets/${early.booking.passengers[0].ticket.ticketNumber}/board`).set(session.auth).send({ tripId: running.id }).expect(201);
-
+    it('takes the points back when the booking is cancelled', async () => {
+      const trip = await createTrip();
+      const { user, booking } = await book(trip);
+      await request(http()).post(`${API}/bookings/${booking.id}/admin-cancel`).set(admin.auth).send({ note: 'قرار إداري' }).expect(201);
       await app.get(TripsService).completeFinishedTrips();
-      for (const user of [noShow.user, early.user]) {
-        const res = await request(http()).get(`${API}/users/profile/loyalty`).set(user.auth).expect(200);
-        expect(res.body.points).toBe(0);
-      }
+      const res = await request(http()).get(`${API}/users/profile/loyalty`).set(user.auth).expect(200);
+      expect(res.body.points).toBe(0);
+      expect(res.body.transactions.map((tx: any) => tx.type)).toEqual(['REFUNDED', 'EARNED']);
     });
 
     it('cannot be credited by the customer through the profile', async () => {

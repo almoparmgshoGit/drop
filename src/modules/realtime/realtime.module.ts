@@ -3,7 +3,7 @@ import { JwtService } from '@nestjs/jwt';
 import { ConnectedSocket, MessageBody, OnGatewayConnection, OnGatewayDisconnect, OnGatewayInit, SubscribeMessage, WebSocketGateway } from '@nestjs/websockets';
 import type { Server, Socket } from 'socket.io';
 import { PrismaService } from '../../common/services/prisma.service';
-import { CHAT_STAFF_ROOM, RealtimeService, sessionRoom, tripRoom, userRoom } from '../../common/services/realtime.service';
+import { CHAT_STAFF_ROOM, RealtimeService, sessionRoom, TRACKING_PERMISSIONS, TRACKING_STAFF_ROOM, tripRoom, userRoom } from '../../common/services/realtime.service';
 import { AuthModule } from '../auth/auth.module';
 import { JwtStrategy } from '../auth/jwt.strategy';
 
@@ -53,6 +53,8 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayConnection, OnGa
     socket.join(userRoom(user.userId));
     if (user.jti) socket.join(sessionRoom(user.jti));
     if (user.permissions.includes('chat.view')) socket.join(CHAT_STAFF_ROOM);
+    // The same permissions that list every trip, so the live map shows nothing its holder could not already open.
+    if (TRACKING_PERMISSIONS.some((permission) => user.permissions.includes(permission))) socket.join(TRACKING_STAFF_ROOM);
     // HTTP refuses an expired token on its next request; a socket has no next request, so it is ended here.
     socket.data.expiryTimer = setTimeout(() => socket.disconnect(true), Math.max(0, socket.data.expiresAt - Date.now()));
   }

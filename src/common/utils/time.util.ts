@@ -1,5 +1,5 @@
 // Saudi Arabia is UTC+3 year-round with no daylight saving.
-const RIYADH_OFFSET_MS = 3 * 60 * 60 * 1000;
+export const RIYADH_OFFSET_MS = 3 * 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 /** Parses YYYY-M-D as a calendar day in Riyadh and returns its UTC bounds. */

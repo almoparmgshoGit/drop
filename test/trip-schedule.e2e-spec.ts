@@ -127,7 +127,6 @@ describe('Trip scheduling and editing (e2e)', () => {
       const hotel = await createHotel();
       const service = await prisma.service.create({ data: { name: `خدمة ${Date.now()}` } });
       const source = await createTrip({
-        tripCode: 'R100',
         scheduleType: 'FIXED',
         recurrenceCalendar: 'GREGORIAN',
         bookingType: 'WITH_HOTEL',
@@ -146,7 +145,9 @@ describe('Trip scheduling and editing (e2e)', () => {
       expect(drafts).toHaveLength(1);
       const [draft] = drafts;
       const saved = await prisma.trip.findUniqueOrThrow({ where: { id: source.id } });
-      expect(draft.tripCode).toBe('R101');
+      // Next year's copy takes the next number of its own month.
+      expect(draft.tripCode).toMatch(/^D\d{3}-\d{2}\/\d{4}$/);
+      expect(draft.codePeriod).toBe(new Date(draft.departureTime.getTime() + 3 * 60 * 60 * 1000).toISOString().slice(0, 7));
       expect(draft.recurrenceCalendar).toBe('GREGORIAN');
       expect(draft.departureTime.getTime()).toBeGreaterThan(Date.now());
       expect(draft.arrivalTime.getTime() - draft.departureTime.getTime()).toBe(saved.arrivalTime.getTime() - saved.departureTime.getTime());

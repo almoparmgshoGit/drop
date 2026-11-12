@@ -5,6 +5,7 @@ import { PrismaService } from '../../common/services/prisma.service';
 import { vatInside } from '../../common/utils/invoice.util';
 import { halalas, hotelBookingCost, netBookingFigures } from '../../common/utils/payment.util';
 import { riyadhDate, riyadhDayRange, riyadhMonthRange } from '../../common/utils/time.util';
+import { journeyCodeOf } from '../../common/utils/trip-code.util';
 import { readInvoiceFiles, UploadedInvoice } from '../cash/cash.service';
 import { AccountView, CreateCategoryDto, CreateEntryDto, TripAccountsQuery, UpdateCategoryDto, UpdateTaxFlagsDto } from './trip-accounts.dto';
 
@@ -64,6 +65,14 @@ const ACCOUNT_SELECT = {
 
 type AccountTrip = Prisma.TripGetPayload<{ select: typeof ACCOUNT_SELECT }>;
 
+/** A DR journey: the way there with its way back, whose money is one account. */
+const JOURNEY_SELECT = {
+  ...ACCOUNT_SELECT,
+  codeNumber: true,
+  codePeriod: true,
+  reverseTrip: { select: ACCOUNT_SELECT },
+} satisfies Prisma.TripSelect;
+
 /**
  * Sold value rather than cash in hand: a seat sold and not yet collected is still the trip's revenue,
  * and only what was kept counts from a cancelled booking. Collections are tracked beside it.
@@ -117,6 +126,37 @@ function accountFigures(trip: AccountTrip) {
 
 type Figures = ReturnType<typeof accountFigures>;
 
+/**
+ * The DR journey's account: revenue and expenses of the way there (D) and the way back (R) together. Each leg keeps its own
+ * manifest and its own entries, but the journey is what earns or loses.
+ */
+function journeyFigures(legs: AccountTrip[]): Figures {
+  const all = legs.map(accountFigures);
+  const sum = (key: keyof Figures) => all.reduce((total, figures) => total + figures[key], 0);
+  return {
+    tickets: sum('tickets'),
+    otherIncome: sum('otherIncome'),
+    revenue: sum('revenue'),
+    hotels: sum('hotels'),
+    bus: sum('bus'),
+    driver: sum('driver'),
+    admin: sum('admin'),
+    other: sum('other'),
+    expenses: sum('expenses'),
+    net: sum('net'),
+    collected: sum('collected'),
+    remaining: sum('remaining'),
+    passengers: sum('passengers'),
+  };
+}
+
+/** A way back counts once it ran or sold; one cancelled with nothing on it is left out of the journey. */
+function legsOf(trip: AccountTrip & { reverseTrip: AccountTrip | null }) {
+  const back = trip.reverseTrip;
+  const counts = back && (back.tripStatus !== 'CANCELLED' || back.bookings.length > 0 || back.accountEntries.length > 0 || back.custodies.length > 0);
+  return counts ? [trip, back] : [trip];
+}
+
 const figuresInSar = (figures: Figures) => ({
   tickets: sar(figures.tickets),
   otherIncome: sar(figures.otherIncome),
@@ -157,14 +197,23 @@ export class TripAccountsService {
     const range = view === 'trip' ? null : viewRange(view, date);
 
     const where: Prisma.TripWhereInput = {
+      // One row per DR journey: a way back is counted inside the trip it returns from.
+      reverseOfTripId: null,
       ...(range && { departureTime: range }),
       ...(query.destination && { destination: query.destination }),
-      ...(query.q && { tripCode: { contains: query.q, mode: 'insensitive' } }),
-      // A cancelled trip only belongs here if money was spent or kept on it.
-      OR: [
-        { tripStatus: { in: ['PUBLISHED', 'COMPLETED'] } },
-        { tripStatus: 'CANCELLED', accountEntries: { some: { voidedAt: null } } },
-        { tripStatus: 'CANCELLED', custodies: { some: { status: 'SETTLED' } } },
+      AND: [
+        ...(query.q
+          ? [{ OR: [{ tripCode: { contains: query.q, mode: 'insensitive' as const } }, { reverseTrip: { tripCode: { contains: query.q, mode: 'insensitive' as const } } }] }]
+          : []),
+        {
+          // A cancelled trip only belongs here if money was spent or kept on it, or its way back still runs.
+          OR: [
+            { tripStatus: { in: ['PUBLISHED', 'COMPLETED'] } },
+            { tripStatus: 'CANCELLED', accountEntries: { some: { voidedAt: null } } },
+            { tripStatus: 'CANCELLED', custodies: { some: { status: 'SETTLED' } } },
+            { tripStatus: 'CANCELLED', reverseTrip: { tripStatus: { in: ['PUBLISHED', 'COMPLETED'] } } },
+          ],
+        },
       ],
     };
 
@@ -173,13 +222,13 @@ export class TripAccountsService {
         where,
         orderBy: { departureTime: view === 'trip' ? 'desc' : 'asc' },
         ...(view === 'trip' && { take: BY_TRIP_LIMIT }),
-        select: ACCOUNT_SELECT,
+        select: JOURNEY_SELECT,
       }),
       this.prisma.trip.count({ where }),
       this.prisma.trip.findMany({ where: { tripStatus: { not: 'DRAFT' } }, distinct: ['destination'], select: { destination: true }, orderBy: { destination: 'asc' } }),
     ]);
 
-    const rows = trips.map((trip) => ({ trip, figures: accountFigures(trip) }));
+    const rows = trips.map((trip) => ({ trip, legs: legsOf(trip), figures: journeyFigures(legsOf(trip)) }));
     const revenue = rows.reduce((sum, row) => sum + row.figures.revenue, 0);
     const expenses = rows.reduce((sum, row) => sum + row.figures.expenses, 0);
     const best = rows.reduce<(typeof rows)[number] | null>((top, row) => (!top || row.figures.net > top.figures.net ? row : top), null);
@@ -199,13 +248,23 @@ export class TripAccountsService {
         unfinished: rows.filter((row) => row.trip.tripStatus === 'PUBLISHED' && row.trip.departureTime > now).length,
         best: best && { tripCode: best.trip.tripCode, net: sar(best.figures.net) },
       },
-      items: rows.map(({ trip, figures }) => ({
+      items: rows.map(({ trip, legs, figures }) => ({
         id: trip.id,
         tripCode: trip.tripCode,
+        journeyCode: journeyCodeOf(trip),
         destination: trip.destination,
         departureTime: trip.departureTime,
         tripStatus: trip.tripStatus,
-        rentMissing: trip.tripStatus !== 'CANCELLED' && trip.busRentalPrice === null,
+        rentMissing: legs.some((leg) => leg.tripStatus !== 'CANCELLED' && leg.busRentalPrice === null),
+        // Each leg's own share, for the row that opens up into D and R.
+        legs: legs.map((leg, index) => ({
+          id: leg.id,
+          tripCode: leg.tripCode,
+          role: index === 0 ? 'OUTBOUND' : 'RETURN',
+          departureTime: leg.departureTime,
+          tripStatus: leg.tripStatus,
+          ...figuresInSar(accountFigures(leg)),
+        })),
         ...figuresInSar(figures),
       })),
     };
@@ -216,12 +275,24 @@ export class TripAccountsService {
    * less the trip's costs as they stand. Unlike the accounts page's net, an unpaid seat adds nothing here yet.
    */
   async currentProfits() {
-    const trips = await this.prisma.trip.findMany({ where: { tripStatus: { in: ['PUBLISHED', 'COMPLETED'] } }, select: ACCOUNT_SELECT });
+    const trips = await this.prisma.trip.findMany({
+      where: { reverseOfTripId: null, OR: [{ tripStatus: { in: ['PUBLISHED', 'COMPLETED'] } }, { reverseTrip: { tripStatus: { in: ['PUBLISHED', 'COMPLETED'] } } }] },
+      select: JOURNEY_SELECT,
+    });
+    const profitOf = (figures: Figures) => {
+      const paid = figures.collected + figures.otherIncome;
+      return { collected: sar(figures.collected), expenses: sar(figures.expenses), profit: sar(paid - figures.expenses) };
+    };
+    // The journey's profit sits on its way there; the way back shows its own share and which journey it belongs to.
     return Object.fromEntries(
-      trips.map((trip) => {
-        const figures = accountFigures(trip);
-        const paid = figures.collected + figures.otherIncome;
-        return [trip.id, { collected: sar(figures.collected), expenses: sar(figures.expenses), profit: sar(paid - figures.expenses) }];
+      trips.flatMap((trip) => {
+        const legs = legsOf(trip);
+        const journey = { ...profitOf(journeyFigures(legs)), journeyCode: journeyCodeOf(trip), isJourney: legs.length > 1 };
+        const back = legs[1];
+        return [
+          [trip.id, journey],
+          ...(back ? [[back.id, { ...profitOf(accountFigures(back)), journeyCode: journeyCodeOf(trip), partOfTripId: trip.id }]] : []),
+        ];
       }),
     );
   }
@@ -229,9 +300,20 @@ export class TripAccountsService {
   async detail(id: string) {
     const trip = await this.prisma.trip.findUnique({
       where: { id },
-      select: { ...ACCOUNT_SELECT, busCost: { select: { rentHasTaxInvoice: true } }, bus: { select: { plateNumber: true, office: { select: { name: true } } } } },
+      select: {
+        ...ACCOUNT_SELECT,
+        codeNumber: true,
+        codePeriod: true,
+        busCost: { select: { rentHasTaxInvoice: true } },
+        bus: { select: { plateNumber: true, office: { select: { name: true } } } },
+        reverseTrip: { select: ACCOUNT_SELECT },
+        reverseOf: { select: { ...ACCOUNT_SELECT, reverseTrip: { select: ACCOUNT_SELECT } } },
+      },
     });
     if (!trip) throw new NotFoundException('الرحلة غير موجودة');
+    // Either leg opens the same DR journey's account.
+    const outbound = trip.reverseOf ?? { ...trip, reverseTrip: trip.reverseTrip };
+    const journeyLegs = legsOf(outbound);
 
     const [pendingCustody, entries, vatRate] = await Promise.all([
       this.prisma.custodyExpense.aggregate({ where: { voidedAt: null, custody: { tripId: id, status: 'OPEN' } }, _sum: { amount: true } }),
@@ -260,6 +342,14 @@ export class TripAccountsService {
       },
       vatRate,
       figures: figuresInSar(figures),
+      journey:
+        journeyLegs.length > 1
+          ? {
+              journeyCode: journeyCodeOf(trip),
+              legs: journeyLegs.map((leg, index) => ({ id: leg.id, tripCode: leg.tripCode, role: index === 0 ? 'OUTBOUND' : 'RETURN', tripStatus: leg.tripStatus, departureTime: leg.departureTime })),
+              figures: figuresInSar(journeyFigures(journeyLegs)),
+            }
+          : null,
       pendingCustody: Number(pendingCustody._sum.amount ?? 0),
       rent: live ? { amount: sar(figures.bus), missing: trip.busRentalPrice === null, hasTaxInvoice: trip.busCost?.rentHasTaxInvoice ?? false } : null,
       hotels: live

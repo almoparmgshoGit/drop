@@ -41,6 +41,7 @@ import { SupervisorsModule } from './modules/supervisors/supervisors.module';
 import { CrewRequestsModule } from './modules/crew-requests/crew-requests.module';
 import { HrModule } from './modules/hr/hr.module';
 import { ComplaintsModule } from './modules/complaints/complaints.module';
+import { TripChatModule } from './modules/trip-chat/trip-chat.module';
 
 @Module({
   imports: [
@@ -86,6 +87,7 @@ import { ComplaintsModule } from './modules/complaints/complaints.module';
     CrewRequestsModule,
     HrModule,
     ComplaintsModule,
+    TripChatModule,
   ],
   providers: [
     { provide: APP_GUARD, useClass: ThrottlerGuard },

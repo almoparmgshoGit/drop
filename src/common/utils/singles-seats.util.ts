@@ -19,6 +19,20 @@ export function assertValidSinglesRange(range: SinglesRange, capacity = BUS_SEAT
 }
 
 /**
+ * Where singles start on a new vehicle of this size. The settings describe the standard bus: a vehicle they fit keeps them,
+ * a smaller one they do not fit starts with singles on its back half, and a larger bus keeps the same share of its seats at
+ * the back, running to its last seat when the settings run to the standard bus's last.
+ */
+export function singlesRangeFor(settings: SinglesRange, seatCount: number): SinglesRange {
+  if (seatCount === BUS_SEAT_COUNT || (seatCount < BUS_SEAT_COUNT && settings.to <= seatCount)) return settings;
+  if (seatCount < BUS_SEAT_COUNT) return { from: Math.floor(seatCount / 2) + 1, to: seatCount };
+  const scale = (seat: number) => Math.round((seat * seatCount) / BUS_SEAT_COUNT);
+  const from = Math.min(seatCount, scale(settings.from - 1) + 1);
+  const to = settings.to === BUS_SEAT_COUNT ? seatCount : Math.min(seatCount, Math.max(from, scale(settings.to)));
+  return { from, to };
+}
+
+/**
  * A bus can reach a trip after it went on sale, and a range can change while bookings exist. Nobody already seated is
  * moved silently: the change is refused and names who is in the way, so staff can move that passenger first.
  */

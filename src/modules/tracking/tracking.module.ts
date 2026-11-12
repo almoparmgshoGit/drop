@@ -18,6 +18,8 @@ const RIYADH_OFFSET_MS = 3 * HOUR_MS;
 /** A position older than this no longer describes where the bus is now. */
 const LIVE_FOR_MS = 2 * 60 * 1000;
 const MAX_NOTICES = 10;
+/** Far more buses than the company runs at once; only a guard against an unbounded answer. */
+const MAX_LIVE_TRIPS = 300;
 
 class ReportLocationDto {
   @IsNumber()
@@ -102,6 +104,61 @@ class TrackingService {
     await this.prisma.tripLocation.deleteMany({ where: { tripId } });
     this.realtime.tripLocation(tripId, null);
     return { success: true };
+  }
+
+  /**
+   * Every trip that is out now, for the operations map: the crew said it is on the road or at a point, or it is
+   * sending its position. Bounded by the same window the crew may broadcast in, so a trip nobody closed does not
+   * stay on the map for days. The map follows later positions over the staff tracking room.
+   */
+  async live() {
+    const now = Date.now();
+    const limits = await this.appSettings.numbers('trackingOpensBeforeHours', 'trackingClosesAfterHours');
+    const trips = await this.prisma.trip.findMany({
+      where: {
+        tripStatus: 'PUBLISHED',
+        liveStatus: { not: 'ARRIVED' },
+        departureTime: { lte: new Date(now + limits.trackingOpensBeforeHours * HOUR_MS) },
+        arrivalTime: { gte: new Date(now - limits.trackingClosesAfterHours * HOUR_MS) },
+        OR: [{ liveStatus: { in: ['AT_POINT', 'ON_ROAD'] } }, { location: { isNot: null } }],
+      },
+      orderBy: { departureTime: 'asc' },
+      take: MAX_LIVE_TRIPS,
+      select: {
+        id: true,
+        tripCode: true,
+        origin: true,
+        destination: true,
+        departureTime: true,
+        arrivalTime: true,
+        liveStatus: true,
+        liveStatusAt: true,
+        currentBoardingPointId: true,
+        boardingPoints: { select: { id: true, name: true, time: true, lat: true, lng: true } },
+        statusUpdates: { where: { status: 'AT_POINT' }, select: { boardingPointId: true, pointName: true } },
+        bus: { select: { plateNumber: true } },
+        location: { select: { lat: true, lng: true, speed: true, recordedAt: true } },
+        drivers: { select: { user: { select: { name: true, phone: true } } } },
+        supervisors: { orderBy: { isPrimary: 'desc' }, select: { user: { select: { name: true, phone: true } } } },
+      },
+    });
+    return {
+      serverTime: new Date(now),
+      liveForMs: LIVE_FOR_MS,
+      trips: trips.map(({ boardingPoints, statusUpdates, location, drivers, supervisors, bus, currentBoardingPointId, ...trip }) => {
+        const reached = new Set(statusUpdates.flatMap((row) => [row.boardingPointId, row.pointName]));
+        return {
+          ...trip,
+          busPlate: bus?.plateNumber ?? null,
+          drivers: drivers.map((row) => row.user),
+          supervisors: supervisors.map((row) => row.user),
+          points: [...boardingPoints]
+            .sort((a, b) => a.time.localeCompare(b.time))
+            .map((point) => ({ ...point, isCurrent: point.id === currentBoardingPointId, reached: reached.has(point.id) || reached.has(point.name) })),
+          location: location ? { ...location, isLive: now - location.recordedAt.getTime() <= LIVE_FOR_MS } : null,
+        };
+      }),
+    };
   }
 
   /** The same branch rule as branch bookings: another branch's booking stays hidden unless this employee works the trip. */
@@ -277,6 +334,13 @@ class TrackingController {
   @ApiOperation({ summary: 'Crew stops sharing and clears the last position' })
   stop(@Req() req, @Param('tripId') tripId: string) {
     return this.tracking.stop(req.user, tripId);
+  }
+
+  @Get('live')
+  @RequirePermission('trips.view', 'trips.manage')
+  @ApiOperation({ summary: 'Trips out now with their last bus position, for the operations map' })
+  live() {
+    return this.tracking.live();
   }
 
   @Get('bookings/:bookingId')

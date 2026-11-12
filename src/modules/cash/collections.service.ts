@@ -2,6 +2,7 @@ import { BadRequestException, ConflictException, ForbiddenException, Injectable,
 import { BookingStatus, CollectionMethod, Prisma } from '@prisma/client';
 import { BookingEventsService } from '../../common/services/booking-events.service';
 import { InvoiceLedgerService } from '../../common/services/invoice-ledger.service';
+import { LoyaltyService } from '../../common/services/loyalty.service';
 import { formatSar, NotificationsService } from '../../common/services/notifications.service';
 import { PaymentLedgerService } from '../../common/services/payment-ledger.service';
 import { PrismaService } from '../../common/services/prisma.service';
@@ -35,6 +36,7 @@ export class CollectionsService {
     private notifications: NotificationsService,
     private invoices: InvoiceLedgerService,
     private ledger: PaymentLedgerService,
+    private loyalty: LoyaltyService,
   ) {}
 
   async list(actor: CashActor, query: CollectionsQuery) {
@@ -201,6 +203,8 @@ export class CollectionsService {
         remainingAmount: formatSar(toSar(left)),
       });
     }
+    // The last payment completes the booking, which is when its points are credited.
+    if (left === 0) await this.loyalty.creditPaidBooking(tx, booking.id);
     return collection;
   }
 

@@ -38,6 +38,28 @@ class StaffLoginDto {
   password: string;
 }
 
+class GoogleSignInDto {
+  // Google's ID tokens are signed JWTs of about a kilobyte; the ceiling only stops junk.
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(4096)
+  idToken: string;
+}
+
+class GoogleLinkDto {
+  @IsString()
+  @Matches(/^[a-f0-9]{64}$/, { message: 'انتهت مهلة ربط حساب Google، أعد المحاولة من البداية' })
+  linkToken: string;
+
+  @IsString()
+  @IsNotEmpty()
+  phone: string;
+
+  @IsString()
+  @Matches(/^\d{4}$/, { message: 'رمز التحقق يجب أن يكون 4 أرقام' })
+  code: string;
+}
+
 class RefreshTokenDto {
   @IsString()
   @IsNotEmpty()
@@ -71,6 +93,22 @@ export class AuthController {
     const ip = req.ip;
     const userAgent = req.headers['user-agent'];
     return this.authService.verifyOtp(dto.phone, dto.code, ip, userAgent);
+  }
+
+  @Public()
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  @Post('google')
+  @ApiOperation({ summary: 'Sign in with a Google ID token; an unlinked Google account gets a link token and must verify a phone' })
+  async googleSignIn(@Body() dto: GoogleSignInDto, @Req() req) {
+    return this.authService.googleSignIn(dto.idToken, req.ip, req.headers['user-agent']);
+  }
+
+  @Public()
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
+  @Post('google/link')
+  @ApiOperation({ summary: "Verify the phone's code and link the Google account from the link token to that phone's account" })
+  async linkGoogle(@Body() dto: GoogleLinkDto, @Req() req) {
+    return this.authService.linkGoogle(dto.linkToken, dto.phone, dto.code, req.ip, req.headers['user-agent']);
   }
 
   @Public()

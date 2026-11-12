@@ -363,7 +363,8 @@ describe('Booking administration (e2e)', () => {
       await bookTrip([{ tripId: trip.id, seats: ['1', '2', '3'] }], ['راكب أول', 'راكب ثان', 'راكب ثالث']);
       await bookTrip([{ tripId: trip.id, seats: ['4'] }, { tripId: later.id, seats: ['4'] }], ['راكب رابع']);
 
-      const reverse = (await request(http()).post(`${API}/trips/${trip.id}/open-reverse`).set(admin.auth).send({ boardingPointName: 'مكة' }).expect(201)).body;
+      // Publishing the trip opened its way back, which sells the whole bus again.
+      const reverse = await prisma.trip.findFirstOrThrow({ where: { reverseOfTripId: trip.id } });
       expect(reverse.availableSeats).toBe(49);
       await bookTrip([{ tripId: reverse.id, seats: ['1'] }], ['راكب عكسي']);
 
@@ -394,11 +395,9 @@ describe('Booking administration (e2e)', () => {
         direction: 'ROUND_TRIP',
         departureTime: new Date(departure).toISOString(),
         arrivalTime: new Date(departure + 5 * 3_600_000).toISOString(),
-        reverseEnabled: true,
-        reverseOpenPercent: 10,
-        reverseDepartureAt: new Date(departure + 8 * 3_600_000).toISOString(),
-        reversePrice: 90,
       });
+      // Switched on after publishing, so publishing does not open it by itself and the office opens it by hand here.
+      await prisma.trip.update({ where: { id: trip.id }, data: { reverseEnabled: true, reverseOpenPercent: 10, reverseDepartureAt: new Date(departure + 8 * 3_600_000), reversePrice: 90 } });
       const open = (body = { boardingPointName: 'فندق العزيزية', channelApp: true }) =>
         request(http()).post(`${API}/trips/${trip.id}/open-reverse`).set(admin.auth).send(body);
 
@@ -503,8 +502,8 @@ describe('Booking administration (e2e)', () => {
 
   describe('search and export', () => {
     it('finds a passenger and reports the amount per seat', async () => {
-      const { trip, booking } = await bookOne({ tripCode: 'R777' }, ['5', '6']);
-      const res = await request(http()).get(`${API}/bookings/admin/search?q=R777`).set(staff.auth).expect(200);
+      const { trip, booking } = await bookOne({}, ['5', '6']);
+      const res = await request(http()).get(`${API}/bookings/admin/search?q=${encodeURIComponent(trip.tripCode)}`).set(staff.auth).expect(200);
       expect(res.body.items).toHaveLength(2);
       expect(res.body.items[0].bookingId).toBe(booking.id);
       expect(res.body.items[0].tripCode).toBe(trip.tripCode);

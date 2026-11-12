@@ -32,8 +32,20 @@ export const MIN_SMALL_VEHICLE_SEATS = 4;
 export const MAX_SMALL_VEHICLE_SEATS = 48;
 
 /**
- * Draws a van's or a minibus's seats from its count, on the same five columns as the bus so every screen draws it alike:
- * two by the door, the aisle, two by the driver. Five seats left over make a back bench across the aisle, as on the bus.
+ * A bus is usually the client's 49-seat plan, but coaches of other sizes exist (50, 53, 60...). Any count in this range is
+ * drawn two and two; only 49 keeps the fixed plan with its middle door, so every bus saved before keeps its exact seats.
+ */
+export const MIN_BUS_SEATS = 20;
+export const MAX_BUS_SEATS = 80;
+
+/** The seats a vehicle of this kind may have, wherever a count is saved: on a vehicle or on a vehicle type in the settings. */
+export const seatLimitsFor = (kind: string) =>
+  kind === 'BUS' ? { min: MIN_BUS_SEATS, max: MAX_BUS_SEATS } : { min: MIN_SMALL_VEHICLE_SEATS, max: MAX_SMALL_VEHICLE_SEATS };
+
+/**
+ * Draws a vehicle's seats from its count (a van, a minibus, or a bus of other than 49 seats), on the same five columns as
+ * the fixed plan so every screen draws it alike: two by the door, the aisle, two by the driver. Five seats left over make a
+ * back bench across the aisle, as on the bus; two or three left over make a short last row.
  */
 export function generateSeatLayout(count: number): SeatLayout {
   const rows: SeatLayout = [];
@@ -55,9 +67,13 @@ export function generateSeatLayout(count: number): SeatLayout {
   return rows;
 }
 
-/** The plan a vehicle seats passengers on: the fixed one for a bus, one drawn from the count for anything smaller. */
+/**
+ * The plan a vehicle seats passengers on: the fixed one for the standard 49-seat bus (and for no vehicle yet), one drawn
+ * from the count for anything else. A bus row saved before buses had other sizes holds 49, so it keeps the fixed plan.
+ */
 export function seatLayoutFor(vehicle: { kind: string; seatCount: number } | null | undefined): SeatLayout {
-  return !vehicle || vehicle.kind === 'BUS' ? (BUS_SEAT_LAYOUT as SeatLayout) : generateSeatLayout(vehicle.seatCount);
+  const standard = !vehicle || (vehicle.kind === 'BUS' && (!vehicle.seatCount || vehicle.seatCount === BUS_SEAT_COUNT));
+  return standard ? (BUS_SEAT_LAYOUT as SeatLayout) : generateSeatLayout(vehicle.seatCount);
 }
 
 export const seatNumbersOf = (layout: SeatLayout) => layout.flat().filter((seat): seat is string => seat !== null);

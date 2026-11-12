@@ -245,7 +245,7 @@ class LoyaltyAdminService {
 
   async report() {
     const program = await this.loyalty.getProgram();
-    const [byType, outstanding, members, referrals, plans] = await Promise.all([
+    const [byType, outstanding, members, referrals, plans, withdrawals] = await Promise.all([
       this.prisma.loyaltyTransaction.groupBy({ by: ['type'], _sum: { points: true }, _count: true }),
       this.prisma.user.aggregate({ _sum: { loyaltyPoints: true } }),
       this.prisma.user.count({ where: { loyaltyPoints: { gt: 0 } } }),
@@ -256,8 +256,11 @@ class LoyaltyAdminService {
         take: 2000,
         select: { loyaltyPlan: true },
       }),
+      // REFUNDED holds both the redeemed points a cancellation gives back and the earned points it takes back.
+      this.prisma.loyaltyTransaction.aggregate({ where: { type: 'REFUNDED', points: { lt: 0 } }, _sum: { points: true } }),
     ]);
     const sum = (types: string[]) => byType.filter((row) => types.includes(row.type)).reduce((total, row) => total + (row._sum.points ?? 0), 0);
+    const withdrawn = withdrawals._sum.points ?? 0;
     const points = outstanding._sum.loyaltyPoints ?? 0;
     const usage = new Map<string, number>();
     for (const { loyaltyPlan } of plans) {
@@ -269,9 +272,10 @@ class LoyaltyAdminService {
       outstandingValue: Math.round(((points / program.redeemPoints) * program.redeemValue) * 100) / 100,
       members,
       referrals,
-      issued: sum(['EARNED', 'BONUS', 'REFERRAL']),
+      // Points earned on a booking later cancelled or refunded were never really issued.
+      issued: sum(['EARNED', 'BONUS', 'REFERRAL']) + withdrawn,
       redeemed: -sum(['REDEEMED', 'VOUCHER']),
-      returned: sum(['REFUNDED']),
+      returned: sum(['REFUNDED']) - withdrawn,
       expired: -sum(['EXPIRED']),
       adjusted: sum(['ADJUSTED']),
       ruleUsage: [...usage.entries()].map(([name, bookings]) => ({ name, bookings })).sort((a, b) => b.bookings - a.bookings),

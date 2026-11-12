@@ -388,6 +388,33 @@ export const NOTIFICATION_CATALOG = {
       ur: { title: 'کسٹمر سروس کی طرف سے نیا جواب', body: '{{message}}' },
     },
   },
+  // No trip code here on purpose: it is an internal reference customers are not shown.
+  TRIP_CHAT_CREW_MESSAGE: {
+    audience: 'PASSENGER',
+    group: 'المحادثات',
+    label: 'رسالة من مشرف الرحلة',
+    trigger: 'عند رد مشرف الرحلة على محادثة العميل وهو خارج شاشة المحادثة',
+    title: 'رسالة من مشرف رحلتك',
+    body: '{{senderName}}: {{message}}',
+    variables: ['userName', 'origin', 'destination', 'departureDate', 'departureTime', 'senderName', 'message'],
+    translations: {
+      en: { title: 'Message from your trip supervisor', body: '{{senderName}}: {{message}}' },
+      ur: { title: 'آپ کے سفر کے نگران کا پیغام', body: '{{senderName}}: {{message}}' },
+    },
+  },
+  TRIP_CHAT_PASSENGER_MESSAGE: {
+    audience: 'STAFF',
+    group: 'طاقم الرحلة',
+    label: 'رسالة من راكب',
+    trigger: 'عند كتابة راكب لمشرف رحلته، مرة واحدة حتى يقرأ المشرف المحادثة',
+    title: 'رسالة جديدة من راكب',
+    body: 'كتب {{customerName}} في محادثة رحلة {{tripCode}}: {{message}}',
+    variables: [...TRIP, 'customerName', 'message'],
+    translations: {
+      en: { title: 'New message from a passenger', body: '{{customerName}} wrote in the chat of trip {{tripCode}}: {{message}}' },
+      ur: { title: 'مسافر کا نیا پیغام', body: '{{customerName}} نے سفر {{tripCode}} کی گفتگو میں لکھا: {{message}}' },
+    },
+  },
   WALLET_CREDITED: {
     audience: 'PASSENGER',
     group: 'المحفظة والنقاط',
@@ -417,8 +444,8 @@ export const NOTIFICATION_CATALOG = {
   POINTS_EARNED: {
     audience: 'PASSENGER',
     group: 'المحفظة والنقاط',
-    label: 'كسب نقاط رحلة',
-    trigger: 'بعد اكتمال الرحلة واحتساب نقاطها',
+    label: 'كسب نقاط حجز',
+    trigger: 'عند اكتمال دفع الحجز وإضافة نقاطه',
     title: 'حصلت على نقاط جديدة',
     body: 'حصلت على {{points}} نقطة عن الحجز {{bookingReference}}. رصيدك الحالي {{pointsBalance}} نقطة.',
     variables: [...BOOKING, 'points', 'pointsBalance'],
@@ -1177,13 +1204,13 @@ export const NOTIFICATION_CATALOG = {
     label: 'تذكير بموعد الانطلاق',
     trigger: 'يرسله مشرف الرحلة من التطبيق',
     title: 'تذكير بموعد الانطلاق',
-    body: 'تذكير من دروب الهجرة: تنطلق رحلتكم من {{origin}} إلى {{destination}} يوم {{departureDate}} الساعة {{departureTime}}. نرجو الحضور قبل الموعد بـ30 دقيقة. رقم الرحلة {{tripCode}}.',
+    body: 'تذكير من دروب الهجرة: تنطلق رحلتكم من {{origin}} إلى {{destination}} يوم {{departureDate}} الساعة {{departureTime}}. نرجو الحضور قبل الموعد بـ30 دقيقة.',
     variables: BOOKING,
     crewManual: true,
     expiresMinutes: 6 * 60,
     translations: {
-      en: { title: 'Departure time reminder', body: 'A reminder from Durob Al Hijra: your trip from {{origin}} to {{destination}} departs on {{departureDate}} at {{departureTime}}. Please arrive 30 minutes early. Trip number {{tripCode}}.' },
-      ur: { title: 'روانگی کے وقت کی یاد دہانی', body: 'دروب الہجرہ کی طرف سے یاد دہانی: {{origin}} سے {{destination}} کے لیے آپ کا سفر {{departureDate}} کو {{departureTime}} بجے روانہ ہوگا۔ براہ کرم وقت سے 30 منٹ پہلے پہنچیں۔ سفر نمبر {{tripCode}}۔' },
+      en: { title: 'Departure time reminder', body: 'A reminder from Durob Al Hijra: your trip from {{origin}} to {{destination}} departs on {{departureDate}} at {{departureTime}}. Please arrive 30 minutes early.' },
+      ur: { title: 'روانگی کے وقت کی یاد دہانی', body: 'دروب الہجرہ کی طرف سے یاد دہانی: {{origin}} سے {{destination}} کے لیے آپ کا سفر {{departureDate}} کو {{departureTime}} بجے روانہ ہوگا۔ براہ کرم وقت سے 30 منٹ پہلے پہنچیں۔' },
     },
   },
   CREW_DEPARTURE_CHANGE: {
@@ -1239,12 +1266,12 @@ export const NOTIFICATION_CATALOG = {
     label: 'الحافلة تقترب من المحطة',
     trigger: 'تلقائيًا قبل وصول الحافلة إلى محطة الراكب، أو يدويًا من صفحة تنبيهات المحطات',
     title: 'الحافلة تقترب من محطتك',
-    body: 'الحافلة في طريقها إلى محطة {{stopName}} {{etaText}}. نرجو التواجد الآن. رحلة {{tripCode}} إلى {{destination}}.',
+    body: 'الحافلة في طريقها إلى محطة {{stopName}} {{etaText}}. نرجو التواجد الآن. رحلتكم إلى {{destination}}.',
     variables: [...BOOKING, 'stopName', 'etaText'],
     expiresMinutes: LIVE_ALERT_EXPIRES_MINUTES,
     translations: {
-      en: { title: 'Your bus is approaching', body: 'The bus is on its way to {{stopName}}. Please be at the stop now. Trip {{tripCode}} to {{destination}}.' },
-      ur: { title: 'بس آپ کے اسٹاپ کے قریب ہے', body: 'بس {{stopName}} کی طرف آ رہی ہے۔ براہ کرم ابھی اسٹاپ پر موجود رہیں۔ سفر {{tripCode}} برائے {{destination}}۔' },
+      en: { title: 'Your bus is approaching', body: 'The bus is on its way to {{stopName}}. Please be at the stop now. Your trip to {{destination}}.' },
+      ur: { title: 'بس آپ کے اسٹاپ کے قریب ہے', body: 'بس {{stopName}} کی طرف آ رہی ہے۔ براہ کرم ابھی اسٹاپ پر موجود رہیں۔ آپ کا سفر برائے {{destination}}۔' },
     },
   },
   STATION_ARRIVED: {
@@ -1253,12 +1280,12 @@ export const NOTIFICATION_CATALOG = {
     label: 'وصلت الحافلة (إرسال يدوي)',
     trigger: 'يدويًا من صفحة تنبيهات المحطات. الإرسال التلقائي عند الوصول هو «وصول الحافلة إلى نقطة المسافر»',
     title: 'وصلت الحافلة إلى المحطة',
-    body: 'وصلت الحافلة إلى محطة {{stopName}}. توجه إليها بتذكرتك. رحلة {{tripCode}} إلى {{destination}}.',
+    body: 'وصلت الحافلة إلى محطة {{stopName}}. توجه إليها بتذكرتك. رحلتكم إلى {{destination}}.',
     variables: [...BOOKING, 'stopName'],
     expiresMinutes: LIVE_ALERT_EXPIRES_MINUTES,
     translations: {
-      en: { title: 'The bus has arrived', body: 'The bus has arrived at {{stopName}}. Please board with your ticket. Trip {{tripCode}} to {{destination}}.' },
-      ur: { title: 'بس پہنچ گئی ہے', body: 'بس {{stopName}} پہنچ گئی ہے۔ اپنا ٹکٹ لے کر سوار ہوں۔ سفر {{tripCode}} برائے {{destination}}۔' },
+      en: { title: 'The bus has arrived', body: 'The bus has arrived at {{stopName}}. Please board with your ticket. Your trip to {{destination}}.' },
+      ur: { title: 'بس پہنچ گئی ہے', body: 'بس {{stopName}} پہنچ گئی ہے۔ اپنا ٹکٹ لے کر سوار ہوں۔ آپ کا سفر برائے {{destination}}۔' },
     },
   },
   STATION_LATE_REMINDER: {
@@ -1281,12 +1308,12 @@ export const NOTIFICATION_CATALOG = {
     label: 'تأخر الحافلة',
     trigger: 'يدويًا من صفحة تنبيهات المحطات',
     title: 'تأخرت الحافلة',
-    body: 'نعتذر، تأخر وصول الحافلة إلى محطة {{stopName}} نحو {{minutes}} دقيقة. رحلة {{tripCode}} إلى {{destination}}.',
+    body: 'نعتذر، تأخر وصول الحافلة إلى محطة {{stopName}} نحو {{minutes}} دقيقة. رحلتكم إلى {{destination}}.',
     variables: [...BOOKING, 'stopName', 'minutes'],
     expiresMinutes: LIVE_ALERT_EXPIRES_MINUTES,
     translations: {
-      en: { title: 'The bus is delayed', body: 'Sorry, the bus will reach {{stopName}} about {{minutes}} minutes late. Trip {{tripCode}} to {{destination}}.' },
-      ur: { title: 'بس میں تاخیر ہے', body: 'معذرت، بس {{stopName}} پر تقریباً {{minutes}} منٹ تاخیر سے پہنچے گی۔ سفر {{tripCode}} برائے {{destination}}۔' },
+      en: { title: 'The bus is delayed', body: 'Sorry, the bus will reach {{stopName}} about {{minutes}} minutes late. Your trip to {{destination}}.' },
+      ur: { title: 'بس میں تاخیر ہے', body: 'معذرت، بس {{stopName}} پر تقریباً {{minutes}} منٹ تاخیر سے پہنچے گی۔ آپ کا سفر برائے {{destination}}۔' },
     },
   },
   STATION_LOCATION_CHANGED: {
@@ -1295,13 +1322,13 @@ export const NOTIFICATION_CATALOG = {
     label: 'تغيير موقع المحطة',
     trigger: 'يدويًا من صفحة تنبيهات المحطات، ويكتب الموظف الموقع الجديد',
     title: 'تغير موقع المحطة',
-    body: 'تغير موقع محطة {{stopName}} إلى: {{newValue}}. رحلة {{tripCode}} إلى {{destination}}.',
+    body: 'تغير موقع محطة {{stopName}} إلى: {{newValue}}. رحلتكم إلى {{destination}}.',
     variables: [...BOOKING, 'stopName', 'newValue'],
     requires: ['newValue'],
     expiresMinutes: LIVE_ALERT_EXPIRES_MINUTES,
     translations: {
-      en: { title: 'Stop location changed', body: 'The location of {{stopName}} has changed to: {{newValue}}. Trip {{tripCode}} to {{destination}}.' },
-      ur: { title: 'اسٹاپ کی جگہ تبدیل ہو گئی', body: '{{stopName}} کی جگہ اب یہ ہے: {{newValue}}۔ سفر {{tripCode}} برائے {{destination}}۔' },
+      en: { title: 'Stop location changed', body: 'The location of {{stopName}} has changed to: {{newValue}}. Your trip to {{destination}}.' },
+      ur: { title: 'اسٹاپ کی جگہ تبدیل ہو گئی', body: '{{stopName}} کی جگہ اب یہ ہے: {{newValue}}۔ آپ کا سفر برائے {{destination}}۔' },
     },
   },
   GATHERING_REMINDER: {
@@ -1310,12 +1337,12 @@ export const NOTIFICATION_CATALOG = {
     label: 'تذكير موعد التجمع',
     trigger: 'تلقائيًا قبل وقت نقطة تجمع الراكب، ويتكرر حتى موعدها حسب إعدادات الرحلة أو المسافر',
     title: 'اقترب موعد التجمع',
-    body: 'موعد التجمع في {{stopName}} بعد نحو {{minutes}} دقيقة. نرجو الحضور قبل الموعد. رحلة {{tripCode}} إلى {{destination}}.',
+    body: 'موعد التجمع في {{stopName}} بعد نحو {{minutes}} دقيقة. نرجو الحضور قبل الموعد. رحلتكم إلى {{destination}}.',
     variables: [...BOOKING, 'stopName', 'minutes'],
     expiresMinutes: LIVE_ALERT_EXPIRES_MINUTES,
     translations: {
-      en: { title: 'Gathering time is near', body: 'Gathering at {{stopName}} is in about {{minutes}} minutes. Please arrive early. Trip {{tripCode}} to {{destination}}.' },
-      ur: { title: 'جمع ہونے کا وقت قریب ہے', body: '{{stopName}} پر جمع ہونے میں تقریباً {{minutes}} منٹ باقی ہیں۔ براہ کرم وقت سے پہلے پہنچیں۔ سفر {{tripCode}} برائے {{destination}}۔' },
+      en: { title: 'Gathering time is near', body: 'Gathering at {{stopName}} is in about {{minutes}} minutes. Please arrive early. Your trip to {{destination}}.' },
+      ur: { title: 'جمع ہونے کا وقت قریب ہے', body: '{{stopName}} پر جمع ہونے میں تقریباً {{minutes}} منٹ باقی ہیں۔ براہ کرم وقت سے پہلے پہنچیں۔ آپ کا سفر برائے {{destination}}۔' },
     },
   },
   STATION_MIQAT_REMINDER: {
@@ -1387,10 +1414,40 @@ const PLACEHOLDER = /\{\{\s*([A-Za-z0-9_]+)\s*\}\}/g;
 
 export const isNotificationEvent = (value: string): value is NotificationEvent => Object.prototype.hasOwnProperty.call(NOTIFICATION_CATALOG, value);
 
-export const describeVariables = (event: NotificationEvent) => {
+/** Internal to the company: the client asked that customers never see the trip number, in any channel. */
+const STAFF_ONLY_VARIABLES: NotificationVariable[] = ['tripCode'];
+const isForCustomers = (event: NotificationEvent) => NOTIFICATION_CATALOG[event].audience === 'PASSENGER';
+
+/** The variables a template of this action may use; a customer's template never gets the staff-only ones. */
+const variablesOf = (event: NotificationEvent): NotificationVariable[] => {
   const keys: NotificationVariable[] = NOTIFICATION_CATALOG[event].variables;
-  return keys.map((key) => ({ key, ...VARIABLES[key] }));
+  return isForCustomers(event) ? keys.filter((key) => !STAFF_ONLY_VARIABLES.includes(key)) : keys;
 };
+
+export const describeVariables = (event: NotificationEvent) => variablesOf(event).map((key) => ({ key, ...VARIABLES[key] }));
+
+// A label that only introduced the number goes with it ("رقم الرحلة {{tripCode}}."); elsewhere only the number goes ("رحلة {{tripCode}} إلى" reads "رحلة إلى").
+const TRIP_CODE_PHRASE = /\s*(?:رقم الرحلة|Trip number|سفر نمبر)\s*\{\{\s*tripCode\s*\}\}\s*[.۔]?/gi;
+const TRIP_CODE_PLACEHOLDER = /[ \t]*\{\{\s*tripCode\s*\}\}/g;
+
+/**
+ * The wording as a customer may receive it. Templates saved in the panel before the trip number was hidden
+ * can still name it, so it is taken out wherever a customer's text is rendered or sent to WhatsApp for approval.
+ */
+export const customerWording = (event: NotificationEvent, text: string) =>
+  isForCustomers(event) ? text.replace(TRIP_CODE_PHRASE, '').replace(TRIP_CODE_PLACEHOLDER, '') : text;
+
+/** The values a customer's message may carry: the staff-only ones are dropped, so even an older WhatsApp template leaves them blank. */
+export const customerValues = (event: NotificationEvent, values: NotificationValues): NotificationValues => {
+  if (!isForCustomers(event)) return values;
+  const kept = { ...values };
+  for (const key of STAFF_ONLY_VARIABLES) delete kept[key];
+  return kept;
+};
+
+/** renderTemplate for one action's message, keeping what its audience must not see out of it. */
+export const renderNotification = (event: NotificationEvent, template: string, values: NotificationValues) =>
+  renderTemplate(customerWording(event, template), customerValues(event, values));
 
 /** One pass only, so a value that happens to contain {{...}} is never expanded again. */
 export const renderTemplate = (template: string, values: NotificationValues) =>
@@ -1404,7 +1461,7 @@ export const renderTemplate = (template: string, values: NotificationValues) =>
 
 /** Returns what is wrong with a template, or null when it can be saved. */
 export function findTemplateProblem(event: NotificationEvent, text: string): string | null {
-  const allowed: string[] = NOTIFICATION_CATALOG[event].variables;
+  const allowed: string[] = variablesOf(event);
   for (const [, key] of text.matchAll(PLACEHOLDER)) {
     if (!allowed.includes(key)) return `المتغير {{${key}}} غير متاح لهذا الإشعار`;
   }

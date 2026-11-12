@@ -239,7 +239,8 @@ describe('Security hardening (e2e)', () => {
       });
       const customer = await loginPassenger(app);
       await book(customer, trip.id, ['1']);
-      const reverse = (await request(http()).post(`${API}/trips/${trip.id}/open-reverse`).set(admin.auth).send({ boardingPointName: 'مكة' }).expect(201)).body;
+      // Publishing opened the way back; the seat sold since is closed on it by the link.
+      const reverse = await prisma.trip.findFirstOrThrow({ where: { reverseOfTripId: trip.id } });
       expect(reverse.availableSeats).toBe(48);
 
       const outbound = await book(customer, trip.id, ['2']);

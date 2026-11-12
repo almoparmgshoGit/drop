@@ -91,8 +91,9 @@ export function audienceWhere(filters: AudienceFilters, isMarketing: boolean, no
   if (filters.customerType === 'RETURNING') where.push({ bookings: { some: hasTravelled } });
   if (filters.customerType === 'NEW') where.push({ bookings: { none: hasTravelled } });
   if (filters.inactiveDays) {
+    // Both halves count the same real bookings: a booking cancelled last week is not activity, so it must not hide a lapsed customer.
     where.push({ bookings: { some: { status: { in: [...LIVE_BOOKING_STATUSES] } } } });
-    where.push({ bookings: { none: { createdAt: { gte: new Date(now.getTime() - filters.inactiveDays * DAY_MS) } } } });
+    where.push({ bookings: { none: { status: { in: [...LIVE_BOOKING_STATUSES] }, createdAt: { gte: new Date(now.getTime() - filters.inactiveDays * DAY_MS) } } } });
   }
   if (filters.hasWallet) where.push({ walletBalance: { gt: 0 } });
   if (filters.languages?.length && filters.languages.length < 3) where.push({ messageLanguage: { in: filters.languages } });

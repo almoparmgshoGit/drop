@@ -2,7 +2,8 @@ import { BadRequestException, ConflictException, ForbiddenException, Injectable,
 import { CustomerComplaintCategory, Prisma } from '@prisma/client';
 import { NotificationsService } from '../../common/services/notifications.service';
 import { PrismaService } from '../../common/services/prisma.service';
-import { CreateCustomerComplaintDto, ListCustomerComplaintsQuery } from './complaints.dto';
+import { complaintReference, hotelBookingReference } from '../hotels/hotels.service';
+import { CreateCustomerComplaintDto, ListCustomerComplaintsQuery, ListHotelComplaintsQuery } from './complaints.dto';
 
 const TX_OPTIONS = { maxWait: 10_000, timeout: 30_000 };
 const MAX_OPEN_COMPLAINTS = 5;
@@ -13,9 +14,15 @@ export const COMPLAINT_CATEGORY_LABELS: Record<CustomerComplaintCategory, string
   APP: 'التطبيق',
   TRIP: 'رحلة',
   SUPERVISOR: 'المشرف',
+  BUS: 'الباص',
   OTHER: 'أخرى',
 };
-const NEEDS_BOOKING: CustomerComplaintCategory[] = ['TRIP', 'SUPERVISOR'];
+/** A bus changes from trip to trip, so a complaint about one has to say which trip it was. */
+const NEEDS_BOOKING: CustomerComplaintCategory[] = ['TRIP', 'SUPERVISOR', 'BUS'];
+const MISSING_BOOKING: Partial<Record<CustomerComplaintCategory, string>> = {
+  SUPERVISOR: 'اختر الرحلة التي كان عليها المشرف',
+  BUS: 'اختر الرحلة التي كان عليها الباص',
+};
 
 export const customerComplaintReference = (number: number) => `C-${number}`;
 
@@ -29,6 +36,7 @@ const BOOKING_CHOICE_SELECT = {
       origin: true,
       destination: true,
       departureTime: true,
+      bus: { select: { plateNumber: true } },
       supervisors: { orderBy: { isPrimary: 'desc' }, select: { user: { select: { name: true } } } },
     },
   },
@@ -87,6 +95,8 @@ export class ComplaintsService {
         destination: booking.trip.destination,
         departureTime: booking.trip.departureTime,
         supervisors: supervisorNamesOf(booking),
+        // Lets the customer recognise the bus they mean when complaining about it.
+        busPlate: booking.trip.bus?.plateNumber ?? null,
       })),
     };
   }
@@ -97,7 +107,7 @@ export class ComplaintsService {
     if (user.blockedAt) throw new ForbiddenException('حسابك موقوف، تواصل مع خدمة العملاء');
 
     if (NEEDS_BOOKING.includes(dto.category) && !dto.bookingId) {
-      throw new BadRequestException(dto.category === 'SUPERVISOR' ? 'اختر الرحلة التي كان عليها المشرف' : 'اختر الرحلة التي تشتكي منها');
+      throw new BadRequestException(MISSING_BOOKING[dto.category] ?? 'اختر الرحلة التي تشتكي منها');
     }
     // Someone else's booking looks like it does not exist.
     const booking = dto.bookingId
@@ -173,6 +183,58 @@ export class ComplaintsService {
       page,
       limit,
       openByCategory: Object.fromEntries(open.map((row) => [row.category, row._count._all])),
+    };
+  }
+
+  /**
+   * Hotel complaints keep their own table and their own reply and reopen endpoints under /hotels, which notify the traveler;
+   * this only gathers every hotel's into one list, so nobody has to open each hotel to find what is waiting.
+   */
+  async listHotelComplaints(query: ListHotelComplaintsQuery) {
+    const page = query.page ?? 1;
+    const limit = query.limit ?? 20;
+    const search = query.search?.trim();
+    const number = search && /^hc-?\d+$/i.test(search) ? Number(search.replace(/\D/g, '')) : null;
+    const where: Prisma.HotelComplaintWhereInput = {
+      ...(query.status && { status: query.status }),
+      ...(query.source && { source: query.source }),
+      ...(search && {
+        OR: number !== null
+          ? [{ number }]
+          : [
+              { hotel: { name: { contains: search, mode: 'insensitive' } } },
+              { subject: { contains: search, mode: 'insensitive' } },
+              { travelerName: { contains: search, mode: 'insensitive' } },
+              { roomNumber: { contains: search } },
+              { hotelBooking: { trip: { tripCode: { contains: search, mode: 'insensitive' } } } },
+            ],
+      }),
+    };
+    const [items, total, open] = await Promise.all([
+      this.prisma.hotelComplaint.findMany({
+        where,
+        orderBy: [{ status: 'asc' }, { createdAt: 'desc' }],
+        skip: (page - 1) * limit,
+        take: limit,
+        include: {
+          hotel: { select: { id: true, name: true, city: true } },
+          hotelBooking: { select: { number: true, trip: { select: { tripCode: true } } } },
+        },
+      }),
+      this.prisma.hotelComplaint.count({ where }),
+      this.prisma.hotelComplaint.count({ where: { status: 'OPEN' } }),
+    ]);
+    return {
+      items: items.map(({ number, hotelBooking, ...complaint }) => ({
+        ...complaint,
+        reference: complaintReference(number),
+        hotelBookingReference: hotelBooking ? hotelBookingReference(hotelBooking.number) : null,
+        tripCode: hotelBooking?.trip.tripCode ?? null,
+      })),
+      total,
+      page,
+      limit,
+      open,
     };
   }
 

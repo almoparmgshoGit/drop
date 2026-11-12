@@ -9,6 +9,7 @@ import { InvoiceLedgerService } from './invoice-ledger.service';
 import { formatSar, NotificationsService } from './notifications.service';
 import { PaymentLedgerService } from './payment-ledger.service';
 import { PrismaService } from './prisma.service';
+import { LoyaltyService } from './loyalty.service';
 import { WalletService } from './wallet.service';
 
 const AUTOMATIC_BATCH = 200;
@@ -43,6 +44,7 @@ export class TicketCompensationService {
     private notifications: NotificationsService,
     private ledger: PaymentLedgerService,
     private invoices: InvoiceLedgerService,
+    private loyalty: LoyaltyService,
   ) {}
 
   /** The most that can be given is what was paid for those who did not travel, so a part-boarded booking gets only their share. */
@@ -103,6 +105,8 @@ export class TicketCompensationService {
     // Money handed back to the customer, so the books record it like any refund to the wallet.
     await this.ledger.walletRefund(tx, { bookingId: booking.id, amount, actorId: details.actor?.userId });
     await tx.booking.update({ where: { id: booking.id }, data: { refundAmount: { increment: amount } } });
+    // Points were credited on the whole payment; the share now handed back takes its points with it.
+    await this.loyalty.withdrawEarned(tx, booking.id);
     await this.invoices.credit(tx, { bookingId: booking.id, amount: halalas(amount), reason: 'تعويض تذكرة موقوفة', actorId: details.actor?.userId });
     await this.events.record(tx, {
       bookingId: booking.id,

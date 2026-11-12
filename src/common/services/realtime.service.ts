@@ -7,14 +7,32 @@ export const userRoom = (userId: string) => `user:${userId}`;
 export const sessionRoom = (jti: string) => `session:${jti}`;
 export const tripRoom = (tripId: string) => `trip:${tripId}`;
 export const CHAT_STAFF_ROOM = 'staff:chat';
+/** Staff who may see every trip follow every moving bus on the live map. */
+export const TRACKING_STAFF_ROOM = 'staff:tracking';
+export const TRACKING_PERMISSIONS = ['trips.view', 'trips.manage'] as const;
 
 export const REALTIME_EVENTS = {
   NOTIFICATION: 'notification:new',
   CHAT_MESSAGE: 'chat:message',
   CHAT_UPDATED: 'chat:updated',
+  TRIP_CHAT_MESSAGE: 'tripchat:message',
+  TRIP_CHAT_UPDATED: 'tripchat:updated',
   TRIP_LOCATION: 'trip:location',
   TRIP_CHANGED: 'trip:changed',
+  /** The live map's own events, so a staff socket that also follows one booking's trip never mistakes them for that trip's. */
+  TRACKING_LOCATION: 'tracking:location',
+  TRACKING_CHANGED: 'tracking:changed',
 } as const;
+
+/** What every trip chat event carries besides the message: the unread counts let both sides draw read ticks and badges without asking. */
+export interface TripChatEvent {
+  threadId: string;
+  tripId: string;
+  crewUnread: number;
+  customerUnread: number;
+  /** Lets the device that sent the message replace its own pending copy. */
+  clientId?: string | null;
+}
 
 export interface LiveLocation {
   lat: number;
@@ -57,13 +75,36 @@ export class RealtimeService {
     this.server?.to(CHAT_STAFF_ROOM).emit(REALTIME_EVENTS.CHAT_UPDATED, { conversationId });
   }
 
+  /**
+   * A message in a customer's thread with a trip's crew. Sent to people rather than to a trip room, so a supervisor taken off
+   * the trip stops hearing it at once and one just added hears it without subscribing to anything.
+   */
+  tripChatMessage(customerId: string, crewIds: string[], event: TripChatEvent, message: Record<string, unknown>) {
+    // The customer reads the supervisor's name, not their account id.
+    const { senderId: _senderId, ...forCustomer } = message;
+    this.server?.to(userRoom(customerId)).emit(REALTIME_EVENTS.TRIP_CHAT_MESSAGE, { ...event, message: forCustomer });
+    const crewRooms = [...new Set(crewIds)].map(userRoom);
+    if (crewRooms.length > 0) this.server?.to(crewRooms).emit(REALTIME_EVENTS.TRIP_CHAT_MESSAGE, { ...event, message });
+  }
+
+  /** Someone read the thread: the other side's read ticks and every open copy's badge follow. */
+  tripChatUpdated(customerId: string, crewIds: string[], event: Omit<TripChatEvent, 'clientId'>) {
+    const rooms = [userRoom(customerId), ...new Set(crewIds.map(userRoom))];
+    this.server?.to(rooms).emit(REALTIME_EVENTS.TRIP_CHAT_UPDATED, event);
+  }
+
   /** A null location means the crew stopped sharing and the last position must leave the map. */
   tripLocation(tripId: string, location: LiveLocation | null) {
     this.server?.to(tripRoom(tripId)).emit(REALTIME_EVENTS.TRIP_LOCATION, { tripId, location });
+    this.server?.to(TRACKING_STAFF_ROOM).emit(REALTIME_EVENTS.TRACKING_LOCATION, { tripId, location });
   }
 
   tripChanged(tripId: string) {
-    this.prisma.afterCommit(() => this.server?.to(tripRoom(tripId)).emit(REALTIME_EVENTS.TRIP_CHANGED, { tripId }));
+    this.prisma.afterCommit(() => {
+      this.server?.to(tripRoom(tripId)).emit(REALTIME_EVENTS.TRIP_CHANGED, { tripId });
+      // Carries no content: the map reads the trip's new status over HTTP, behind its permission check.
+      this.server?.to(TRACKING_STAFF_ROOM).emit(REALTIME_EVENTS.TRACKING_CHANGED, { tripId });
+    });
   }
 
   disconnectSession(jti: string) {

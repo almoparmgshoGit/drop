@@ -7,7 +7,7 @@ import { RoomAllocationService } from './room-allocation.service';
 import { WalletService } from './wallet.service';
 import { InvoiceLedgerService } from './invoice-ledger.service';
 import { PaymentLedgerService, refundMethodLabel } from './payment-ledger.service';
-import { lockTripsWithLinked, releaseLinkedSeats } from '../utils/linked-seats.util';
+import { lockTripsWithLinked, releaseLinkedSeats, retakeReturnSeats } from '../utils/linked-seats.util';
 import { halalas, paymentFigures, splitOriginalRefund } from '../utils/payment.util';
 
 /**
@@ -98,6 +98,7 @@ export class BookingCancellationService {
       data: { availableSeats: { increment: seatNumbers.length } },
     });
     await releaseLinkedSeats(tx, booking.tripId, seatNumbers);
+    await this.returnHomeOnOwnTrip(tx, booking);
 
     if (walletRefund > 0) {
       await this.wallet.apply(tx, {
@@ -126,6 +127,8 @@ export class BookingCancellationService {
     await this.rooms.tidyEmptyRooms(tx, booking.passengers.map((p) => p.hotelRoomId).filter((id): id is string => !!id));
 
     await this.loyalty.restoreForCancelledBooking(tx, booking);
+    // Points were credited when it was paid; a cancelled booking keeps none, whatever share of the money it keeps.
+    await this.loyalty.withdrawEarned(tx, booking.id, { cancelled: true });
     await this.releaseVoucher(tx, booking);
 
     await this.events.record(tx, {
@@ -167,6 +170,24 @@ export class BookingCancellationService {
   }
 
   /** Cancelling gives back the use the booking took, for a points voucher and a marketing coupon alike. */
+  /**
+   * Cancelling the return leg of a journey sends its round-trip outbound home on that trip's own reverse again, so the
+   * outbound's seats there are taken back. Seats a return-only passenger bought meanwhile stay theirs.
+   */
+  private async returnHomeOnOwnTrip(tx: Prisma.TransactionClient, booking: { id: string; groupReference: string | null }) {
+    if (!booking.groupReference) return;
+    const legs = await tx.booking.findMany({
+      where: { groupReference: booking.groupReference, id: { not: booking.id }, status: { in: ['CONFIRMED', 'PENDING_CANCELLATION_REVIEW'] } },
+      select: { id: true, tripId: true, passengers: { select: { seatNumber: true } }, trip: { select: { direction: true, reverseOfTripId: true } } },
+    });
+    // Only a lone remaining leg rides back on its own trip; with two legs left, the journey still returns elsewhere.
+    if (legs.length !== 1) return;
+    const [outbound] = legs;
+    if (outbound.trip.direction !== 'ROUND_TRIP' || outbound.trip.reverseOfTripId) return;
+    await lockTripsWithLinked(tx, [outbound.tripId]);
+    await retakeReturnSeats(tx, outbound.tripId, outbound.passengers.map((passenger) => passenger.seatNumber));
+  }
+
   private async releaseVoucher(tx: Prisma.TransactionClient, booking: { id: string; couponId: string | null; groupReference: string | null }) {
     if (!booking.couponId) return;
     // A round trip is one use across two bookings, so it comes back only with the last of them.

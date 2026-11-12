@@ -14,7 +14,7 @@ import { WalletService } from '../../common/services/wallet.service';
 import { BookingCancellationService, lockBookingWithTrip } from '../../common/services/booking-cancellation.service';
 import { BookingEventsService } from '../../common/services/booking-events.service';
 import { InvoiceLedgerService } from '../../common/services/invoice-ledger.service';
-import { LoyaltyService, transportShare } from '../../common/services/loyalty.service';
+import { earnedPoints, LoyaltyService, transportShare } from '../../common/services/loyalty.service';
 import { NotificationsService } from '../../common/services/notifications.service';
 import { PaymentLedgerService } from '../../common/services/payment-ledger.service';
 import { includesHousing } from '../../common/utils/booking-types.util';
@@ -391,10 +391,11 @@ export class BookingsService {
 
     // Worked out once here, so the preview and the saved booking can never disagree.
     const plans = await Promise.all(pricedLegs.map((leg) => this.loyalty.earnPlan(db, userId, program, leg.trip, leg.seats.length)));
-    // Points are earned on the tickets alone, so the hotel's part of each leg is left out, the same rule as settlement.
+    // Points are earned on the tickets alone, so the hotel's part of each leg is left out, the same rule as crediting at payment.
     const willEarn = pricedLegs.reduce((sum, leg, idx) => {
       const share = transportShare({ subtotal: leg.subtotal / 100, housingAmount: leg.housingAmount / 100, seats: leg.seats.length, trip: { price: leg.trip.price, packageId: leg.trip.packageId } });
-      return sum + Math.floor((leg.total / 100) * share * plans[idx].rate) + plans[idx].bonus;
+      // A leg's total is exactly what it brings in, online and from the wallet, so this is what payment will credit.
+      return sum + earnedPoints(leg.total, share, plans[idx]);
     }, 0);
 
     const housing = pricedLegs.map((leg) => leg.stay?.details ?? null);
@@ -578,7 +579,7 @@ export class BookingsService {
               where: { id: leg.trip.id },
               data: { availableSeats: { decrement: leg.seats.length } },
             });
-            await takeLinkedSeats(tx, leg.trip.id, leg.seats, holdAvailableTo(userId, now));
+            await takeLinkedSeats(tx, leg.trip.id, leg.seats, holdAvailableTo(userId, now), { returnsOnOtherLeg: quote.pricedLegs.length > 1 });
 
             const boardingPoint = await this.resolveBoardingPoint(tx, leg.leg, leg.trip.id);
             const bookingReference = `DRB-${randomCode(8)}`;
@@ -691,6 +692,8 @@ export class BookingsService {
           for (const booking of created) {
             await this.notifications.toStaffAboutBooking(tx, 'STAFF_NEW_BOOKING', ['bookings.view'], booking.id, { exceptUserId: userId });
           }
+          // Paid in full at checkout, online or from the wallet, so the points are credited now rather than after the trip.
+          for (const booking of created) await this.loyalty.creditPaidBooking(tx, booking.id);
           // Last, so a failure earlier in the booking does not burn an invoice number.
           for (const booking of created) await this.invoices.ensure(tx, booking.id);
           return group;

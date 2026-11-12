@@ -204,22 +204,22 @@ describe('Hotels and rooming (e2e)', () => {
       const departure = new Date('2031-03-15T06:00:00Z');
       const dates = { departureTime: departure.toISOString(), arrivalTime: new Date(departure.getTime() + 18_000_000).toISOString() };
       const hotel = await createHotel(50);
-      const booked = await hotelTrip({ tripCode: 'R900', ...dates });
-      const unbooked = await hotelTrip({ tripCode: 'R901', ...dates });
+      const booked = await hotelTrip(dates);
+      const unbooked = await hotelTrip(dates);
       const a = await book(booked, ['1', '2']);
       await book(unbooked, ['1']);
       const { id } = await bookHotel(booked, hotel, admin, { extraCost: 30 });
       await request(http()).post(`${API}/hotels/bookings/${id}/rooms`).set(staff.auth).send({ passengerIds: [a.booking.passengers[0].id], roomNumber: '1', roomType: 'SHARED' }).expect(201);
 
       const res = await request(http()).get(`${API}/hotels/overview?month=2031-03`).set(admin.auth).expect(200);
-      const row = res.body.rows.find((r: any) => r.tripCode === 'R900');
+      const row = res.body.rows.find((r: any) => r.tripCode === booked.tripCode);
       // 1 occupied room × 2 nights × 50 + 30 extra; the unroomed passenger still counts toward sales.
       expect(row.cost).toBe(130);
       expect(row.sales).toBe(80);
       expect(row.profit).toBe(-50);
       expect(row.reference).toMatch(/^HB-\d+$/);
-      expect(res.body.rows.find((r: any) => r.tripCode === 'R901').status).toBe('NOT_BOOKED');
-      expect(res.body.summary.tripsWithoutHotel).toEqual(['R901']);
+      expect(res.body.rows.find((r: any) => r.tripCode === unbooked.tripCode).status).toBe('NOT_BOOKED');
+      expect(res.body.summary.tripsWithoutHotel).toEqual([unbooked.tripCode]);
       await request(http()).get(`${API}/hotels/overview?month=nope`).set(admin.auth).expect(400);
     });
   });

@@ -2,6 +2,7 @@ import {
   Injectable,
   UnauthorizedException,
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   HttpException,
   HttpStatus,
@@ -10,8 +11,10 @@ import {
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
+import { Prisma } from '@prisma/client';
 import * as argon2 from 'argon2';
 import * as crypto from 'crypto';
+import { OAuth2Client, TokenPayload } from 'google-auth-library';
 import { PrismaService } from '../../common/services/prisma.service';
 import { permissionsOf } from '../../common/permissions';
 import { RedisService } from '../../common/services/redis.service';
@@ -26,6 +29,16 @@ import { revokedTokenKey } from './jwt.strategy';
 const DUMMY_PASSWORD_HASH = argon2.hash(crypto.randomBytes(32).toString('hex'));
 
 const ACCOUNT_WIDE_FAILURES_FACTOR = 10;
+
+/** Long enough to receive a code by WhatsApp and type it, short enough that a leaked link token is soon worthless. */
+const GOOGLE_LINK_TTL_SECONDS = 15 * 60;
+const googleLinkKey = (linkToken: string) => `google_link:${linkToken}`;
+
+/** What a verified Google ID token says about its owner. The email is kept only when Google verified it. */
+interface GoogleIdentity {
+  googleId: string;
+  email: string | null;
+}
 
 const AUTH_USER_SELECT = {
   id: true,
@@ -44,6 +57,8 @@ const AUTH_USER_SELECT = {
 @Injectable()
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
+  /** Caches Google's signing keys between sign-ins; the audience is passed per call, so a changed client id applies at once. */
+  private readonly googleClient = new OAuth2Client();
 
   constructor(
     private prisma: PrismaService,
@@ -115,6 +130,28 @@ export class AuthService {
 
   async verifyOtp(rawPhone: string, code: string, ip?: string, userAgent?: string) {
     const phone = normalizeSaudiPhone(rawPhone);
+    await this.checkOtp(phone, code);
+
+    let user = await this.prisma.user.findUnique({ where: { phone } });
+    await this.assertCustomerMayEnter(user);
+    await this.consumeOtp(phone);
+
+    if (!user) {
+      user = await this.prisma.user.create({
+        data: { phone, isVerified: true },
+      });
+    } else if (!user.isVerified) {
+      user = await this.prisma.user.update({
+        where: { id: user.id },
+        data: { isVerified: true },
+      });
+    }
+
+    return this.generateAuthTokens(user.id, user.role, ip, userAgent);
+  }
+
+  /** Throws unless the code is right. It stays usable, so a refusal that follows (a blocked account) does not cost the customer their code. */
+  private async checkOtp(phone: string, code: string) {
     const invalidCode = new BadRequestException('رمز التحقق غير صحيح أو منتهي الصلاحية');
 
     const storedHash = await this.redis.get(`otp:${phone}`);
@@ -137,8 +174,17 @@ export class AuthService {
       await this.redis.incr(dailyFailuresKey, 24 * 60 * 60);
       throw invalidCode;
     }
+  }
 
-    let user = await this.prisma.user.findUnique({ where: { phone } });
+  /** A code opens one sign-in only. */
+  private async consumeOtp(phone: string) {
+    await this.redis.del(`otp:${phone}`);
+    await this.redis.del(`otp_attempts:${phone}`);
+    await this.redis.del(`otp_failures:${phone}`);
+  }
+
+  /** The account a customer may open with a phone code or Google, or a new one when registration is open. */
+  private async assertCustomerMayEnter(user: { role: string; blockedAt: Date | null } | null) {
     // Staff accounts have elevated access, so a phone code alone must never be enough to open them.
     if (user && user.role !== 'PASSENGER') {
       throw new ForbiddenException('هذا الحساب يدخل عبر بوابة الموظفين بكلمة المرور');
@@ -146,25 +192,84 @@ export class AuthService {
     if (user?.blockedAt) {
       throw new ForbiddenException('هذا الحساب موقوف. تواصل مع خدمة العملاء');
     }
-    if (!user &&!(await this.appSettings.flag('registrationEnabled'))) {
+    if (!user && !(await this.appSettings.flag('registrationEnabled'))) {
       throw new ForbiddenException('تسجيل الحسابات الجديدة متوقف مؤقتًا');
     }
-    await this.redis.del(`otp:${phone}`);
-    await this.redis.del(`otp_attempts:${phone}`);
-    await this.redis.del(dailyFailuresKey);
+  }
 
-    if (!user) {
-      user = await this.prisma.user.create({
-        data: { phone, isVerified: true },
-      });
-    } else if (!user.isVerified) {
-      user = await this.prisma.user.update({
-        where: { id: user.id },
-        data: { isVerified: true },
-      });
+  // ---- Google quick sign-in ----
+
+  /**
+   * Signs in a customer whose Google account is already linked. Any other Google account gets a short-lived link token
+   * instead, and proves a phone with the usual code (see linkGoogle): the phone is what identifies an account here.
+   * The email on a profile is typed by the customer and never verified, so it is not used to find the account: a typo
+   * would otherwise hand that account, wallet included, to whoever owns the typed address.
+   */
+  async googleSignIn(idToken: string, ip?: string, userAgent?: string) {
+    const identity = await this.verifyGoogleToken(idToken);
+    const user = await this.prisma.user.findUnique({ where: { googleId: identity.googleId } });
+    if (user) {
+      // An employee promoted from a customer keeps the link, and must still use their password.
+      await this.assertCustomerMayEnter(user);
+      return this.generateAuthTokens(user.id, user.role, ip, userAgent);
     }
+    const linkToken = crypto.randomBytes(32).toString('hex');
+    await this.redis.set(googleLinkKey(linkToken), JSON.stringify(identity), GOOGLE_LINK_TTL_SECONDS);
+    return { needsPhone: true as const, linkToken, email: identity.email };
+  }
 
-    return this.generateAuthTokens(user.id, user.role, ip, userAgent);
+  /** Finishes a first Google sign-in: the phone's code proves the account, and the Google account is linked to it. */
+  async linkGoogle(linkToken: string, rawPhone: string, code: string, ip?: string, userAgent?: string) {
+    const saved = await this.redis.get(googleLinkKey(linkToken));
+    if (!saved) throw new BadRequestException('انتهت مهلة ربط حساب Google، أعد المحاولة من البداية');
+    const identity = JSON.parse(saved) as GoogleIdentity;
+
+    const phone = normalizeSaudiPhone(rawPhone);
+    await this.checkOtp(phone, code);
+    const user = await this.prisma.user.findUnique({ where: { phone } });
+    await this.assertCustomerMayEnter(user);
+    if (user?.googleId && user.googleId !== identity.googleId) {
+      throw new ConflictException('هذا الرقم مرتبط بحساب Google آخر. ادخل برقم الجوال ثم تابع');
+    }
+    const linkedElsewhere = await this.prisma.user.findFirst({ where: { googleId: identity.googleId, ...(user && { id: { not: user.id } }) }, select: { id: true } });
+    if (linkedElsewhere) throw new ConflictException('حساب Google هذا مرتبط برقم آخر. ادخل به مباشرة');
+
+    await this.consumeOtp(phone);
+    await this.redis.del(googleLinkKey(linkToken));
+
+    // Google vouched for this address, so it fills an empty profile email, unless another account already uses it.
+    const canTakeEmail = !!identity.email && !user?.email && (await this.prisma.user.count({ where: { email: identity.email } })) === 0;
+    const email = canTakeEmail ? { email: identity.email } : {};
+    try {
+      const linked = user
+        ? await this.prisma.user.update({ where: { id: user.id }, data: { googleId: identity.googleId, isVerified: true, ...email } })
+        : await this.prisma.user.create({ data: { phone, googleId: identity.googleId, isVerified: true, ...email } });
+      return this.generateAuthTokens(linked.id, linked.role, ip, userAgent);
+    } catch (err) {
+      // Two taps of the same link can race to the unique index; the second one is told what happened.
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+        throw new ConflictException('تم ربط حساب Google بالفعل، ادخل به مباشرة');
+      }
+      throw err;
+    }
+  }
+
+  private async verifyGoogleToken(idToken: string): Promise<GoogleIdentity> {
+    const setting = await this.prisma.setting.findUnique({ where: { key: 'googleWebClientId' } });
+    const audience = setting?.value.trim();
+    if (!audience) throw new ServiceUnavailableException('الدخول بحساب Google غير مفعّل حاليًا');
+    let payload: TokenPayload | undefined;
+    try {
+      // Checks Google's signature, the issuer, the expiry, and that the token was issued for this app and no other.
+      const ticket = await this.googleClient.verifyIdToken({ idToken, audience });
+      payload = ticket.getPayload();
+    } catch {
+      throw new UnauthorizedException('تعذر التحقق من حساب Google، حاول مرة أخرى');
+    }
+    if (!payload?.sub) throw new UnauthorizedException('تعذر التحقق من حساب Google، حاول مرة أخرى');
+    // An address Google has not verified could belong to anyone, so it is not kept.
+    const email = payload.email_verified === true && payload.email ? payload.email.trim().toLowerCase() : null;
+    return { googleId: payload.sub, email };
   }
 
   async staffLogin(rawIdentifier: string, password: string, ip?: string, userAgent?: string) {

@@ -1,4 +1,4 @@
-import { BUS_SEAT_COUNT, MAX_SMALL_VEHICLE_SEATS, MIN_SMALL_VEHICLE_SEATS } from '../../common/utils/bus-layout.util';
+import { MAX_BUS_SEATS, MIN_SMALL_VEHICLE_SEATS } from '../../common/utils/bus-layout.util';
 import { PartialType } from '@nestjs/swagger';
 import { Transform, Type } from 'class-transformer';
 import {
@@ -51,29 +51,29 @@ export class CreateBusDto {
   @MaxLength(500)
   imageUrl?: string;
 
-  /** A bus seats passengers on the fixed plan; a van or minibus on one drawn from seatCount. */
+  /** A 49-seat bus seats passengers on the fixed plan; any other vehicle on one drawn from seatCount. */
   @IsOptional()
   @IsEnum(VehicleKind, { message: 'اختر نوع المركبة: باص أو فان أو باص صغير' })
   kind?: VehicleKind;
 
-  /** Required for a van or minibus; a bus always has the fixed plan's seats. */
+  /** Required for a van or minibus; a bus left without it is the standard 49. The limits for each kind are checked on save. */
   @IsOptional()
   @IsInt({ message: 'عدد المقاعد رقم صحيح' })
   @Min(MIN_SMALL_VEHICLE_SEATS, { message: `عدد المقاعد لا يقل عن ${MIN_SMALL_VEHICLE_SEATS}` })
-  @Max(MAX_SMALL_VEHICLE_SEATS, { message: `عدد المقاعد لا يزيد عن ${MAX_SMALL_VEHICLE_SEATS}، وللأكثر اختر باص` })
+  @Max(MAX_BUS_SEATS, { message: `عدد المقاعد لا يزيد عن ${MAX_BUS_SEATS}` })
   seatCount?: number;
 
   /** Where singles sit on this bus. Left out, it starts from the settings. */
   @IsOptional()
   @IsInt()
   @Min(1)
-  @Max(BUS_SEAT_COUNT)
+  @Max(MAX_BUS_SEATS)
   singlesFromSeat?: number;
 
   @IsOptional()
   @IsInt()
   @Min(1)
-  @Max(BUS_SEAT_COUNT)
+  @Max(MAX_BUS_SEATS)
   singlesToSeat?: number;
 
   /** Ignored once the bus belongs to an office: the company then follows the office's name. */

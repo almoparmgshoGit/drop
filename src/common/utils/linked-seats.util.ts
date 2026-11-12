@@ -129,8 +129,22 @@ export async function lockTripsWithLinked(tx: Prisma.TransactionClient, tripIds:
     FOR UPDATE`;
 }
 
-/** Takes the same seat numbers on the linked trip. A number it never had, because it was sold before the reverse opened, needs nothing. */
-export async function takeLinkedSeats(tx: Prisma.TransactionClient, tripId: string, seatNumbers: string[], available: Prisma.SeatWhereInput) {
+/**
+ * Takes the same seat numbers on the linked trip. A number it never had, because it was sold before the reverse opened, needs nothing.
+ * A round-trip booking that comes back on another date (its group has a return leg elsewhere) leaves its seat on this trip's
+ * reverse free to sell, which is how one DR trip can carry more passengers than the bus has seats.
+ */
+export async function takeLinkedSeats(
+  tx: Prisma.TransactionClient,
+  tripId: string,
+  seatNumbers: string[],
+  available: Prisma.SeatWhereInput,
+  options: { returnsOnOtherLeg?: boolean } = {},
+) {
+  if (options.returnsOnOtherLeg) {
+    const trip = await tx.trip.findUnique({ where: { id: tripId }, select: { reverseOfTripId: true } });
+    if (trip && !trip.reverseOfTripId) return;
+  }
   const linkedId = await linkedTripId(tx, tripId);
   if (!linkedId) return;
   const existing = await tx.seat.count({ where: { tripId: linkedId, seatNumber: { in: seatNumbers } } });
@@ -170,6 +184,23 @@ export async function releaseLinkedSeats(tx: Prisma.TransactionClient, tripId: s
       data: { availableSeats: { increment: released.count + added.length }, totalSeats: { increment: added.length } },
     });
   }
+}
+
+/**
+ * A round-trip booking whose return leg elsewhere was cancelled rides back on its own trip's reverse again, so it takes back
+ * whichever of its seat numbers are still free there. A number sold meanwhile stays with its buyer; the office reseats them.
+ */
+export async function retakeReturnSeats(tx: Prisma.TransactionClient, outboundId: string, seatNumbers: string[]) {
+  if (seatNumbers.length === 0) return;
+  const linkedId = await linkedTripId(tx, outboundId);
+  if (!linkedId) return;
+  const outbound = await tx.trip.findUnique({ where: { id: outboundId }, select: { reverseOfTripId: true } });
+  if (outbound?.reverseOfTripId) return;
+  const taken = await tx.seat.updateMany({
+    where: { tripId: linkedId, seatNumber: { in: seatNumbers }, isBooked: false },
+    data: { isBooked: true, heldByUserId: null, heldUntil: null },
+  });
+  if (taken.count > 0) await tx.trip.update({ where: { id: linkedId }, data: { availableSeats: { decrement: taken.count } } });
 }
 
 /** Holds the same numbers on the linked trip too, so two customers cannot each hold one seat from opposite directions and block each other at checkout. */

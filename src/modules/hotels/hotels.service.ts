@@ -67,7 +67,7 @@ const money = (value: Prisma.Decimal | number | null | undefined) => Math.round(
 const bookingCost = (booking: Parameters<typeof hotelBookingCost>[0]) => hotelBookingCost(booking) / 100;
 
 export const hotelBookingReference = (number: number) => `HB-${number}`;
-const complaintReference = (number: number) => `HC-${number}`;
+export const complaintReference = (number: number) => `HC-${number}`;
 
 @Injectable()
 export class HotelsService {

@@ -174,11 +174,19 @@ describe('Notifications (e2e)', () => {
       expect(confirmed.variables.map((v: any) => v.key)).toContain('bookingReference');
     });
 
-    it('uses the edited title and body with variables and the recipient name', async () => {
+    it('never lets a customer template name the trip number', async () => {
       await request(http())
         .put(url('BOOKING_CONFIRMED'))
         .set(admin.auth)
         .send({ title: 'أهلًا {{userName}}', body: 'مقعدك {{seats}} في رحلة {{tripCode}}', isActive: true })
+        .expect(400);
+    });
+
+    it('uses the edited title and body with variables and the recipient name', async () => {
+      await request(http())
+        .put(url('BOOKING_CONFIRMED'))
+        .set(admin.auth)
+        .send({ title: 'أهلًا {{userName}}', body: 'مقعدك {{seats}} في رحلة {{destination}}', isActive: true })
         .expect(200);
 
       const trip = await createTrip();
@@ -188,7 +196,7 @@ describe('Notifications (e2e)', () => {
 
       const [item] = await received(passenger, 'BOOKING_CONFIRMED');
       expect(item.title).toBe('أهلًا خالد');
-      expect(item.body).toBe(`مقعدك 7 في رحلة ${trip.tripCode}`);
+      expect(item.body).toBe(`مقعدك 7 في رحلة ${trip.destination}`);
     });
 
     it("sends each customer their language's wording, with the admin's own translation where there is one", async () => {
@@ -363,6 +371,10 @@ describe('Notifications (e2e)', () => {
   });
 
   describe('inbox', () => {
+    // Paid bookings also bring a points notice; with the programme off, each booking brings exactly one notification here.
+    beforeAll(() => prisma.setting.upsert({ where: { key: 'loyaltyProgram' }, create: { key: 'loyaltyProgram', value: JSON.stringify({ enabled: false }) }, update: { value: JSON.stringify({ enabled: false }) } }));
+    afterAll(() => prisma.setting.deleteMany({ where: { key: 'loyaltyProgram' } }));
+
     it('counts unread, marks read, and pages with before', async () => {
       const passenger = await loginPassenger(app);
       const first = await book(await createTrip(), passenger);

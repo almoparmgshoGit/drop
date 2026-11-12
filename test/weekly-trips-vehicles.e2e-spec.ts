@@ -55,9 +55,15 @@ describe('Vehicles and weekly trips (e2e)', () => {
     await app.close();
   });
 
-  it('gives a bus the fixed plan and a van the seats entered for it', async () => {
-    const bus = await createVehicle({ kind: 'BUS', seatCount: 20 });
+  it('gives a bus the fixed plan unless it seats another number, and a van the seats entered for it', async () => {
+    const bus = await createVehicle({ kind: 'BUS' });
     expect(bus.seatCount).toBe(49);
+    const larger = await createVehicle({ kind: 'BUS', seatCount: 50 });
+    expect(larger).toMatchObject({ seatCount: 50, singlesToSeat: 50 });
+    const onLarger = await createTrip({ busId: larger.id });
+    expect(onLarger.totalSeats).toBe(50);
+    expect(await prisma.seat.count({ where: { tripId: onLarger.id } })).toBe(50);
+    await request(http()).post(`${API}/buses`).set(admin.auth).send({ plateNumber: 'TOO-MANY', model: 'باص', kind: 'BUS', seatCount: 200 }).expect(400);
     const van = await createVehicle({ kind: 'VAN', seatCount: 13 });
     expect(van.seatCount).toBe(13);
     expect(van.singlesToSeat).toBeLessThanOrEqual(13);

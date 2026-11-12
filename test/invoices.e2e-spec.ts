@@ -217,7 +217,7 @@ describe('Invoices, tax report and trip accounts', () => {
       expect(summary).toMatchObject({ count: 2, total: 74310, collected: 73920, remaining: 390, rate: 99.5 });
       expect(summary.vat).toBeCloseTo(9692.61, 1);
       expect(summary.taxable).toBeCloseTo(64617.39, 1);
-      expect(items[0].number).toMatch(/^INV-T\d+-\d{4}$/);
+      expect(items[0].number).toMatch(/^INV-D\d{3}-\d{2}\/\d{4}-\d{4}$/);
       expect(trips).toHaveLength(1);
     });
 

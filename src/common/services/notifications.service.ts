@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
-import { MessageLanguage, NOTIFICATION_CATALOG, NotificationEvent, NotificationValues, renderTemplate, toWhatsAppParam } from '../notification-catalog';
+import { customerValues, customerWording, MessageLanguage, NOTIFICATION_CATALOG, NotificationEvent, NotificationValues, renderTemplate, toWhatsAppParam } from '../notification-catalog';
 import { readWordings, Wording } from '../message-languages';
 import { Permission, permissionsOf } from '../permissions';
 import { formatRiyadhDate, formatRiyadhTime } from '../utils/time.util';
@@ -67,14 +67,20 @@ export type CatalogView = { audience: string; title: string; body: string; expir
 /**
  * The wording one language receives: the admin's own for that language, else the catalog's translation,
  * else the Arabic (the admin's or the catalog's). Shared with campaigns so WhatsApp approval compares the same text.
+ * With the event, what that action's audience must not see (the trip number, for customers) is taken out.
  */
-export function templateWording(entry: CatalogView, custom?: { title: string; body: string; translations?: Prisma.JsonValue } | null) {
+export function templateWording(entry: CatalogView, custom?: { title: string; body: string; translations?: Prisma.JsonValue } | null, event?: NotificationEvent) {
   const arabic: Wording = { title: custom?.title ?? entry.title, body: custom?.body ?? entry.body };
   const own = readWordings(custom?.translations);
-  return (language: string): Wording => {
+  const pick = (language: string): Wording => {
     if (language === 'ar') return arabic;
     const key = language as Exclude<MessageLanguage, 'ar'>;
     return own[key] ?? entry.translations?.[key] ?? arabic;
+  };
+  if (!event) return pick;
+  return (language: string): Wording => {
+    const wording = pick(language);
+    return { title: customerWording(event, wording.title), body: customerWording(event, wording.body) };
   };
 }
 
@@ -128,7 +134,7 @@ export class NotificationsService {
     const wantsWhatsapp = !!custom?.whatsappEnabled && entry.audience === 'PASSENGER' && channels.whatsapp !== false;
     if (!wantsInApp && !wantsWhatsapp) return;
 
-    const wordingFor = templateWording(entry, custom);
+    const wordingFor = templateWording(entry, custom, event);
     const hasTranslations = !!entry.translations || Object.keys(readWordings(custom?.translations)).length > 0;
     // Only asked for when it can change something, because most events reach staff or carry one wording.
     const languages = wantsWhatsapp || hasTranslations
@@ -138,7 +144,7 @@ export class NotificationsService {
     const fallbackName = entry.audience === 'STAFF' ? STAFF_FALLBACK_NAME : PASSENGER_FALLBACK_NAME;
     const prepared = messages.map((message) => ({
       ...message,
-      all: { ...message.values, userName: message.user.name || fallbackName },
+      all: customerValues(event, { ...message.values, userName: message.user.name || fallbackName }),
       language: languages.get(message.user.id) ?? 'ar',
     }));
 

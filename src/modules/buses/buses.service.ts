@@ -3,8 +3,8 @@ import { BusStatus, Prisma, VehicleKind } from '@prisma/client';
 import { PrismaService } from '../../common/services/prisma.service';
 import { AppSettingsService } from '../../common/services/app-settings.service';
 import { applyBusServices } from '../../common/utils/bus-services.util';
-import { BUS_SEAT_COUNT, seatLayoutFor } from '../../common/utils/bus-layout.util';
-import { assertSinglesFitRange, assertValidSinglesRange } from '../../common/utils/singles-seats.util';
+import { BUS_SEAT_COUNT, seatLayoutFor, seatLimitsFor } from '../../common/utils/bus-layout.util';
+import { assertSinglesFitRange, assertValidSinglesRange, singlesRangeFor } from '../../common/utils/singles-seats.util';
 import { applySeatLayout } from '../../common/utils/trip-seats.util';
 import { PublicService, SERVICE_SELECT } from '../../common/utils/services.util';
 
@@ -23,11 +23,22 @@ interface BusInput {
   singlesToSeat?: number;
 }
 
-/** A bus always has the fixed plan's seats; a van or minibus has the count entered for it. */
+/**
+ * How many a vehicle seats. A bus sent without a count is the standard 49-seat bus, as every bus was before buses had
+ * other sizes; a van or minibus always needs its count, and one too big for it is a bus.
+ */
 function vehicleCapacity(kind: VehicleKind, seatCount: number | undefined) {
-  if (kind === 'BUS') return BUS_SEAT_COUNT;
-  if (!seatCount) throw new BadRequestException('أدخل عدد مقاعد المركبة');
-  return seatCount;
+  const count = kind === 'BUS' ? seatCount ?? BUS_SEAT_COUNT : seatCount;
+  if (!count) throw new BadRequestException('أدخل عدد مقاعد المركبة');
+  const limits = seatLimitsFor(kind);
+  if (count < limits.min || count > limits.max) {
+    throw new BadRequestException(
+      kind === 'BUS'
+        ? `مقاعد الباص من ${limits.min} إلى ${limits.max}، وللأقل اختر فان أو باص صغير`
+        : `مقاعد الفان والباص الصغير من ${limits.min} إلى ${limits.max}، وللأكثر اختر باص`,
+    );
+  }
+  return count;
 }
 
 const OFFICE_SELECT = { select: { id: true, name: true } };
@@ -98,9 +109,7 @@ export class BusesService {
 
     const kind = dto.kind ?? 'BUS';
     const seatCount = vehicleCapacity(kind, dto.seatCount);
-    const settings = await this.appSettings.singlesRange(null);
-    // The settings follow the standard bus; a smaller vehicle they do not fit starts with singles at the back half.
-    const defaults = settings.to <= seatCount ? settings : { from: Math.floor(seatCount / 2) + 1, to: seatCount };
+    const defaults = singlesRangeFor(await this.appSettings.singlesRange(null), seatCount);
     const singles = { from: dto.singlesFromSeat ?? defaults.from, to: dto.singlesToSeat ?? defaults.to };
     assertValidSinglesRange(singles, seatCount);
     const serviceIds = await this.knownServices(dto.serviceIds);

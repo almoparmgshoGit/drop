@@ -27,7 +27,8 @@ import { GENDERS, NATIONALITIES } from '../../common/profile-options';
 import { ID_TYPES } from '../../common/utils/identity.util';
 
 const trimmed = () => Transform(({ value }) => (typeof value === 'string' ? value.trim() : value));
-const SEAT_NUMBER = /^\d{1,3}$/;
+/** A seat number, or an empty entry for a passenger the server seats itself (staff only; see BranchBookingsService.assignSeats). */
+const SEAT_OR_AUTO = /^(\d{1,3})?$/;
 const NATIONAL_ID = /^[A-Za-z0-9]{0,20}$/;
 const MAX_AMOUNT = 1_000_000;
 
@@ -165,10 +166,15 @@ export class JourneyLegDto {
   @Length(1, 60)
   tripId: string;
 
+  /**
+   * One entry per passenger, in passenger order. Counter staff may leave an entry empty ("") and the server assigns a
+   * free seat as the booking is saved, so a queue never waits on the seat map. Customers in the app always pick their own.
+   */
   @IsArray()
   @ArrayMinSize(1)
   @ArrayMaxSize(20)
-  @Matches(SEAT_NUMBER, { each: true })
+  @IsString({ each: true })
+  @Matches(SEAT_OR_AUTO, { each: true, message: 'رقم الكرسي أرقام فقط، أو اتركه فارغًا ليُختار تلقائيًا' })
   seats: string[];
 
   @IsOptional()

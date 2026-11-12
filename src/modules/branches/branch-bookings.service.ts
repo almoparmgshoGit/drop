@@ -9,6 +9,9 @@ import { BOOKING_KIND_LABELS, BOOKING_KIND_PARTS } from '../../common/utils/book
 import { housingCharge, HousingTerms, isRoomSellable } from '../../common/utils/housing-price.util';
 import { vatInside } from '../../common/utils/invoice.util';
 import { tripSeatLayout } from '../../common/utils/bus-layout.util';
+import { chooseSeats } from '../../common/utils/seat-picking.util';
+import { isSinglesSeat } from '../../common/utils/singles-seats.util';
+import { AppSettingsService } from '../../common/services/app-settings.service';
 import { lockTripsWithLinked, takeLinkedSeats } from '../../common/utils/linked-seats.util';
 import { halalas, netBookingFigures, paymentFigures } from '../../common/utils/payment.util';
 import { normalizeSaudiPhone } from '../../common/utils/phone.util';
@@ -31,7 +34,8 @@ const RIYADH_OFFSET_MS = 3 * 60 * 60 * 1000;
 
 const riyadhDate = (date: Date) => new Date(date.getTime() + RIYADH_OFFSET_MS).toISOString().slice(0, 10);
 const dateOnly = (value: string) => new Date(`${value.slice(0, 10)}T00:00:00.000Z`);
-const normalizeSeats = (seats: string[]) => seats.map((seat) => String(parseInt(seat, 10)));
+/** An empty entry stays empty: it is a passenger the server seats when the booking is saved. */
+const normalizeSeats = (seats: string[]) => seats.map((seat) => (seat ? String(parseInt(seat, 10)) : ''));
 
 const JOURNEY_TRIP = {
   id: true,
@@ -99,6 +103,7 @@ export class BranchBookingsService {
     private invoices: InvoiceLedgerService,
     private notifications: NotificationsService,
     private bookings: BookingsService,
+    private appSettings: AppSettingsService,
   ) {}
 
   // ---------------------------------------------------------------- what the screen needs
@@ -547,15 +552,18 @@ export class BranchBookingsService {
         const created: { id: string; total: number }[] = [];
 
         for (const [index, leg] of quote.legs.entries()) {
-          await this.bookings.assertSeatRules(leg.trip, leg.seats);
           const available = holdAvailableTo(actor.userId, now);
+          // From here on every passenger has a seat; the empty entries only say which ones the system chose.
+          const seats = await this.assignSeats(tx, leg.trip, leg.seats, available);
+          const autoSeats = seats.filter((_, position) => !leg.seats[position]);
+          await this.bookings.assertSeatRules(leg.trip, seats);
           const claimed = await tx.seat.updateMany({
-            where: { tripId: leg.trip.id, seatNumber: { in: leg.seats }, ...available },
+            where: { tripId: leg.trip.id, seatNumber: { in: seats }, ...available },
             data: { isBooked: true, heldByUserId: null, heldUntil: null },
           });
-          if (claimed.count !== leg.seats.length) throw new ConflictException(`بعض مقاعد الرحلة ${leg.trip.tripCode} لم تعد متاحة، اختر غيرها`);
-          await tx.trip.update({ where: { id: leg.trip.id }, data: { availableSeats: { decrement: leg.seats.length } } });
-          await takeLinkedSeats(tx, leg.trip.id, leg.seats, available);
+          if (claimed.count !== seats.length) throw new ConflictException(`بعض مقاعد الرحلة ${leg.trip.tripCode} لم تعد متاحة، اختر غيرها`);
+          await tx.trip.update({ where: { id: leg.trip.id }, data: { availableSeats: { decrement: seats.length } } });
+          await takeLinkedSeats(tx, leg.trip.id, seats, available, { returnsOnOtherLeg: quote.legs.length > 1 });
 
           const point = leg.leg.boardingPointId ? await tx.boardingPoint.findFirst({ where: { id: leg.leg.boardingPointId, tripId: leg.trip.id } }) : null;
           if (leg.leg.boardingPointId && !point) throw new BadRequestException('نقطة التجمع لا تخص هذه الرحلة');
@@ -591,7 +599,7 @@ export class BranchBookingsService {
               boardingPointName: point?.name,
               boardingPointTime: point?.time,
               idempotencyKey: keyOf(index),
-              passengers: { create: passengers.map((passenger, position) => ({ ...passenger, position, seatNumber: leg.seats[position] })) },
+              passengers: { create: passengers.map((passenger, position) => ({ ...passenger, position, seatNumber: seats[position] })) },
               // What is owed until the collections below settle it, the same as any booking paid at a counter.
               payment: { create: { amount: toSar(leg.total), currency: 'SAR', status: leg.total === 0 ? 'COMPLETED' : 'PENDING', method: null } },
             },
@@ -612,7 +620,7 @@ export class BranchBookingsService {
             bookingId: booking.id,
             action: 'BRANCH_BOOKING_CREATED',
             actorId: actor.userId,
-            after: { kind: dto.kind, branchId, total: toSar(leg.total), seats: leg.seats },
+            after: { kind: dto.kind, branchId, total: toSar(leg.total), seats, ...(autoSeats.length > 0 && { autoSeats }) },
           });
           if (leg.total !== leg.listTotal) {
             // The history keeps both figures, so a changed price can always be reviewed later.
@@ -643,6 +651,42 @@ export class BranchBookingsService {
       }
       throw err;
     }
+  }
+
+  /**
+   * Gives a free seat to every passenger whose entry staff left empty. It runs inside the booking's transaction, after the
+   * trips are locked, so the seats read as free here are the ones claimed right after; a hold another customer places in the
+   * app meanwhile still makes the claim fail rather than double-book. Passengers of one booking are seated together, beside
+   * any seats picked by hand. With no seat picked, a family is first kept out of the singles section, which only singles may
+   * use, and first given seat numbers that are also free on the trip's reverse, which a round trip takes along with them.
+   */
+  private async assignSeats(tx: Db, trip: JourneyTrip, seats: string[], available: Prisma.SeatWhereInput) {
+    const missing = seats.filter((seat) => !seat).length;
+    if (missing === 0) return seats;
+    const picked = seats.filter(Boolean);
+
+    const free = await tx.seat.findMany({ where: { tripId: trip.id, ...available }, select: { seatNumber: true } });
+    const relatives = await tx.trip.findUnique({ where: { id: trip.id }, select: { seatLayout: true, reverseOfTripId: true, reverseTrip: { select: { id: true } } } });
+    const linkedIds = [relatives?.reverseOfTripId, relatives?.reverseTrip?.id].filter((id): id is string => !!id);
+    const takenOnLinked = linkedIds.length
+      ? await tx.seat.findMany({ where: { tripId: { in: linkedIds }, NOT: available }, select: { seatNumber: true } })
+      : [];
+    const blocked = new Set(takenOnLinked.map((seat) => seat.seatNumber));
+    const singles = await this.appSettings.singlesRange(trip.busId);
+
+    const chosen = chooseSeats({
+      layout: tripSeatLayout(relatives ?? {}),
+      free: free.map((seat) => seat.seatNumber),
+      picked,
+      count: missing,
+      // Beside a seat picked by hand matters more than the section: the family asked to sit there.
+      preferences: picked.length ? [(seat) => !blocked.has(seat)] : [(seat) => !blocked.has(seat), (seat) => !isSinglesSeat(seat, singles)],
+    });
+    if (!chosen) {
+      throw new ConflictException(`لا توجد مقاعد متاحة كافية في الرحلة ${trip.tripCode}: المتاح ${free.filter((seat) => !picked.includes(seat.seatNumber)).length} والمطلوب ${missing}`);
+    }
+    let next = 0;
+    return seats.map((seat) => seat || chosen[next++]);
   }
 
   /** Fills each trip's booking in turn from the payments, so a split payment still adds up on every invoice. */

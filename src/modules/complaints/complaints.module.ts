@@ -2,7 +2,7 @@ import { Body, Controller, Get, Module, Param, Post, Query, Req } from '@nestjs/
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
 import { RequirePermission } from '../../common/decorators/auth.decorators';
-import { CreateCustomerComplaintDto, ListCustomerComplaintsQuery, ResolveCustomerComplaintDto } from './complaints.dto';
+import { CreateCustomerComplaintDto, ListCustomerComplaintsQuery, ListHotelComplaintsQuery, ResolveCustomerComplaintDto } from './complaints.dto';
 import { ComplaintsService } from './complaints.service';
 
 /** The customer side is open to any signed-in user and only ever reaches their own complaints and bookings. */
@@ -20,7 +20,7 @@ class ComplaintsController {
 
   @Post()
   @Throttle({ default: { limit: 10, ttl: 60_000 } })
-  @ApiOperation({ summary: 'Customer complains about the app, a trip, a supervisor or anything else' })
+  @ApiOperation({ summary: 'Customer complains about the app, a trip, a supervisor, a bus or anything else' })
   create(@Req() req, @Body() dto: CreateCustomerComplaintDto) {
     return this.complaints.create(req.user.userId, dto);
   }
@@ -30,6 +30,14 @@ class ComplaintsController {
   @ApiOperation({ summary: 'Complaints customers sent from the app, open ones first' })
   list(@Query() query: ListCustomerComplaintsQuery) {
     return this.complaints.list(query);
+  }
+
+  /** Replies and reopening stay on the hotel's own endpoints (hotels.manage), which also tell the traveler. */
+  @Get('hotels')
+  @RequirePermission('hotels.view')
+  @ApiOperation({ summary: 'Every hotel\'s complaints in one list, open ones first' })
+  hotels(@Query() query: ListHotelComplaintsQuery) {
+    return this.complaints.listHotelComplaints(query);
   }
 
   @Post(':id/resolve')

@@ -12,7 +12,6 @@ import {
   IsOptional,
   IsString,
   Length,
-  Matches,
   Max,
   MaxLength,
   Min,
@@ -138,9 +137,11 @@ class AccommodationDto {
 }
 
 export class CreateTripDto {
+  /** Ignored: the system numbers trips per month (D001-11/2026). Still accepted so older dashboards keep working. */
+  @IsOptional()
   @IsString()
-  @Matches(/^[A-Za-z0-9-]{2,30}$/, { message: 'رمز الرحلة غير صحيح' })
-  tripCode: string;
+  @MaxLength(30)
+  tripCode?: string;
 
   @IsOptional()
   @IsString()

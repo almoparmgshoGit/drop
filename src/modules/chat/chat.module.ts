@@ -49,6 +49,7 @@ const SCREEN_LABELS: Record<string, string> = {
   Profile: 'حسابي',
   Policy: 'السياسات',
   Chat: 'المحادثة مع الدعم',
+  TripChat: 'المحادثة مع مشرف الرحلة',
 };
 const BROWSING_SCREENS = ['Search', 'SearchResults', 'ReturnSearchResults', 'TripDetails', 'SelectPackage', 'SeatSelection', 'PassengerDetails', 'MapBoardingPoint', 'BookingReview'];
 

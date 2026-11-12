@@ -2,6 +2,7 @@ import { INestApplication } from '@nestjs/common';
 import * as request from 'supertest';
 import { PrismaService } from '../src/common/services/prisma.service';
 import { TripsService } from '../src/modules/trips/trips.service';
+import { BookingCancellationService } from '../src/common/services/booking-cancellation.service';
 import { API, createStaff, createTestApp, loginPassenger, loginStaff, resetDatabase, tripPayload } from './helpers';
 
 const HOUR = 3_600_000;
@@ -21,6 +22,11 @@ describe('Reverse trips (e2e)', () => {
     return { departure, departureTime: new Date(departure).toISOString(), arrivalTime: new Date(departure + 5 * HOUR).toISOString() };
   };
 
+  /**
+   * Most cases here open the way back by hand, at a chosen moment, to see what that moment leaves on sale. So the trip is
+   * published first and its way back switched on afterwards, which skips the automatic opening publishing does; that is
+   * covered with createPublished.
+   */
   const createOutbound = async (direction: 'ONE_WAY' | 'ROUND_TRIP', overrides: Record<string, unknown> = {}) => {
     const { departure, departureTime, arrivalTime } = times();
     const trip = (await request(http()).post(`${API}/trips`).set(admin.auth).send(tripPayload({
@@ -29,13 +35,25 @@ describe('Reverse trips (e2e)', () => {
       arrivalTime,
       estimatedArrivalAt: arrivalTime,
       maxSeatsPerBooking: 6,
-      reverseEnabled: true,
-      reverseOpenPercent: 1,
-      reverseDepartureAt: new Date(departure + 8 * HOUR).toISOString(),
-      reversePrice: 90,
       ...overrides,
     })).expect(201)).body;
-    return { ...trip, departure };
+    const reverse = { reverseEnabled: true, reverseOpenPercent: 1, reverseDepartureAt: new Date(departure + 8 * HOUR), reversePrice: 90 };
+    await prisma.trip.update({ where: { id: trip.id }, data: reverse });
+    return { ...trip, ...reverse, departure };
+  };
+
+  /** A trip published with its way back on, as the office creates one: the way back opens with it. */
+  const createPublished = async (direction: 'ONE_WAY' | 'ROUND_TRIP', overrides: Record<string, unknown> = {}) => {
+    const { departure, departureTime, arrivalTime } = times();
+    return (await request(http()).post(`${API}/trips`).set(admin.auth).send(tripPayload({
+      direction,
+      departureTime,
+      arrivalTime,
+      estimatedArrivalAt: arrivalTime,
+      reverseEnabled: true,
+      reverseDepartureAt: new Date(departure + 8 * HOUR).toISOString(),
+      ...overrides,
+    })).expect(201)).body;
   };
 
   const book = async (tripId: string, seats: string[], customer?: any) => {
@@ -305,11 +323,12 @@ describe('Reverse trips (e2e)', () => {
       })).expect(201)).body;
 
       const all = (await request(http()).get(`${API}/trips/admin/reverse`).set(admin.auth).expect(200)).body;
-      expect(all.find((row: any) => row.id === trip.id)).toMatchObject({ status: 'READY', reachedPercent: false });
+      // Published means both ways are on sale: the way back opened with it, whatever its percent.
+      expect(all.find((row: any) => row.id === trip.id)).toMatchObject({ status: 'OPEN', reachedPercent: false });
       const month = (await request(http()).get(`${API}/trips/admin/reverse?range=month`).set(admin.auth).expect(200)).body;
       expect(month.some((row: any) => row.id === trip.id)).toBe(false);
 
-      const reverse = await openReverse(trip.id);
+      const reverse = await prisma.trip.findFirstOrThrow({ where: { reverseOfTripId: trip.id } });
       expect(reverse.totalSeats).toBe(trip.totalSeats);
       // A seat the outbound sells afterwards is kept for its passenger on the way back.
       await book(trip.id, ['1']);
@@ -388,19 +407,88 @@ describe('Reverse trips (e2e)', () => {
       await openReverse(late.id);
     });
 
-    it('tells those who manage trips once, when a trip reaches its percent', async () => {
-      const trip = await createOutbound('ONE_WAY', { reverseOpenPercent: 5 });
-      const sweep = () => app.get(TripsService).announceReverseReady();
+    it('opens the way back by itself when the way there is published, under the same number', async () => {
+      // A road no earlier case used, so no return on it exists yet.
+      const trip = await createPublished('ONE_WAY', { destination: 'الطائف' });
+      const saved = await prisma.trip.findUniqueOrThrow({ where: { id: trip.id }, include: { reverseTrip: { include: { boardingPoints: true } } } });
+      expect(saved.tripCode).toMatch(/^D\d{3}-\d{2}\/\d{4}$/);
+      expect(saved.reverseTrip).toMatchObject({ tripStatus: 'PUBLISHED', codeNumber: saved.codeNumber, codePeriod: saved.codePeriod });
+      // No price of its own: coming back only costs the ticket's base price.
+      expect(Number(saved.reverseTrip!.price)).toBe(Number(saved.price));
+      expect(saved.reverseTrip!.tripCode).toBe(saved.tripCode.replace(/^D/, 'R'));
+      // With no earlier return on this road, passengers gather at the destination.
+      expect(saved.reverseTrip!.boardingPoints.map((point) => point.name)).toEqual([saved.destination]);
+
+      // The next return on the road reuses that one's gathering points.
+      await prisma.boardingPoint.updateMany({ where: { tripId: saved.reverseTrip!.id }, data: { name: 'فندق العزيزية' } });
+      const next = await createPublished('ONE_WAY', { destination: 'الطائف' });
+      const nextReverse = await prisma.trip.findFirstOrThrow({ where: { reverseOfTripId: next.id }, include: { boardingPoints: true } });
+      expect(nextReverse.boardingPoints.map((point) => point.name)).toEqual(['فندق العزيزية']);
+    });
+
+    it('tells those who manage trips once when the way back cannot open, and opens it once it can', async () => {
+      const trip = await createPublished('ONE_WAY', { tripStatus: 'DRAFT' });
+      // Both sale channels closed: the way back has nowhere to be sold.
+      await edit(trip.id, { channelApp: false, channelBranch: false, tripStatus: 'PUBLISHED' }).expect(200);
+      const sweep = () => app.get(TripsService).openPendingReverses();
       const told = () => prisma.notification.count({ where: { tripId: trip.id, event: 'REVERSE_TRIP_READY', userId: admin.user.id } });
-
-      await book(trip.id, ['1']);
-      await sweep();
-      expect(await told()).toBe(0);
-
-      await book(trip.id, ['2', '3']);
-      await sweep();
       await sweep();
       expect(await told()).toBe(1);
+      expect(await prisma.trip.count({ where: { reverseOfTripId: trip.id } })).toBe(0);
+
+      await edit(trip.id, { channelApp: true }).expect(200);
+      expect(await prisma.trip.count({ where: { reverseOfTripId: trip.id, tripStatus: 'PUBLISHED' } })).toBe(1);
+      expect(await told()).toBe(1);
+    });
+  });
+
+  describe('a DR journey account', () => {
+    it('adds up the way there and the way back in one account, and shows each leg', async () => {
+      const trip = await createOutbound('ONE_WAY');
+      await book(trip.id, ['1', '2']);
+      const reverse = await openReverse(trip.id);
+      await book(reverse.id, ['7']);
+
+      const list = (await request(http()).get(`${API}/trip-accounts?view=trip&q=${encodeURIComponent(reverse.tripCode)}`).set(admin.auth).expect(200)).body;
+      // One row for the journey, found by either leg's code; the way back has no row of its own.
+      expect(list.items.map((item: any) => item.id)).toEqual([trip.id]);
+      const [row] = list.items;
+      expect(row.journeyCode).toBe(reverse.tripCode.replace(/^R/, 'DR'));
+      expect(row.legs.map((leg: any) => leg.id)).toEqual([trip.id, reverse.id]);
+      expect(row.tickets).toBe(2 * 180 + 90);
+      expect(row.passengers).toBe(3);
+
+      // Either leg opens the same journey account; the figures below it stay the leg's own.
+      const detail = (await request(http()).get(`${API}/trip-accounts/${reverse.id}`).set(admin.auth).expect(200)).body;
+      expect(detail.journey.figures.tickets).toBe(450);
+      expect(detail.figures.tickets).toBe(90);
+
+      const profits = (await request(http()).get(`${API}/trip-accounts/current-profits`).set(admin.auth).expect(200)).body;
+      expect(profits[trip.id]).toMatchObject({ isJourney: true, journeyCode: row.journeyCode });
+      expect(profits[reverse.id]).toMatchObject({ partOfTripId: trip.id });
+    });
+  });
+
+  describe('a DR journey carrying more than the bus holds', () => {
+    it('frees the way-back seat of a round-trip passenger who comes back on another date, and takes it back if that leg is cancelled', async () => {
+      const trip = await createOutbound('ROUND_TRIP');
+      const reverse = await openReverse(trip.id);
+      const { departureTime, arrivalTime } = times();
+      const later = (await request(http()).post(`${API}/trips`).set(admin.auth)
+        .send(tripPayload({ origin: 'مكة المكرمة', destination: 'ينبع', departureTime, arrivalTime })).expect(201)).body;
+      const seatOnReverse = () => prisma.seat.findFirstOrThrow({ where: { tripId: reverse.id, seatNumber: '5' } });
+
+      const customer = await loginPassenger(app);
+      const journey = (await request(http()).post(`${API}/bookings`).set(customer.auth)
+        .send({ paymentMethod: 'mada', legs: [{ tripId: trip.id, seats: ['5'] }, { tripId: later.id, seats: ['5'] }], passengers: [{ fullName: 'راكب يعود لاحقًا' }] })
+        .expect(201)).body;
+      // Coming home on the later trip, so seat 5 on this journey's way back can be sold to someone else.
+      expect(await seatOnReverse()).toMatchObject({ isBooked: false });
+
+      const returnLeg = journey.bookings.find((booking: any) => booking.tripId === later.id);
+      await prisma.$transaction((tx) => app.get(BookingCancellationService).cancel(tx, returnLeg.id, { refundAmount: 0 }));
+      // With that leg gone, the passenger rides back on the journey's own way back again.
+      expect(await seatOnReverse()).toMatchObject({ isBooked: true });
     });
   });
 

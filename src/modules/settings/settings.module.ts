@@ -1,10 +1,12 @@
 import { BadRequestException, Body, Controller, ForbiddenException, Get, HttpCode, Injectable, Module, Post, Put, Req } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
-import { Type } from 'class-transformer';
-import { ArrayMaxSize, IsArray, IsBoolean, IsInt, IsNumber, IsObject, IsOptional, IsString, Length, Matches, Max, MaxLength, Min, ValidateNested } from 'class-validator';
+import { randomUUID } from 'crypto';
+import { VehicleKind } from '@prisma/client';
+import { Transform, Type } from 'class-transformer';
+import { ArrayMaxSize, IsArray, IsBoolean, IsEnum, IsInt, IsNumber, IsObject, IsOptional, IsString, Length, Matches, Max, MaxLength, Min, ValidateNested } from 'class-validator';
 import { PrismaService } from '../../common/services/prisma.service';
 import { AppSettingsService, FLAG_SETTINGS, NUMBER_SETTINGS } from '../../common/services/app-settings.service';
-import { BUS_SEAT_COUNT } from '../../common/utils/bus-layout.util';
+import { BUS_SEAT_COUNT, MAX_BUS_SEATS, MIN_SMALL_VEHICLE_SEATS, seatLimitsFor } from '../../common/utils/bus-layout.util';
 import { assertSinglesFitRange, assertValidSinglesRange } from '../../common/utils/singles-seats.util';
 import { openTripsWhere } from '../buses/buses.service';
 import { IntegrationsService } from '../../common/services/integrations.service';
@@ -34,6 +36,17 @@ const APP_TEXT_DEFAULTS: Record<string, string> = {
   announcementTitle: '',
   announcementBody: '',
 };
+
+/**
+ * Google's OAuth client ids for quick sign-in. Not secrets: Google puts them in every sign-in request, and the app needs them
+ * before anyone signs in. The web id is also the audience the server checks each ID token against; empty turns the button off.
+ */
+export const GOOGLE_SIGN_IN_DEFAULTS: Record<string, string> = {
+  googleWebClientId: '',
+  googleIosClientId: '',
+};
+const GOOGLE_CLIENT_ID = /^(\d+-[a-z0-9]+\.apps\.googleusercontent\.com)?$/;
+const GOOGLE_CLIENT_ID_MESSAGE = 'معرّف العميل بالشكل 1234567890-xxxx.apps.googleusercontent.com';
 
 const PANEL_DEFAULTS: Record<string, string> = {
   panelTitle: 'دروب الهجرة',
@@ -188,6 +201,16 @@ class UpdateSettingsDto {
   @IsString()
   @MaxLength(500)
   announcementBody?: string;
+
+  @IsOptional()
+  @Matches(GOOGLE_CLIENT_ID, { message: GOOGLE_CLIENT_ID_MESSAGE })
+  @MaxLength(200)
+  googleWebClientId?: string;
+
+  @IsOptional()
+  @Matches(GOOGLE_CLIENT_ID, { message: GOOGLE_CLIENT_ID_MESSAGE })
+  @MaxLength(200)
+  googleIosClientId?: string;
 
   @IsOptional()
   @IsString()
@@ -360,6 +383,55 @@ class UpdateSettingsDto {
   @IsOptional() @IsInt() @Min(1) @Max(100) advanceMaxInstallmentPercent?: number;
 }
 
+/**
+ * The vehicle types the fleet is made of, e.g. "حافلة 49 راكب" or "فان 13 راكب". Choosing one on the vehicle form fills
+ * its kind and seat count, which stay editable: the type is only a starting point, and a vehicle keeps its own count, so
+ * editing or removing a type here changes no vehicle and no trip. Kept as one JSON setting, read whole and saved whole.
+ */
+const VEHICLE_TYPES_KEY = 'vehicleTypes';
+const MAX_VEHICLE_TYPES = 30;
+
+type VehicleType = { id: string; name: string; kind: VehicleKind; seatCount: number };
+
+/** What the client listed, until the settings page saves its own list. */
+const DEFAULT_VEHICLE_TYPES: VehicleType[] = [
+  { id: 'bus-49', name: 'حافلة 49 راكب', kind: 'BUS', seatCount: 49 },
+  { id: 'bus-50', name: 'حافلة 50 راكب', kind: 'BUS', seatCount: 50 },
+  { id: 'coaster-28', name: 'كوستر 28 راكب', kind: 'MINIBUS', seatCount: 28 },
+  { id: 'van-13', name: 'فان 13 راكب', kind: 'VAN', seatCount: 13 },
+];
+
+const isVehicleType = (row: any): row is VehicleType =>
+  !!row && typeof row.id === 'string' && typeof row.name === 'string' && Object.values(VehicleKind).includes(row.kind) && Number.isInteger(row.seatCount);
+
+class VehicleTypeDto {
+  /** Left out for a new type; kept for an existing one so the forms can tell which type a choice was. */
+  @IsOptional()
+  @Matches(/^[A-Za-z0-9-]{1,40}$/)
+  id?: string;
+
+  @Transform(({ value }) => (typeof value === 'string' ? value.trim() : value))
+  @IsString()
+  @Length(2, 60, { message: 'اسم نوع المركبة بين حرفين و60 حرفًا' })
+  name: string;
+
+  @IsEnum(VehicleKind, { message: 'اختر فئة المركبة: باص أو فان أو باص صغير' })
+  kind: VehicleKind;
+
+  @IsInt({ message: 'عدد المقاعد رقم صحيح' })
+  @Min(MIN_SMALL_VEHICLE_SEATS)
+  @Max(MAX_BUS_SEATS)
+  seatCount: number;
+}
+
+class UpdateVehicleTypesDto {
+  @IsArray()
+  @ArrayMaxSize(MAX_VEHICLE_TYPES, { message: `الحد الأقصى ${MAX_VEHICLE_TYPES} نوعًا` })
+  @ValidateNested({ each: true })
+  @Type(() => VehicleTypeDto)
+  types: VehicleTypeDto[];
+}
+
 class UpdateIntegrationsDto {
   @IsObject()
   values: Record<string, unknown>;
@@ -414,25 +486,27 @@ class SettingsService {
 
   /** Everything the settings page edits, except integration keys, which have their own permission. */
   async getAdmin() {
-    const [general, appText, panel, numbers, flags] = await Promise.all([
+    const [general, appText, google, panel, numbers, flags] = await Promise.all([
       this.getAll(),
       this.textValues(APP_TEXT_DEFAULTS),
+      this.textValues(GOOGLE_SIGN_IN_DEFAULTS),
       this.textValues(PANEL_DEFAULTS),
       this.numberValues(),
       this.flagValues(),
     ]);
-    return { ...general, ...appText, ...panel, ...numbers, ...flags };
+    return { ...general, ...appText, ...google, ...panel, ...numbers, ...flags };
   }
 
   /** What each copy of the app asks for on opening, before anyone signs in. */
   async getAppConfig() {
-    const [appText, contact, flags, map] = await Promise.all([
+    const [appText, contact, google, flags, map] = await Promise.all([
       this.textValues(APP_TEXT_DEFAULTS),
       this.textValues({ supportPhone: '', supportWhatsapp: '' }),
+      this.textValues(GOOGLE_SIGN_IN_DEFAULTS),
       this.flagValues(),
       this.integrations.mapConfig(),
     ]);
-    return { ...appText, ...contact, ...flags, mapTilesUrl: map.tilesUrl, mapAttribution: map.attribution };
+    return { ...appText, ...contact, ...google, ...flags, mapTilesUrl: map.tilesUrl, mapAttribution: map.attribution };
   }
 
   async getPanelConfig() {
@@ -480,6 +554,46 @@ class SettingsService {
         ),
     );
     return this.getAdmin();
+  }
+
+  /** The saved list, or the defaults until one is saved. A row damaged by hand is skipped rather than breaking the forms. */
+  private async storedVehicleTypes(): Promise<VehicleType[]> {
+    const row = await this.prisma.setting.findUnique({ where: { key: VEHICLE_TYPES_KEY } });
+    if (!row) return DEFAULT_VEHICLE_TYPES;
+    try {
+      const parsed = JSON.parse(row.value);
+      return Array.isArray(parsed) ? parsed.filter(isVehicleType) : DEFAULT_VEHICLE_TYPES;
+    } catch {
+      return DEFAULT_VEHICLE_TYPES;
+    }
+  }
+
+  /** The types, plus what the vehicle form needs to fill a new vehicle from one: the limits per kind and the singles settings. */
+  async getVehicleTypes() {
+    const [types, singles] = await Promise.all([this.storedVehicleTypes(), this.appSettings.singlesRange(null)]);
+    return {
+      types,
+      limits: Object.fromEntries(Object.values(VehicleKind).map((kind) => [kind, seatLimitsFor(kind)])),
+      singlesDefaults: singles,
+    };
+  }
+
+  async updateVehicleTypes(dto: UpdateVehicleTypesDto) {
+    const seen = new Set<string>();
+    const types = dto.types.map((type) => {
+      const limits = seatLimitsFor(type.kind);
+      if (type.seatCount < limits.min || type.seatCount > limits.max) {
+        throw new BadRequestException(`«${type.name}»: المقاعد من ${limits.min} إلى ${limits.max} لهذه الفئة`);
+      }
+      const key = type.name.replace(/s+/g, ' ').toLowerCase();
+      if (seen.has(key)) throw new BadRequestException(`نوع المركبة «${type.name}» مكرر`);
+      seen.add(key);
+      return { id: type.id || randomUUID().slice(0, 8), name: type.name, kind: type.kind, seatCount: type.seatCount };
+    });
+    if (new Set(types.map((type) => type.id)).size !== types.length) throw new BadRequestException('يوجد نوعان بنفس المعرّف');
+    const value = JSON.stringify(types);
+    await this.prisma.setting.upsert({ where: { key: VEHICLE_TYPES_KEY }, create: { key: VEHICLE_TYPES_KEY, value }, update: { value } });
+    return this.getVehicleTypes();
   }
 
   async updateIntegrations(actor: { userId: string }, dto: UpdateIntegrationsDto, ip?: string) {
@@ -535,6 +649,23 @@ class SettingsController {
   @ApiOperation({ summary: 'Update system settings; send only the fields being changed' })
   update(@Req() req, @Body() dto: UpdateSettingsDto) {
     return this.settings.update(req.user, dto);
+  }
+
+  @Get('vehicle-types')
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Vehicle types with their kind and seat count, offered when a vehicle is added' })
+  getVehicleTypes(@Req() req) {
+    // Whoever adds a vehicle reads it, not only whoever edits the settings.
+    if (req.user.role === 'PASSENGER') throw new ForbiddenException();
+    return this.settings.getVehicleTypes();
+  }
+
+  @Put('vehicle-types')
+  @RequirePermission('settings.manage')
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Replace the list of vehicle types; vehicles already saved keep their own seats' })
+  updateVehicleTypes(@Body() dto: UpdateVehicleTypesDto) {
+    return this.settings.updateVehicleTypes(dto);
   }
 
   @Get('integrations')

@@ -3,6 +3,7 @@ import { MessageDeliveryStatus, Prisma, WhatsAppTemplateStatus } from '@prisma/c
 import * as crypto from 'crypto';
 import { readWordings } from '../../common/message-languages';
 import {
+  customerWording,
   describeEntry,
   findMissingRequired,
   findWhatsAppProblem,
@@ -61,8 +62,9 @@ export class WhatsAppAdminService {
 
   /** What each action currently says in this language; the panel and the send compare it with the approved copy. */
   private currentBody(event: NotificationEvent, language: MessageLanguage, custom?: { body: string; translations?: Prisma.JsonValue } | null): string | null {
-    if (language === 'ar') return custom?.body ?? NOTIFICATION_CATALOG[event].body;
-    return readWordings(custom?.translations)[language]?.body ?? translationsOf(event)[language]?.body ?? null;
+    // The same customer wording the sender compares approved templates with, so an approval always matches what is sent.
+    const body = language === 'ar' ? (custom?.body ?? NOTIFICATION_CATALOG[event].body) : (readWordings(custom?.translations)[language]?.body ?? translationsOf(event)[language]?.body ?? null);
+    return body === null ? null : customerWording(event, body);
   }
 
   /** Each action's WhatsApp state and its 30-day delivery counts, for the templates page. */

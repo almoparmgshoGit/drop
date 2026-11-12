@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   ConflictException,
+  HttpException,
   Injectable,
   NotFoundException,
   OnModuleDestroy,
@@ -33,6 +34,7 @@ import { assertTripFitsPackage } from '../../common/utils/package-window.util';
 import { PACKAGE_PRICE_SELECT, PackagePrices, packagePriceTiers } from '../../common/utils/package-price.util';
 import { cityTripWhere, servedCity } from '../../common/utils/branch-city.util';
 import { PublicService, SERVICE_SELECT, withHotelServices } from '../../common/utils/services.util';
+import { assignTripCode, journeyCodeOf, reverseCodeOf } from '../../common/utils/trip-code.util';
 
 const DEFAULT_TRIP_DURATION_MS = 8 * 60 * 60 * 1000;
 const COMPLETION_SWEEP_MS = 5 * 60 * 1000;
@@ -227,6 +229,20 @@ export interface CrewActor {
   name?: string | null;
 }
 
+/** A clock time (HH:mm) moved to keep its distance, within half a day either way, from one departure to another. */
+function shiftClock(time: string, from: Date, to: Date) {
+  const match = /^(\d{1,2}):(\d{2})$/.exec(time.trim());
+  if (!match) return time;
+  const minutesOf = (date: Date) => {
+    const [hours, minutes] = formatRiyadhTime(date).split(':').map(Number);
+    return hours * 60 + minutes;
+  };
+  const day = 24 * 60;
+  const offset = ((((Number(match[1]) * 60 + Number(match[2]) - minutesOf(from)) % day) + day + day / 2) % day) - day / 2;
+  const shifted = (((minutesOf(to) + offset) % day) + day) % day;
+  return `${String(Math.floor(shifted / 60)).padStart(2, '0')}:${String(shifted % 60).padStart(2, '0')}`;
+}
+
 @Injectable()
 export class TripsService implements OnModuleInit, OnModuleDestroy {
   private completionTimer: NodeJS.Timeout;
@@ -250,7 +266,8 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
     this.completionTimer.unref();
     this.crewWindowTimer = setInterval(() => {
       this.announceCrewWindows().catch((err) => console.error('Crew window sweep failed:', err.message));
-      this.announceReverseReady().catch((err) => console.error('Reverse trip sweep failed:', err.message));
+      // Tests drive this sweep themselves: on a timer it would open ways back that a test means to open by hand.
+      if (process.env.NODE_ENV !== 'test') this.openPendingReverses().catch((err) => console.error('Reverse trip sweep failed:', err.message));
     }, CREW_WINDOW_SWEEP_MS);
     this.crewWindowTimer.unref();
   }
@@ -298,20 +315,64 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  /** Opening a reverse is a person's decision, so whoever can make it is told, once, when the trip reaches its percent. */
-  async announceReverseReady() {
-    const now = new Date();
+  /**
+   * Publishing a DR journey puts both of its legs on sale: the way back (R) opens by itself as soon as the way there (D) is
+   * published, even long before it leaves. This sweep catches any that could not open at publishing, such as when the bus
+   * or crew was busy at the return time, and tries again once that is sorted out. A return staff cancelled stays cancelled.
+   */
+  async openPendingReverses() {
     const trips = await this.prisma.trip.findMany({
-      where: { reverseEnabled: true, tripStatus: 'PUBLISHED', reverseReadyAnnouncedAt: null, reverseTrip: null, reverseDepartureAt: { gt: now } },
-      select: { id: true, totalSeats: true, availableSeats: true, reverseOpenPercent: true },
+      where: { reverseEnabled: true, tripStatus: 'PUBLISHED', reverseTrip: null, reverseDepartureAt: { gt: new Date() } },
+      select: { id: true },
     });
-    for (const trip of trips) {
-      if (trip.totalSeats === 0 || ((trip.totalSeats - trip.availableSeats) / trip.totalSeats) * 100 < trip.reverseOpenPercent) continue;
+    for (const trip of trips) await this.autoOpenReverse(trip.id);
+  }
+
+  /**
+   * Opens the trip's way back on the gathering points and route of the last return on the same road, so staff do not type
+   * them again; with none yet, passengers gather at the destination at departure time. Staff edit it afterwards like any
+   * trip. When it cannot open, whoever manages trips is told once, and opens it by hand from the return trips screen.
+   */
+  private async autoOpenReverse(id: string) {
+    try {
+      const reverse = await this.openReverseTrip(id, await this.defaultReverseOpening(id));
+      return { id: reverse.id, tripCode: reverse.tripCode, tripStatus: reverse.tripStatus };
+    } catch (err) {
+      if (!(err instanceof HttpException)) console.error(`Could not open the return of trip ${id}:`, err.message);
       await this.prisma.$transaction(async (tx) => {
-        const claimed = await tx.trip.updateMany({ where: { id: trip.id, reverseReadyAnnouncedAt: null }, data: { reverseReadyAnnouncedAt: now } });
-        if (claimed.count === 1) await this.notifications.toStaff(tx, 'REVERSE_TRIP_READY', ['trips.manage'], {}, { tripId: trip.id });
+        // Opened by someone else meanwhile: nothing to tell.
+        if ((await tx.trip.count({ where: { id, reverseTrip: null } })) === 0) return;
+        const claimed = await tx.trip.updateMany({ where: { id, reverseReadyAnnouncedAt: null }, data: { reverseReadyAnnouncedAt: new Date() } });
+        if (claimed.count === 1) await this.notifications.toStaff(tx, 'REVERSE_TRIP_READY', ['trips.manage'], {}, { tripId: id });
       }, TRIP_TX_OPTIONS);
+      return null;
     }
+  }
+
+  private async defaultReverseOpening(id: string): Promise<OpenReverseTripDto> {
+    const trip = await this.prisma.trip.findUniqueOrThrow({
+      where: { id },
+      select: { origin: true, destination: true, reverseDepartureAt: true, channelApp: true, channelBranch: true },
+    });
+    const departure = trip.reverseDepartureAt ?? new Date();
+    const template = await this.prisma.trip.findFirst({
+      where: { reverseOfTripId: { not: null }, origin: trip.destination, destination: trip.origin, tripStatus: { not: 'CANCELLED' }, boardingPoints: { some: {} } },
+      orderBy: { createdAt: 'desc' },
+      select: {
+        departureTime: true,
+        boardingPoints: { orderBy: { time: 'asc' }, select: { name: true, time: true, address: true, lat: true, lng: true } },
+        itineraryStops: { orderBy: { sortOrder: 'asc' }, select: { title: true, time: true, desc: true, kind: true } },
+      },
+    });
+    const channels = { channelApp: trip.channelApp, channelBranch: trip.channelBranch };
+    if (!template) return { ...channels, boardingPoints: [{ name: trip.destination, time: formatRiyadhTime(departure) }] };
+    // The template's times keep their distance from its departure.
+    const clock = (time: string) => shiftClock(time, template.departureTime, departure);
+    return {
+      ...channels,
+      boardingPoints: template.boardingPoints.map((point) => ({ ...point, time: clock(point.time), lat: point.lat ?? undefined, lng: point.lng ?? undefined })),
+      itineraryStops: template.itineraryStops.map((stop) => ({ ...stop, time: clock(stop.time) })),
+    };
   }
 
   /** The crew cannot board anyone before the trip is open to them, and boarding needs a moment to be open at all. */
@@ -439,12 +500,6 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  private async nextTripCode(db: Prisma.TransactionClient) {
-    const trips = await db.trip.findMany({ where: { tripCode: { startsWith: 'R' } }, select: { tripCode: true } });
-    const highest = trips.reduce((top, { tripCode }) => Math.max(top, /^R\d+$/.test(tripCode) ? Number(tripCode.slice(1)) : 0), 0);
-    return `R${String(highest + 1).padStart(3, '0')}`;
-  }
-
   /** Next year's copy: everything except the bus and crew, which are assigned for each year, and the rent that came with the bus. */
   private async draftNextOccurrence(tx: Prisma.TransactionClient, id: string) {
     // Claiming first keeps a second server instance from drafting the same trip again, and a deleted draft from coming back.
@@ -506,7 +561,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
 
     const draft = await tx.trip.create({
       data: {
-        tripCode: await this.nextTripCode(tx),
+        ...(await assignTripCode(tx, departure)),
         title: source.title,
         origin: source.origin,
         destination: source.destination,
@@ -800,8 +855,8 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
     outbound: OutboundTimes,
   ) {
     if (!settings.enabled) return;
-    if (!settings.departureAt || settings.price == null) {
-      throw new BadRequestException('حدد موعد انطلاق الرحلة العكسية وسعر مقعدها');
+    if (!settings.departureAt) {
+      throw new BadRequestException('حدد موعد انطلاق الرحلة العكسية');
     }
     this.assertReverseAfterOutbound(settings.departureAt, outbound);
   }
@@ -912,11 +967,6 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
     const seriesId = schedule.repeatWeekdays.length ? id : null;
 
     const created = await this.prisma.$transaction(async (tx) => {
-      const existing = await tx.trip.findUnique({ where: { tripCode: dto.tripCode } });
-      if (existing) {
-        throw new ConflictException(`Trip code ${dto.tripCode} already exists`);
-      }
-
       const bus = await this.resolveBus(tx, dto.busId);
       const layout = seatLayoutFor(bus);
       const seatNumbers = seatNumbersOf(layout);
@@ -943,7 +993,8 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
         data: {
           id,
           seriesId,
-          tripCode: dto.tripCode,
+          // The number is the system's: the month's next one, whatever the form showed.
+          ...(await assignTripCode(tx, departure)),
           title: dto.title || 'رحلة عمرة',
           origin: dto.origin,
           destination: dto.destination,
@@ -979,7 +1030,8 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
           reverseEnabled: !!dto.reverseEnabled,
           reverseOpenPercent: dto.reverseOpenPercent ?? 80,
           reverseDepartureAt,
-          reversePrice: dto.reversePrice ?? null,
+          // Coming back only costs the ticket's base price unless the office sets another.
+          reversePrice: dto.reverseEnabled ? dto.reversePrice ?? dto.price : dto.reversePrice ?? null,
           channelApp: dto.channelApp ?? true,
           channelBranch: dto.channelBranch ?? true,
           seats: {
@@ -1013,7 +1065,8 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
       return withSeatPrice(trip);
     }, TRIP_TX_OPTIONS);
     if (seriesId) this.extendSeriesLater(seriesId);
-    return { ...created, seriesDrafting: !!seriesId };
+    const reverseTrip = created.tripStatus === 'PUBLISHED' && created.reverseEnabled ? await this.autoOpenReverse(created.id) : null;
+    return { ...created, ...(reverseTrip && { reverseTrip }), seriesDrafting: !!seriesId };
   }
 
   /**
@@ -1239,7 +1292,6 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
       await tx.trip.update({
         where: { id },
         data: {
-          tripCode: dto.tripCode,
           title: dto.title,
           origin: dto.origin,
           destination: dto.destination,
@@ -1357,7 +1409,11 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
       return withSeatPrice(updated);
     }, TRIP_TX_OPTIONS);
     if (startsSeries) this.extendSeriesLater(id);
-    return { ...result, seriesDrafting: startsSeries };
+    // Publishing the way there opens the way back with it; see openPendingReverses.
+    const opensReverse =
+      result.tripStatus === 'PUBLISHED' && result.reverseEnabled && !result.reverseOfTripId && !result.reverseTrip && !!result.reverseDepartureAt && result.reverseDepartureAt > new Date();
+    const reverseTrip = opensReverse ? await this.autoOpenReverse(id) : null;
+    return { ...result, ...(reverseTrip && { reverseTrip }), seriesDrafting: startsSeries };
   }
 
   /**
@@ -1562,6 +1618,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
       return {
         id: trip.id,
         tripCode: trip.tripCode,
+        journeyCode: journeyCodeOf(trip),
         origin: trip.origin,
         destination: trip.destination,
         departureTime: trip.departureTime,
@@ -1578,7 +1635,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
         openPercent: trip.reverseOpenPercent,
         reachedPercent,
         reverseDepartureAt: trip.reverseDepartureAt,
-        reversePrice: trip.reversePrice === null ? null : Number(trip.reversePrice),
+        reversePrice: Number(trip.reversePrice ?? trip.price),
         busPlate: trip.bus?.plateNumber ?? null,
         driverName: trip.drivers[0]?.user.name ?? null,
         // The way there, stop by stop; the way back runs it the other way round, so the form offers it reversed.
@@ -1627,8 +1684,8 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
       // A completed outbound still counts: the bus has arrived and the way back is ahead of it.
       if (!['PUBLISHED', 'COMPLETED'].includes(trip.tripStatus)) throw new ConflictException('يجب أن تكون رحلة الذهاب منشورة');
       if (dto.channelApp === false && dto.channelBranch === false) throw new BadRequestException('اختر قناة حجز واحدة على الأقل');
-      if (!trip.reverseDepartureAt || trip.reversePrice === null) {
-        throw new BadRequestException('حدد موعد انطلاق الرحلة العكسية وسعر مقعدها');
+      if (!trip.reverseDepartureAt) {
+        throw new BadRequestException('حدد موعد انطلاق الرحلة العكسية');
       }
       if (trip.reverseDepartureAt <= new Date()) throw new BadRequestException('موعد الرحلة العكسية قد مضى');
       this.assertReverseAfterOutbound(trip.reverseDepartureAt, trip);
@@ -1661,7 +1718,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
 
       const reverse = await tx.trip.create({
         data: {
-          tripCode: `${trip.tripCode}-R`,
+          ...reverseCodeOf(trip),
           title: 'رحلة عكسية',
           origin: trip.destination,
           destination: trip.origin,
@@ -1669,7 +1726,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
           arrivalTime: arrival,
           hijriDate: toHijriLabel(departure),
           busType: trip.busType,
-          price: trip.reversePrice,
+          price: trip.reversePrice ?? trip.price,
           totalSeats: seatNumbers.length,
           availableSeats: seatNumbers.length,
           // Same vehicle, so the same plan; the seats on sale are the ones the outbound left free.
@@ -1730,7 +1787,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
   private async reopenReverse(
     tx: Prisma.TransactionClient,
     cancelled: { id: string; busId: string | null },
-    outbound: { busId: string | null; seatLayout: Prisma.JsonValue; reversePrice: Prisma.Decimal | null; destination: string; origin: string; drivers: { userId: string; isPrimary: boolean }[]; supervisors: { userId: string; isPrimary: boolean }[] },
+    outbound: { busId: string | null; seatLayout: Prisma.JsonValue; price: Prisma.Decimal; reversePrice: Prisma.Decimal | null; destination: string; origin: string; drivers: { userId: string; isPrimary: boolean }[]; supervisors: { userId: string; isPrimary: boolean }[] },
     opening: { departure: Date; arrival: Date; seatNumbers: string[]; dto: OpenReverseTripDto; route: ReturnType<TripsService['reverseRoute']> },
     actor?: CrewActor,
   ) {
@@ -1763,7 +1820,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
         departureTime: departure,
         arrivalTime: arrival,
         hijriDate: toHijriLabel(departure),
-        price: outbound.reversePrice!,
+        price: outbound.reversePrice ?? outbound.price,
         totalSeats: seatNumbers.length,
         availableSeats: seatNumbers.length,
         seatLayout: storedSeatLayout(tripSeatLayout(outbound)),

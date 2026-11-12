@@ -191,6 +191,7 @@ enum CustomerComplaintCategory {
   APP
   TRIP
   SUPERVISOR
+  BUS
   OTHER
 }
 
@@ -327,6 +328,8 @@ model User {
   id                  String               @id @default(uuid())
   phone               String               @unique
   email               String?              @unique
+  /// The Google account linked for quick sign-in; the subject of Google's ID token.
+  googleId            String?              @unique
   name                String?
   role                Role                 @default(PASSENGER)
   rankId              String?
@@ -367,6 +370,7 @@ model User {
   blockedAt           DateTime?
   blockedReason       String?
   conversation        Conversation?        @relation("CustomerConversation")
+  tripChatThreads     TripChatThread[]     @relation("TripChatCustomer")
   appPresence         AppPresence?
   referralCode        String?              @unique
   referredById        String?
@@ -481,7 +485,12 @@ model RefreshToken {
 
 model Trip {
   id                         String                @id @default(uuid())
+  /// Shown everywhere: D001-11/2026 for a trip, R001-11/2026 for its return. Numbers start again at 001 each month.
   tripCode                   String                @unique
+  /// The month the number belongs to, as 2026-11, taken from the outbound's departure in Riyadh. Null for trips numbered before monthly codes.
+  codePeriod                 String?
+  /// The trip's number within its month. A return carries its outbound's number, which together make DR001.
+  codeNumber                 Int?
   title                      String                @default("رحلة عمرة")
   origin                     String
   destination                String
@@ -574,6 +583,7 @@ model Trip {
   loyaltyRules               LoyaltyRule[]
   stationRules               TripStationRule[]
   stationAlerts              StationAlert[]
+  chatThreads                TripChatThread[]
   createdAt                  DateTime              @default(now())
   updatedAt                  DateTime              @updatedAt
   seats                      Seat[]
@@ -593,6 +603,7 @@ model Trip {
 
   @@index([origin, destination, departureTime])
   @@index([seriesId])
+  @@index([codePeriod, codeNumber])
 }
 
 model TripImage {
@@ -2634,4 +2645,46 @@ model PromoOffer {
 model TripReminderLog {
   key       String   @id
   createdAt DateTime @default(now())
+}
+
+enum TripChatSender {
+  CUSTOMER
+  CREW
+}
+
+/// A customer's thread with the crew of one trip. Its supervisors answer it from the crew app; it closes for writing with the trip.
+model TripChatThread {
+  id                 String            @id @default(uuid())
+  tripId             String
+  trip               Trip              @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  customerId         String
+  customer           User              @relation("TripChatCustomer", fields: [customerId], references: [id], onDelete: Cascade)
+  lastMessageAt      DateTime          @default(now())
+  lastMessagePreview String            @default("")
+  lastSender         TripChatSender?
+  crewUnread         Int               @default(0)
+  customerUnread     Int               @default(0)
+  createdAt          DateTime          @default(now())
+  messages           TripChatMessage[]
+
+  @@unique([tripId, customerId])
+  @@index([tripId, lastMessageAt])
+  @@index([customerId])
+}
+
+model TripChatMessage {
+  id         String         @id @default(uuid())
+  threadId   String
+  thread     TripChatThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+  sender     TripChatSender
+  /// The crew member who wrote it; the name is copied so the history survives them leaving.
+  senderId   String?
+  senderName String?
+  body       String
+  /// Chosen by the sending device, so a retry over a bad signal does not post twice.
+  clientId   String?
+  createdAt  DateTime       @default(now())
+
+  @@unique([threadId, clientId])
+  @@index([threadId, createdAt])
 }

@@ -8,7 +8,7 @@ import { BookingEventsService } from '../../common/services/booking-events.servi
 import { NotificationsService, tripValues } from '../../common/services/notifications.service';
 import { StationAlertsService } from '../../common/services/station-alerts.service';
 import { TicketAlertsService } from '../../common/services/ticket-alerts.service';
-import { crewManualEvents, describeEntry, isNotificationEvent, NOTIFICATION_CATALOG, renderTemplate } from '../../common/notification-catalog';
+import { crewManualEvents, describeEntry, isNotificationEvent, NOTIFICATION_CATALOG, renderNotification } from '../../common/notification-catalog';
 import { bookingHasStay } from '../../common/utils/booking-types.util';
 import { CREW_WINDOW_SELECT, CrewWindowSettings, crewWindow } from '../../common/utils/crew-window.util';
 import { formatRiyadhDate, formatRiyadhTime } from '../../common/utils/time.util';
@@ -324,7 +324,7 @@ export class TicketsService {
       const custom = customs.get(event);
       if (custom && (!custom.crewCanSend || (!custom.isActive && !custom.whatsappEnabled))) return [];
       // The typed value stays a placeholder, so the app can show it as the supervisor types.
-      const body = renderTemplate(custom?.body ?? entry.body, { ...tripValues(trip), newValue: NEW_VALUE_TOKEN });
+      const body = renderNotification(event, custom?.body ?? entry.body, { ...tripValues(trip), newValue: NEW_VALUE_TOKEN });
       return [{ event, label: entry.label, trigger: entry.trigger, body, needsValue: describeEntry(event).requires.includes('newValue'), hasWhatsapp: !!custom?.whatsappEnabled }];
     });
   }
@@ -346,7 +346,7 @@ export class TicketsService {
     await this.assertNoticeAllowance(bookingIds);
     const sender = await this.prisma.user.findUnique({ where: { id: actor.userId }, select: { name: true } });
     const entry = NOTIFICATION_CATALOG[event];
-    const message = renderTemplate(custom?.body ?? entry.body, { ...tripValues(trip), newValue: value });
+    const message = renderNotification(event, custom?.body ?? entry.body, { ...tripValues(trip), newValue: value });
 
     await this.prisma.$transaction(async (tx) => {
       for (const bookingId of bookingIds) {
