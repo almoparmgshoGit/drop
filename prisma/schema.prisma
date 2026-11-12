@@ -613,6 +613,30 @@ model TripImage {
   url    String
 }
 
+/// A bus's photos, each a PublicImage URL as a trip's are. The whole list is replaced on every save, in the order sent.
+model BusImage {
+  id        String   @id @default(uuid())
+  busId     String
+  bus       Bus      @relation(fields: [busId], references: [id], onDelete: Cascade)
+  url       String
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+
+  @@index([busId, sortOrder])
+}
+
+/// A hotel's photos, each a PublicImage URL as a trip's are. The whole list is replaced on every save, in the order sent.
+model HotelImage {
+  id        String   @id @default(uuid())
+  hotelId   String
+  hotel     Hotel    @relation(fields: [hotelId], references: [id], onDelete: Cascade)
+  url       String
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+
+  @@index([hotelId, sortOrder])
+}
+
 /// A photo anyone may open, referenced by URL so a trip's yearly copy can share it.
 model PublicImage {
   id           String   @id @default(uuid())
@@ -870,6 +894,8 @@ model Bus {
   createdAt       DateTime     @default(now())
   trips           Trip[]
   services        BusService[]
+  /// Shown to customers on the trips the bus runs, in sortOrder; the first is the cover, which imageUrl copies.
+  images          BusImage[]
 
   @@index([officeId])
 }
@@ -1250,6 +1276,8 @@ model Hotel {
   roomBlocks            HotelRoomBlock[]
   customerStays         Booking[]
   packages              Package[]
+  /// Shown to customers wherever the hotel is, in sortOrder; the first is the cover.
+  images                HotelImage[]
 }
 
 model HotelBooking {

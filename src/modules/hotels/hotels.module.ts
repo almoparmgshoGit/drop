@@ -132,14 +132,15 @@ class HotelsController {
   }
 
   @Post(':id/complaints/:complaintId/resolve')
-  @RequirePermission('hotels.manage')
+  // The complaints desk closes hotel complaints too, without being able to change hotels.
+  @RequirePermission('hotels.manage', 'complaints.manage')
   @ApiOperation({ summary: 'Close a complaint with what was done about it' })
   resolveComplaint(@Req() req, @Param('id') id: string, @Param('complaintId') complaintId: string, @Body() dto: ResolveHotelComplaintDto) {
     return this.hotels.resolveComplaint(req.user, id, complaintId, dto.resolution);
   }
 
   @Post(':id/complaints/:complaintId/reopen')
-  @RequirePermission('hotels.manage')
+  @RequirePermission('hotels.manage', 'complaints.manage')
   @ApiOperation({ summary: 'Reopen a closed complaint' })
   reopenComplaint(@Param('id') id: string, @Param('complaintId') complaintId: string) {
     return this.hotels.reopenComplaint(id, complaintId);

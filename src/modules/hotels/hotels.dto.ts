@@ -17,6 +17,7 @@ import {
   Min,
 } from 'class-validator';
 import { HotelComplaintSource, HotelRateUnit, HotelRoomBlockType, HousingPriceMode, HousingPricePeriod, PrivateRoomPriceBasis, RoomType } from '@prisma/client';
+import { GalleryImages } from '../../common/utils/gallery.util';
 
 const trimmed = () => Transform(({ value }) => (typeof value === 'string' ? value.trim() : value));
 const DATE_ONLY = /^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$/;
@@ -59,6 +60,10 @@ export class CreateHotelDto {
   @IsString({ each: true })
   @MaxLength(100, { each: true })
   features?: string[];
+
+  /** The hotel's photos in order, the first being the cover. */
+  @GalleryImages()
+  images?: string[];
 
   @IsOptional()
   @IsBoolean()
@@ -184,6 +189,10 @@ export class UpdateHotelDto {
   @IsString({ each: true })
   @MaxLength(100, { each: true })
   features?: string[];
+
+  /** The hotel's photos in order, the first being the cover. Replaces the whole gallery when sent. */
+  @GalleryImages()
+  images?: string[];
 
   @IsOptional()
   @IsBoolean()

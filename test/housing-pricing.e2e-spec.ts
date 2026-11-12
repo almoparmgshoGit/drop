@@ -153,6 +153,101 @@ describe('Housing prices chosen by the admin', () => {
     await request(http()).post(`${API}/bookings/quote`).set(customer.auth).send({ legs: [{ tripId: trip.id, seats: ['1'], roomChoice: 'SHARED' }] }).expect(400);
   });
 
+  describe('booking a housing trip without its housing', () => {
+    const people = (n: number) => Array.from({ length: n }, (_, i) => ({ fullName: `مسافر ${i + 1}` }));
+    // A quote takes no payment method; only the booking itself does.
+    const send = (path: string, body: object) =>
+      request(http()).post(`${API}/bookings${path}`).set(customer.auth).send(path === '/quote' ? body : { paymentMethod: 'mada', ...body });
+
+    it('charges the seats alone when housing is added to the base price, and still shows what each room would cost', async () => {
+      const trip = await createTrip(await createHotel(), ADDED);
+      const body = (await send('/quote', { legs: [{ tripId: trip.id, seats: ['1', '2'], withoutHousing: true }] }).expect(201)).body;
+      expect(body.legs[0].housingAmount).toBe(0);
+      expect(body.subtotal).toBe(400);
+      expect(body.legs[0].housing).toMatchObject({ canSkip: true, withoutHousing: true, choice: null, optionAmounts: { SHARED: 200, PRIVATE: 300 } });
+      expect((await quote(trip, ['1', '2'])).legs[0].housing).toMatchObject({ canSkip: true, withoutHousing: false });
+    });
+
+    it('books it as transport with no room, so the rooming sheet leaves it out', async () => {
+      const trip = await createTrip(await createHotel(), ADDED);
+      const created = await send('', { legs: [{ tripId: trip.id, seats: ['1', '2'], withoutHousing: true }], passengers: people(2) }).expect(201);
+      const booking = await prisma.booking.findUniqueOrThrow({ where: { id: created.body.bookings[0].id } });
+      expect(Number(booking.housingAmount)).toBe(0);
+      expect(Number(booking.totalPrice)).toBe(400);
+      expect(booking.roomChoice).toBeNull();
+      expect(booking.kind).toBe('TRANSPORT_OUTBOUND');
+      expect(booking.leg).toBe('OUTBOUND');
+    });
+
+    it('still asks for a room type or no housing before booking', async () => {
+      const trip = await createTrip(await createHotel(), ADDED);
+      await send('', { legs: [{ tripId: trip.id, seats: ['1'] }], passengers: people(1) }).expect(400);
+      await send('/quote', { legs: [{ tripId: trip.id, seats: ['1'], roomChoice: 'SHARED', withoutHousing: true }] }).expect(400);
+    });
+
+    it('leaves out only the trip whose hotel the customer skipped on a round trip', async () => {
+      const outbound = await createTrip(await createHotel(), ADDED);
+      const inbound = await createTrip(await createHotel(), { ...ADDED, origin: 'مكة المكرمة', destination: 'ينبع' });
+      const legs = [
+        { tripId: outbound.id, seats: ['1'], roomChoice: 'SHARED' },
+        { tripId: inbound.id, seats: ['1'], withoutHousing: true },
+      ];
+      const priced = (await send('/quote', { legs }).expect(201)).body;
+      expect(priced.legs.map((leg: any) => leg.housingAmount)).toEqual([100, 0]);
+      const created = await send('', { legs, passengers: people(1) }).expect(201);
+      const rows = await prisma.booking.findMany({ where: { groupReference: created.body.groupReference }, orderBy: { tripId: 'asc' } });
+      const byTrip = Object.fromEntries(rows.map((row) => [row.tripId, row]));
+      expect(byTrip[outbound.id]).toMatchObject({ kind: null, roomChoice: 'SHARED' });
+      expect(byTrip[inbound.id]).toMatchObject({ kind: 'TRANSPORT_RETURN', roomChoice: null });
+      expect(Number(byTrip[inbound.id].housingAmount)).toBe(0);
+    });
+
+    it('does not offer it where the price includes the stay or a package sells it whole', async () => {
+      const included = await createTrip(await createHotel(), { housingPriceMode: 'INCLUDED_IN_BASE', housingPrice: 40, privateRoomPrice: 150, privateRoomPriceBasis: 'PER_PERSON' });
+      expect((await quote(included, ['1'])).legs[0].housing.canSkip).toBe(false);
+      await send('/quote', { legs: [{ tripId: included.id, seats: ['1'], withoutHousing: true }] }).expect(400);
+
+      const pkg = await prisma.package.create({ data: { name: 'باقة كاملة', price: 900, price2: 1800, price3: 2700, price4: 3600, status: 'PUBLISHED' } });
+      const packaged = await createTrip(await createHotel(), { ...ADDED, packageId: pkg.id });
+      expect((await quote(packaged, ['1'])).legs[0].housing.canSkip).toBe(false);
+      await send('/quote', { legs: [{ tripId: packaged.id, seats: ['1'], withoutHousing: true }] }).expect(400);
+    });
+
+    it('books a package the customer builds without its stay as plain transport', async () => {
+      const hotel = await createHotel();
+      const pkg = await prisma.package.create({
+        data: { name: 'صمم باقتك', kind: 'CUSTOM', status: 'PUBLISHED', price: 0, price2: 0, price3: 0, price4: 0, origin: 'ينبع', destination: 'مكة المكرمة', hotelId: hotel.id, nightlyBedPrice: 50, nightlyRoomPrice: 200, minDepartureHour: 0 },
+      });
+      const outbound = await createTrip(hotel, { bookingType: 'TRANSPORT_ONLY', accommodation: undefined, price: 100 });
+      const back = new Date(Date.parse(outbound.departureTime) + 2 * 24 * 60 * 60 * 1000);
+      const inbound = await createTrip(hotel, {
+        bookingType: 'TRANSPORT_ONLY',
+        accommodation: undefined,
+        price: 80,
+        origin: 'مكة المكرمة',
+        destination: 'ينبع',
+        departureTime: back.toISOString(),
+        arrivalTime: new Date(back.getTime() + 5 * 60 * 60 * 1000).toISOString(),
+      });
+      const legs = (stay: object) => [{ tripId: outbound.id, seats: ['1', '2'], ...stay }, { tripId: inbound.id, seats: ['1', '2'] }];
+
+      const withStay = (await send('/quote', { customPackageId: pkg.id, legs: legs({ roomChoice: 'SHARED' }) }).expect(201)).body;
+      expect(withStay.legs[0].housingAmount).toBe(200);
+      const without = (await send('/quote', { customPackageId: pkg.id, legs: legs({ withoutHousing: true }) }).expect(201)).body;
+      expect(without.legs[0].housingAmount).toBe(0);
+      expect(without.subtotal).toBe(360);
+      expect(without.legs[0].housing).toMatchObject({ canSkip: true, withoutHousing: true, choice: null, optionAmounts: { SHARED: 200, PRIVATE: 400 } });
+
+      const created = await send('', { customPackageId: pkg.id, legs: legs({ withoutHousing: true }), passengers: people(2) }).expect(201);
+      const rows = await prisma.booking.findMany({ where: { groupReference: created.body.groupReference } });
+      expect(rows).toHaveLength(2);
+      for (const row of rows) {
+        expect(row).toMatchObject({ kind: 'TRANSPORT_ROUND', customPackageId: null, stayHotelId: null, roomChoice: null });
+        expect(Number(row.housingAmount)).toBe(0);
+      }
+    });
+  });
+
   it('shows customers the prices and a starting price, but never the raw settings', async () => {
     const trip = await createTrip(await createHotel(), { ...ADDED, housingPricePeriod: 'PER_NIGHT' });
     const { body } = await request(http()).get(`${API}/trips/${trip.id}`).set(customer.auth).expect(200);

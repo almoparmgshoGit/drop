@@ -164,7 +164,7 @@ describe('Trip scheduling and editing (e2e)', () => {
       expect(draft.drivers).toHaveLength(0);
       expect(draft.supervisors).toHaveLength(0);
 
-      expect(await prisma.notification.count({ where: { event: 'STAFF_FIXED_TRIP_DRAFTED', body: { contains: 'R101' } } })).toBeGreaterThan(0);
+      expect(await prisma.notification.count({ where: { event: 'STAFF_FIXED_TRIP_DRAFTED', body: { contains: draft.tripCode } } })).toBeGreaterThan(0);
       // A draft is invisible to customers until it is published.
       await request(http()).get(`${API}/trips/${draft.id}`).expect(404);
     });

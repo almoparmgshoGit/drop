@@ -21,6 +21,7 @@ import {
 } from 'class-validator';
 import { BusStatus, VehicleKind } from '@prisma/client';
 import { toEnglishDigits } from '../../common/utils/phone.util';
+import { GalleryImages } from '../../common/utils/gallery.util';
 
 const trimmed = () => Transform(({ value }) => (typeof value === 'string' ? value.trim() : value));
 const DATE_ONLY = /^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$/;
@@ -46,6 +47,11 @@ export class CreateBusDto {
   @MaxLength(40)
   color?: string;
 
+  /** The bus's photos in order, the first being the cover. Replaces the whole gallery when sent. */
+  @GalleryImages()
+  images?: string[];
+
+  /** From admin panels made before galleries, which had one photo: used only when images is not sent. */
   @IsOptional()
   @IsString()
   @MaxLength(500)

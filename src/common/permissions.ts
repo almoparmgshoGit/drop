@@ -48,8 +48,8 @@ export const PERMISSION_GROUPS = [
   {
     title: 'شكاوى العملاء',
     items: [
-      { key: 'complaints.view', label: 'عرض الشكاوى التي يرسلها العملاء من التطبيق' },
-      { key: 'complaints.manage', label: 'الرد على شكاوى العملاء وإغلاقها وإعادة فتحها' },
+      { key: 'complaints.view', label: 'عرض شكاوى العملاء من التطبيق وشكاوى الفنادق' },
+      { key: 'complaints.manage', label: 'الرد على شكاوى العملاء والفنادق وإغلاقها وإعادة فتحها' },
     ],
   },
   {

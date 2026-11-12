@@ -58,6 +58,9 @@ describe('Room type at booking time (e2e)', () => {
       options: ['SHARED', 'PRIVATE'],
       optionAmounts: { SHARED: 0, PRIVATE: 0 },
       choice: null,
+      // The stay is part of this trip's price, so it cannot be left out.
+      canSkip: false,
+      withoutHousing: false,
     });
 
     const publicTrip = await request(http()).get(`${API}/trips/${trip.id}`).expect(200);

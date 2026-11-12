@@ -130,7 +130,8 @@ describe('Singles seats set on the bus (e2e)', () => {
       reversePrice: 90,
     });
     await bookReq(await loginPassenger(app), trip.id, '30').expect(201);
-    const reverse = (await request(http()).post(`${API}/trips/${trip.id}/open-reverse`).set(admin.auth).send({ boardingPointName: 'مكة' }).expect(201)).body;
+    // Publishing the trip opened its way back.
+    const reverse = await prisma.trip.findFirstOrThrow({ where: { reverseOfTripId: trip.id } });
     await bookReq(await loginPassenger(app), reverse.id, '48').expect(201);
 
     await assign(trip.id, (await createBus(25, 44)).id).expect(409);

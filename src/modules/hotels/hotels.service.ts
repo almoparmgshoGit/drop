@@ -10,10 +10,12 @@ import { HOUSING_BOOKING_TYPES, includesHousing } from '../../common/utils/booki
 import { CREW_WINDOW_SELECT, crewWindow } from '../../common/utils/crew-window.util';
 import { hotelBookingCost } from '../../common/utils/payment.util';
 import { SERVICE_SELECT, withHotelServices } from '../../common/utils/services.util';
+import { GALLERY_SELECT, galleryRows } from '../../common/utils/gallery.util';
 import { suggestServiceIcon } from '../../common/service-icons';
 import { AssignBookingRoomDto, AssignRoomDto, CrewAssignRoomDto, CreateHotelBookingDto, UpdateHotelBookingDto, CreateHotelComplaintDto, CreateHotelDto, CreateRoomBlockDto, CreateTravelerComplaintDto, UpdateHotelDto } from './hotels.dto';
 
-const HOTEL_SERVICES = { services: SERVICE_SELECT } as const;
+/** What the hotel shows customers, its services and photos, which every staff view of a hotel carries for its edit form. */
+const HOTEL_PROFILE = { services: SERVICE_SELECT, images: GALLERY_SELECT } as const;
 
 const TX_OPTIONS = { maxWait: 10_000, timeout: 30_000 };
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -79,7 +81,7 @@ export class HotelsService {
   ) {}
 
   async listHotels(actor: HotelActor) {
-    const hotels = (await this.prisma.hotel.findMany({ orderBy: [{ isActive: 'desc' }, { name: 'asc' }], include: HOTEL_SERVICES })).map(withHotelServices);
+    const hotels = (await this.prisma.hotel.findMany({ orderBy: [{ isActive: 'desc' }, { name: 'asc' }], include: HOTEL_PROFILE })).map(withHotelServices);
     // The contract rate is a purchase price, so only ranks allowed to see costs get it.
     return actor.permissions.includes('hotels.rates') ? hotels : hotels.map(({ nightlyRate, ...hotel }) => hotel);
   }
@@ -96,7 +98,7 @@ export class HotelsService {
         },
         roomBlocks: { where: { fromDate: { lte: today }, OR: [{ untilDate: null }, { untilDate: { gt: today } }] }, select: { id: true } },
         _count: { select: { complaints: { where: { status: 'OPEN' } } } },
-        ...HOTEL_SERVICES,
+        ...HOTEL_PROFILE,
       },
     });
     const canSeeRates = actor.permissions.includes('hotels.rates');
@@ -149,7 +151,7 @@ export class HotelsService {
           include: { hotelBooking: { select: { number: true, trip: { select: { tripCode: true } } } } },
         },
         roomBlocks: { orderBy: { fromDate: 'desc' } },
-        ...HOTEL_SERVICES,
+        ...HOTEL_PROFILE,
       },
     });
     if (!hotel) throw new NotFoundException('الفندق غير موجود');
@@ -437,12 +439,17 @@ export class HotelsService {
 
   async createHotel(dto: CreateHotelDto) {
     this.assertOffersRoomType(dto.offersSharedRoom ?? true, dto.offersPrivateRoom ?? true);
-    const { serviceIds: _ids, features: _names, ...fields } = dto;
+    const { serviceIds: _ids, features: _names, images, ...fields } = dto;
     return this.prisma.$transaction(async (tx) => {
       const serviceIds = await this.resolveHotelServices(tx, dto);
       const hotel = await tx.hotel.create({
-        data: { ...fields, nightlyRate: dto.nightlyRate ?? 0, ...(serviceIds?.length && { services: { create: serviceIds.map((serviceId) => ({ serviceId })) } }) },
-        include: HOTEL_SERVICES,
+        data: {
+          ...fields,
+          nightlyRate: dto.nightlyRate ?? 0,
+          ...(serviceIds?.length && { services: { create: serviceIds.map((serviceId) => ({ serviceId })) } }),
+          ...(images?.length && { images: { create: galleryRows(images) } }),
+        },
+        include: HOTEL_PROFILE,
       });
       return withHotelServices(hotel);
     });
@@ -452,14 +459,18 @@ export class HotelsService {
     const hotel = await this.prisma.hotel.findUnique({ where: { id }, select: { offersSharedRoom: true, offersPrivateRoom: true } });
     if (!hotel) throw new NotFoundException('الفندق غير موجود');
     this.assertOffersRoomType(dto.offersSharedRoom ?? hotel.offersSharedRoom, dto.offersPrivateRoom ?? hotel.offersPrivateRoom);
-    const { serviceIds: _ids, features: _names, ...fields } = dto;
+    const { serviceIds: _ids, features: _names, images, ...fields } = dto;
     return this.prisma.$transaction(async (tx) => {
       const serviceIds = await this.resolveHotelServices(tx, dto);
       if (serviceIds) await tx.hotelService.deleteMany({ where: { hotelId: id } });
+      if (images) {
+        await tx.hotelImage.deleteMany({ where: { hotelId: id } });
+        await tx.hotelImage.createMany({ data: galleryRows(images).map((row) => ({ ...row, hotelId: id })) });
+      }
       const hotel = await tx.hotel.update({
         where: { id },
         data: { ...fields, ...(serviceIds?.length && { services: { create: serviceIds.map((serviceId) => ({ serviceId })) } }) },
-        include: HOTEL_SERVICES,
+        include: HOTEL_PROFILE,
       });
       return withHotelServices(hotel);
     });

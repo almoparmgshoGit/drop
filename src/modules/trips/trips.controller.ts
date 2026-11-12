@@ -98,10 +98,10 @@ export class TripsController {
   }
 
   @Post('images')
-  @RequirePermission('trips.manage', 'buses.manage', 'offers.manage')
+  @RequirePermission('trips.manage', 'buses.manage', 'hotels.manage', 'offers.manage')
   @UseInterceptors(FilesInterceptor('images', MAX_PUBLIC_IMAGES_PER_UPLOAD, { limits: { fileSize: MAX_PUBLIC_IMAGE_BYTES } }))
   @ApiBearerAuth()
-  @ApiOperation({ summary: 'Store photos for trips and buses; the returned URLs go on the trip or bus' })
+  @ApiOperation({ summary: 'Store photos for trips, buses and hotels; the returned URLs go on the trip, bus or hotel' })
   async uploadImages(@Req() req, @UploadedFiles() files?: UploadedImage[]) {
     return this.tripsService.saveImages(req.user.userId, files);
   }
@@ -111,7 +111,7 @@ export class TripsController {
   // Helmet's default would stop the admin panel, on its own origin, from showing these.
   @Header('Cross-Origin-Resource-Policy', 'cross-origin')
   @Header('Cache-Control', 'public, max-age=31536000, immutable')
-  @ApiOperation({ summary: 'Open a photo of a trip or bus' })
+  @ApiOperation({ summary: 'Open a photo of a trip, bus or hotel' })
   async getImage(@Param('id') id: string) {
     const image = await this.tripsService.getImage(id);
     return new StreamableFile(Buffer.from(image.data), { type: image.mimeType, length: image.size });

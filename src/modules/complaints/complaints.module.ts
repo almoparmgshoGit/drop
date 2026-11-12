@@ -32,9 +32,12 @@ class ComplaintsController {
     return this.complaints.list(query);
   }
 
-  /** Replies and reopening stay on the hotel's own endpoints (hotels.manage), which also tell the traveler. */
+  /**
+   * Whoever handles complaints sees the hotels' ones too, as do hotel staff. Replies and reopening stay on the hotel's own
+   * endpoints, open to either, which also tell the traveler.
+   */
   @Get('hotels')
-  @RequirePermission('hotels.view')
+  @RequirePermission('complaints.view', 'hotels.view')
   @ApiOperation({ summary: 'Every hotel\'s complaints in one list, open ones first' })
   hotels(@Query() query: ListHotelComplaintsQuery) {
     return this.complaints.listHotelComplaints(query);

@@ -81,11 +81,9 @@ describe('Fixed bus plan (e2e)', () => {
       direction: 'ROUND_TRIP',
       departureTime: new Date(departure).toISOString(),
       arrivalTime: new Date(departure + 5 * 3_600_000).toISOString(),
-      reverseEnabled: true,
-      reverseOpenPercent: 1,
-      reverseDepartureAt: new Date(departure + 8 * 3_600_000).toISOString(),
-      reversePrice: 90,
     });
+    // Switched on after publishing, so the way back is opened by hand below, after the outbound sold these seats.
+    await prisma.trip.update({ where: { id: trip.id }, data: { reverseEnabled: true, reverseOpenPercent: 1, reverseDepartureAt: new Date(departure + 8 * 3_600_000), reversePrice: 90 } });
     const user = await loginPassenger(app);
     const seats = Array.from({ length: 5 }, (_, idx) => String(idx + 26));
     await request(http()).post(`${API}/bookings`).set(user.auth)

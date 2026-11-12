@@ -43,6 +43,14 @@ export class BookingLegDto {
   @IsOptional()
   @IsEnum(RoomType)
   roomChoice?: RoomType;
+
+  /**
+   * The customer leaves this trip's hotel out and books its seat alone. Only where the housing is charged on top of the
+   * seat price; a package, or a trip whose price already includes the stay, has no price without it.
+   */
+  @IsOptional()
+  @IsBoolean()
+  withoutHousing?: boolean;
 }
 
 export class PassengerDto {

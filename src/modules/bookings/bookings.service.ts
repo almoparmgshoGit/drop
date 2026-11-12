@@ -18,6 +18,7 @@ import { earnedPoints, LoyaltyService, transportShare } from '../../common/servi
 import { NotificationsService } from '../../common/services/notifications.service';
 import { PaymentLedgerService } from '../../common/services/payment-ledger.service';
 import { includesHousing } from '../../common/utils/booking-types.util';
+import { GALLERY_SELECT } from '../../common/utils/gallery.util';
 import { housingCharge, HousingTerms, isRoomSellable } from '../../common/utils/housing-price.util';
 import { applicableRule, daysUntil, parseCancellationRules } from '../../common/utils/cancellation-policy.util';
 import { paymentFigures } from '../../common/utils/payment.util';
@@ -79,7 +80,7 @@ const BOOKING_INCLUDE = {
               checkIn: true,
               checkOut: true,
               mealPlan: true,
-              hotel: { select: { name: true, city: true, address: true, phone: true, description: true } },
+              hotel: { select: { name: true, city: true, address: true, phone: true, description: true, images: GALLERY_SELECT } },
             },
           },
         },
@@ -88,7 +89,7 @@ const BOOKING_INCLUDE = {
   },
   // The package the customer built and the hotel chosen for its stay.
   customPackage: { select: { id: true, name: true } },
-  stayHotel: { select: { name: true, city: true, address: true } },
+  stayHotel: { select: { name: true, city: true, address: true, images: GALLERY_SELECT } },
   // Field by field: the collector's follow-up note and the gateway reference stay with staff.
   payment: { select: { id: true, bookingId: true, amount: true, currency: true, status: true, method: true, walletAmount: true, createdAt: true } },
   // Enough for the customer to follow a refund; references and failure reasons stay with staff.
@@ -326,17 +327,30 @@ export class BookingsService {
       this.assertBookable(trip);
       return { leg, trip, seats: normalizeSeats(leg.seats) };
     });
-    const customStay = customPackage
-      ? customPackageStay(customPackage, { trip: seated[0].trip, seats: seated[0].seats.length }, { trip: seated[1].trip, seats: seated[1].seats.length }, dto.legs[0].roomChoice)
+    // Leaving out the stay of a package the customer builds leaves its two trips, priced as plain transport like any other.
+    const skipsCustomStay = !!customPackage && !!dto.legs[0].withoutHousing;
+    if (skipsCustomStay && dto.legs[0].roomChoice) throw new BadRequestException('اختر نوع الغرفة أو بدون سكن، لا الاثنين');
+    const builtStay = customPackage
+      ? customPackageStay(customPackage, { trip: seated[0].trip, seats: seated[0].seats.length }, { trip: seated[1].trip, seats: seated[1].seats.length }, skipsCustomStay ? undefined : dto.legs[0].roomChoice)
       : null;
+    // What the customer can still pick from is shown either way; only a stay they keep is charged and saved.
+    const customStayLeg = builtStay && {
+      amount: skipsCustomStay ? 0 : builtStay.amount,
+      details: { ...builtStay.details, ...(skipsCustomStay && { choice: null }), canSkip: true, withoutHousing: skipsCustomStay },
+    };
+    const customStay = skipsCustomStay ? null : builtStay;
 
     const legs = seated.map(({ leg, trip, seats }, index) => {
       // A package charges its total for the group's size; an ordinary trip charges each seat.
       const seatsSubtotal = trip.package ? packageGroupTotal(trip.package, seats.length) : toHalalas(trip.price) * seats.length;
       const unitPrice = seats.length ? Math.round(seatsSubtotal / seats.length) : toHalalas(trip.price);
       // A package's price takes its stay with it, so only an ordinary trip can be booked as transport alone.
-      if (dto.transportOnly && trip.package) throw new BadRequestException('الباقة تُحجز كاملة، ولا يمكن حجز النقل منها وحده');
-      const stay = customStay ? (index === 0 ? { amount: customStay.amount, details: customStay.details } : null) : dto.transportOnly ? null : this.priceStay(trip, leg, seats.length);
+      if ((dto.transportOnly || leg.withoutHousing) && trip.package) throw new BadRequestException('الباقة تُحجز كاملة، ولا يمكن حجز النقل منها وحده');
+      // Its seat price already pays for the stay, so selling it as transport would charge for a room the customer never gets.
+      if (dto.transportOnly && includesHousing(trip.bookingType) && trip.housingPriceMode === 'INCLUDED_IN_BASE') {
+        throw new BadRequestException('السكن مشمول في سعر هذه الرحلة، ولا يمكن حجزها بدون سكن');
+      }
+      const stay = customStayLeg ? (index === 0 ? customStayLeg : null) : dto.transportOnly ? null : this.priceStay(trip, leg, seats.length);
       const housingAmount = stay?.amount ?? 0;
       return { leg, trip, seats, unitPrice, stay, seatsSubtotal, housingAmount, subtotal: seatsSubtotal + housingAmount };
     });
@@ -404,6 +418,7 @@ export class BookingsService {
       coupon,
       housing,
       customStay,
+      skipsCustomStay,
       walletUsed,
       payable,
       pricedLegs,
@@ -458,27 +473,43 @@ export class BookingsService {
       accommodations: { nights: number | null }[];
       hotelBookings: { hotel: { name: string; city: string; address: string | null; description: string | null; services: { service: PublicService }[]; offersSharedRoom: boolean; offersPrivateRoom: boolean } }[];
     },
-    leg: { roomChoice?: RoomType },
+    leg: { roomChoice?: RoomType; withoutHousing?: boolean },
     seats: number,
   ) {
     if (!includesHousing(trip.bookingType)) return null;
     const hotel = trip.hotelBookings[0]?.hotel;
     // A package's price is all-inclusive, so its trips charge nothing more for housing.
     const charges = !trip.package;
+    // The seat alone has a price only when housing is charged on top of it; a price that includes the stay has no part to take off.
+    const canSkip = charges && trip.housingPriceMode === 'ADDED_TO_BASE';
+    const skips = !!leg.withoutHousing;
+    if (skips && !canSkip) throw new BadRequestException('السكن مشمول في سعر هذه الرحلة، ولا يمكن حجزها بدون سكن');
+    if (skips && leg.roomChoice) throw new BadRequestException('اختر نوع الغرفة أو بدون سكن، لا الاثنين');
     if (!hotel) {
+      // Transport alone owes nothing for a hotel, so it needs none.
+      if (skips) return null;
       // Selling without a hotel here would leave out a price the customer owes.
-      if (charges && trip.housingPriceMode === 'ADDED_TO_BASE') throw new BadRequestException('لم يُحدد فندق هذه الرحلة بعد');
+      if (canSkip) throw new BadRequestException('لم يُحدد فندق هذه الرحلة بعد');
       return null;
     }
     const nights = trip.accommodations[0]?.nights ?? 1;
     const options = roomOptionsOf(hotel).filter((room) => !charges || isRoomSellable(trip, room));
     if (leg.roomChoice && !options.includes(leg.roomChoice)) throw new BadRequestException('نوع الغرفة المختار غير متاح في هذا الفندق');
-    const choice = leg.roomChoice ?? (options.length === 1 ? options[0] : null);
+    // With no housing left out, a hotel with one room type picks it; leaving the stay out picks none.
+    const choice = skips ? null : leg.roomChoice ?? (options.length === 1 ? options[0] : null);
     const chargeFor = (room: RoomType) => (charges ? housingCharge(trip, room, seats, nights) : 0);
     const { offersSharedRoom, offersPrivateRoom, ...place } = withHotelServices(hotel);
     return {
       amount: choice ? chargeFor(choice) : 0,
-      details: { ...place, options, choice, optionAmounts: Object.fromEntries(options.map((room) => [room, toSar(chargeFor(room))])) },
+      details: {
+        ...place,
+        options,
+        choice,
+        optionAmounts: Object.fromEntries(options.map((room) => [room, toSar(chargeFor(room))])),
+        // Whether the app may offer the stay as optional, and whether the customer left it out.
+        canSkip,
+        withoutHousing: skips,
+      },
     };
   }
 
@@ -553,7 +584,21 @@ export class BookingsService {
           // Taken before the quote checks the trip, so a booking waiting on a trip being cancelled sees the cancellation instead of confirming onto it.
           await lockTripsWithLinked(tx, dto.legs.map((leg) => leg.tripId));
           const quote = await this.computeQuote(tx, userId, dto);
-          if (quote.housing.some((stay) => stay && !stay.choice)) throw new BadRequestException('اختر نوع الغرفة');
+          if (quote.housing.some((stay) => stay && !stay.choice && !stay.withoutHousing)) throw new BadRequestException('اختر نوع الغرفة أو بدون سكن');
+          // Which rows are sold as transport alone: all of them when the customer asked for transport or left a built package's stay
+          // out, otherwise each trip whose hotel they left out. The kind tells the rooming sheet and the crew there is no stay.
+          const asTransport = quote.pricedLegs.map(
+            (leg) => quote.skipsCustomStay || (!quote.customStay && (!!dto.transportOnly || !!leg.leg.withoutHousing)),
+          );
+          const allTransport = asTransport.every(Boolean);
+          const transportKind = (legIndex: number) =>
+            allTransport
+              ? quote.pricedLegs.length > 1
+                ? ('TRANSPORT_ROUND' as const)
+                : ('TRANSPORT_OUTBOUND' as const)
+              : legIndex === 0
+                ? ('TRANSPORT_OUTBOUND' as const)
+                : ('TRANSPORT_RETURN' as const);
 
           // Until the gateway ships, anything left to pay can only go through in explicit simulated mode.
           const simulated = this.config.get('PAYMENT_MODE') === 'simulated';
@@ -607,8 +652,8 @@ export class BookingsService {
                   }),
                 }),
                 // Named as transport, so the rooming sheet and the crew know this booking has no stay even on a trip with a hotel.
-                ...(dto.transportOnly && !quote.customStay && {
-                  kind: quote.pricedLegs.length > 1 ? ('TRANSPORT_ROUND' as const) : ('TRANSPORT_OUTBOUND' as const),
+                ...(asTransport[legIndex] && {
+                  kind: transportKind(legIndex),
                   leg: legIndex === 0 ? ('OUTBOUND' as const) : ('RETURN' as const),
                 }),
                 housingAmount: toSar(leg.housingAmount),

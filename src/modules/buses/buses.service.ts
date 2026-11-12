@@ -7,11 +7,13 @@ import { BUS_SEAT_COUNT, seatLayoutFor, seatLimitsFor } from '../../common/utils
 import { assertSinglesFitRange, assertValidSinglesRange, singlesRangeFor } from '../../common/utils/singles-seats.util';
 import { applySeatLayout } from '../../common/utils/trip-seats.util';
 import { PublicService, SERVICE_SELECT } from '../../common/utils/services.util';
+import { GALLERY_SELECT, galleryRows } from '../../common/utils/gallery.util';
 
 interface BusInput {
   plateNumber?: string;
   model?: string;
   color?: string;
+  images?: string[];
   imageUrl?: string;
   company?: string;
   serviceIds?: string[];
@@ -44,6 +46,17 @@ function vehicleCapacity(kind: VehicleKind, seatCount: number | undefined) {
 const OFFICE_SELECT = { select: { id: true, name: true } };
 const SERVICES_SELECT = SERVICE_SELECT;
 
+/**
+ * The gallery a save asks for, or undefined to leave it alone. An admin panel from before galleries sends its one photo
+ * as imageUrl, which then stands for the whole gallery, as it did then.
+ */
+const galleryOf = (dto: BusInput) => {
+  if (dto.images) return dto.images;
+  if (dto.imageUrl === undefined) return undefined;
+  const url = dto.imageUrl.trim();
+  return url ? [url] : [];
+};
+
 const withServices = <T extends { services: { service: PublicService }[] }>(bus: T) => ({
   ...bus,
   services: bus.services.map((row) => row.service),
@@ -70,6 +83,7 @@ export class BusesService {
       include: {
         office: OFFICE_SELECT,
         services: SERVICES_SELECT,
+        images: GALLERY_SELECT,
         trips: { where: openTripsWhere(), select: { tripCode: true, departureTime: true, tripStatus: true } },
         _count: { select: { trips: true } },
       },
@@ -84,6 +98,7 @@ export class BusesService {
       include: {
         office: OFFICE_SELECT,
         services: SERVICES_SELECT,
+        images: GALLERY_SELECT,
         trips: { select: { id: true, tripCode: true, departureTime: true, tripStatus: true } },
       },
     });
@@ -113,6 +128,7 @@ export class BusesService {
     const singles = { from: dto.singlesFromSeat ?? defaults.from, to: dto.singlesToSeat ?? defaults.to };
     assertValidSinglesRange(singles, seatCount);
     const serviceIds = await this.knownServices(dto.serviceIds);
+    const gallery = galleryOf(dto) ?? [];
     const bus = await this.prisma.bus.create({
       data: {
         kind,
@@ -122,13 +138,15 @@ export class BusesService {
         plateNumber: dto.plateNumber,
         model: dto.model,
         color: dto.color || 'أبيض',
-        imageUrl: dto.imageUrl,
+        // The cover is kept on the bus too, for copies of the app that read only it.
+        imageUrl: gallery[0] ?? null,
         company: dto.officeId ? await this.companyOf(dto.officeId) : dto.company || 'دروب الهجرة للنقل',
         officeId: dto.officeId || null,
         status: dto.status ?? 'ACTIVE',
         services: serviceIds?.length ? { create: serviceIds.map((serviceId) => ({ serviceId })) } : undefined,
+        images: gallery.length ? { create: galleryRows(gallery) } : undefined,
       },
-      include: { services: SERVICES_SELECT },
+      include: { services: SERVICES_SELECT, images: GALLERY_SELECT },
     });
     return withServices(bus);
   }
@@ -163,7 +181,12 @@ export class BusesService {
         ? await this.companyOf(officeId)
         : dto.company || 'دروب الهجرة للنقل';
     const serviceIds = await this.knownServices(dto.serviceIds);
+    const gallery = galleryOf(dto);
     return this.prisma.$transaction(async (tx) => {
+      if (gallery) {
+        await tx.busImage.deleteMany({ where: { busId: id } });
+        await tx.busImage.createMany({ data: galleryRows(gallery).map((row) => ({ ...row, busId: id })) });
+      }
       if (serviceIds) {
         await tx.busService.deleteMany({ where: { busId: id } });
         await tx.busService.createMany({ data: serviceIds.map((serviceId) => ({ busId: id, serviceId })) });
@@ -185,14 +208,14 @@ export class BusesService {
           plateNumber: dto.plateNumber,
           model: dto.model,
           color: dto.color,
-          imageUrl: dto.imageUrl,
+          imageUrl: gallery ? gallery[0] ?? null : undefined,
           company,
           officeId,
           status: dto.status,
           singlesFromSeat: singles.from,
           singlesToSeat: singles.to,
         },
-        include: { services: SERVICES_SELECT },
+        include: { services: SERVICES_SELECT, images: GALLERY_SELECT },
       });
       return withServices(updated);
     }, { maxWait: 10_000, timeout: 30_000 });

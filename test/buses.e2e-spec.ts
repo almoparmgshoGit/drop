@@ -1,4 +1,5 @@
 import { INestApplication } from '@nestjs/common';
+import { randomUUID } from 'crypto';
 import * as request from 'supertest';
 import { PrismaService } from '../src/common/services/prisma.service';
 import { API, createStaff, createTestApp, loginPassenger, loginStaff, nextPhone, resetDatabase, STAFF_PASSWORD, tripPayload, validIqama } from './helpers';
@@ -475,6 +476,75 @@ describe('Buses, drivers and office statements (e2e)', () => {
       const res = await request(http()).get(`${API}/manifests/${trip.id}`).set(admin.auth).expect(200);
       expect(res.body.trip.driver.iqamaNumber).toBe(driver.iqamaNumber);
       expect(res.body.trip.crew[0]).toMatchObject({ name: driver.name, label: 'السائق الأول' });
+    });
+  });
+
+  describe('photos', () => {
+    const photo = () => `/trips/images/${randomUUID()}`;
+    const urlsOf = (bus: any) => bus.images.map((image: any) => image.url);
+    const put = (bus: any, body: object, session = admin) => request(http()).put(`${API}/buses/${bus.id}`).set(session.auth).send(body);
+
+    it('keeps the gallery in the order sent, with the first as the cover', async () => {
+      const gallery = [photo(), photo(), photo()];
+      const bus = await createBus(null, { images: gallery });
+      expect(urlsOf(bus)).toEqual(gallery);
+      expect(bus.imageUrl).toBe(gallery[0]);
+
+      const one = await request(http()).get(`${API}/buses/${bus.id}`).set(admin.auth).expect(200);
+      expect(urlsOf(one.body)).toEqual(gallery);
+      const all = await request(http()).get(`${API}/buses`).set(staff.auth).expect(200);
+      expect(urlsOf(all.body.find((b: any) => b.id === bus.id))).toEqual(gallery);
+    });
+
+    it('reorders, removes, and leaves the gallery alone when it is not sent', async () => {
+      const [a, b, c] = [photo(), photo(), photo()];
+      const bus = await createBus(null, { images: [a, b, c] });
+      let saved = (await put(bus, { images: [c, a] }).expect(200)).body;
+      expect(urlsOf(saved)).toEqual([c, a]);
+      expect(saved.imageUrl).toBe(c);
+
+      saved = (await put(bus, { color: 'فضي' }).expect(200)).body;
+      expect(urlsOf(saved)).toEqual([c, a]);
+      expect(saved.imageUrl).toBe(c);
+
+      saved = (await put(bus, { images: [] }).expect(200)).body;
+      expect(saved.images).toEqual([]);
+      expect(saved.imageUrl).toBeNull();
+    });
+
+    it('takes a single imageUrl from an older admin panel as the whole gallery', async () => {
+      const [a, b] = [photo(), photo()];
+      const bus = await createBus(null, { imageUrl: a });
+      expect(urlsOf(bus)).toEqual([a]);
+      expect(urlsOf((await put(bus, { imageUrl: b }).expect(200)).body)).toEqual([b]);
+      // A newer panel sends both, and the gallery wins.
+      expect(urlsOf((await put(bus, { imageUrl: b, images: [a] }).expect(200)).body)).toEqual([a]);
+    });
+
+    it('refuses too many photos, repeats, foreign strings, and ranks that cannot manage buses', async () => {
+      const bus = await createBus(null, { images: [photo()] });
+      await put(bus, { images: Array.from({ length: 11 }, photo) }).expect(400);
+      const same = photo();
+      await put(bus, { images: [same, same] }).expect(400);
+      await put(bus, { images: ['data:image/png;base64,AAAA'] }).expect(400);
+      await put(bus, { images: [42] }).expect(400);
+      await put(bus, { images: [photo()] }, staff).expect(403);
+      await request(http()).post(`${API}/buses`).set(admin.auth).send({ plateNumber: `ا ب ${++counter}`, model: 'فيزيرو', images: Array.from({ length: 11 }, photo) }).expect(400);
+      expect(await prisma.busImage.count({ where: { busId: bus.id } })).toBe(1);
+    });
+
+    it('shows customers the bus photos on its trips, without ids or order fields', async () => {
+      const gallery = [photo(), photo()];
+      const trip = await createTrip(await createBus(null, { images: gallery }));
+      const seen = (await request(http()).get(`${API}/trips/${trip.id}`).expect(200)).body;
+      expect(seen.bus.images).toEqual(gallery.map((url) => ({ url })));
+      expect(seen.bus.imageUrl).toBe(gallery[0]);
+    });
+
+    it('goes with the bus when the bus is deleted', async () => {
+      const bus = await createBus(null, { images: [photo(), photo()] });
+      await request(http()).delete(`${API}/buses/${bus.id}`).set(admin.auth).expect(200);
+      expect(await prisma.busImage.count({ where: { busId: bus.id } })).toBe(0);
     });
   });
 });

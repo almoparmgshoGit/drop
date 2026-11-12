@@ -2,6 +2,7 @@ import { BadRequestException, NotFoundException } from '@nestjs/common';
 import { Prisma, RoomType } from '@prisma/client';
 import { riyadhDate } from './time.util';
 import { SERVICE_SELECT, withHotelServices } from './services.util';
+import { GALLERY_SELECT } from './gallery.util';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const RIYADH_OFFSET_MS = 3 * 60 * 60 * 1000;
@@ -36,6 +37,7 @@ export const CUSTOM_PACKAGE_SELECT = {
       offersSharedRoom: true,
       offersPrivateRoom: true,
       services: SERVICE_SELECT,
+      images: GALLERY_SELECT,
     },
   },
 } satisfies Prisma.PackageSelect;

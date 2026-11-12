@@ -29,6 +29,7 @@ import { applyBusServices, busServiceRows } from '../../common/utils/bus-service
 import { WEEKLY_HORIZON_DAYS, nextWeeklyDate, nextYearlyDate } from '../../common/utils/recurrence.util';
 import { AppSettingsService } from '../../common/services/app-settings.service';
 import { imageTypeOf } from '../../common/utils/image-type.util';
+import { GALLERY_SELECT } from '../../common/utils/gallery.util';
 import { CreateTripDto, OpenReverseTripDto, UpdateTripDto } from './trips.dto';
 import { assertTripFitsPackage } from '../../common/utils/package-window.util';
 import { PACKAGE_PRICE_SELECT, PackagePrices, packagePriceTiers } from '../../common/utils/package-price.util';
@@ -57,7 +58,8 @@ export const PUBLIC_TRIP_INCLUDE = {
   boardingPoints: true,
   itineraryStops: { orderBy: { sortOrder: 'asc' } },
   images: true,
-  bus: { select: { model: true, color: true, imageUrl: true, company: true, services: SERVICE_SELECT } },
+  // imageUrl is the gallery's cover, kept for copies of the app from before bus galleries.
+  bus: { select: { model: true, color: true, imageUrl: true, images: GALLERY_SELECT, company: true, services: SERVICE_SELECT } },
   package: { select: { id: true, name: true, description: true, ...PACKAGE_PRICE_SELECT, nights: true, type: true, terms: true } },
   services: { include: { service: true } },
   visits: { orderBy: { sortOrder: 'asc' } },
@@ -67,7 +69,7 @@ export const PUBLIC_TRIP_INCLUDE = {
     where: { status: 'CONFIRMED' },
     orderBy: { number: 'asc' },
     take: 1,
-    select: { hotel: { select: { name: true, city: true, address: true, description: true, services: SERVICE_SELECT } } },
+    select: { hotel: { select: { name: true, city: true, address: true, description: true, services: SERVICE_SELECT, images: GALLERY_SELECT } } },
   },
   supervisors: { select: { isPrimary: true, user: { select: { name: true } } } },
 } satisfies Prisma.TripInclude;
@@ -200,11 +202,13 @@ const reachesDestinationAt = (trip: OutboundTimes) =>
 const sameMembers = (a: string[], b: string[]) => a.length === b.length && a.every((id) => b.includes(id));
 
 /**
- * Transport alone is sold on every trip whose stay can be left out: plain transport, and trips with a hotel that are not part of a package.
- * Any other type matches itself.
+ * Transport alone is sold on every trip whose stay can be left out: plain transport, and trips with a hotel that are not part of a
+ * package and price the stay on top of the seat. A seat that already includes the stay has no price without it. Any other type matches itself.
  */
 export const bookingTypeWhere = (bookingType: string): Prisma.TripWhereInput =>
-  bookingType === 'TRANSPORT_ONLY' ? { OR: [{ bookingType: 'TRANSPORT_ONLY' }, { bookingType: 'WITH_HOTEL', packageId: null }] } : { bookingType };
+  bookingType === 'TRANSPORT_ONLY'
+    ? { OR: [{ bookingType: 'TRANSPORT_ONLY' }, { bookingType: 'WITH_HOTEL', packageId: null, housingPriceMode: { not: 'INCLUDED_IN_BASE' } }] }
+    : { bookingType };
 
 /** A package's trips go on sale with it: while the package is a draft or archived, its trips stay out of the app. */
 const ON_SALE_PACKAGE: Prisma.TripWhereInput = { OR: [{ packageId: null }, { package: { status: 'PUBLISHED' } }] };

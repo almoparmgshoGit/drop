@@ -1,4 +1,5 @@
 import { INestApplication } from '@nestjs/common';
+import { randomUUID } from 'crypto';
 import * as request from 'supertest';
 import { PrismaService } from '../src/common/services/prisma.service';
 import { API, createStaff, createTestApp, loginPassenger, loginStaff, resetDatabase, tripPayload } from './helpers';
@@ -516,6 +517,84 @@ describe('Hotels and rooming (e2e)', () => {
       expect(tickets.body[0].signedToken).toBeUndefined();
       const asOwner = await request(http()).get(`${API}/bookings/${booking.id}`).set(user.auth).expect(200);
       expect(asOwner.body.passengers[0].ticket.signedToken).toBeTruthy();
+    });
+  });
+
+  describe('photos', () => {
+    const photo = () => `/trips/images/${randomUUID()}`;
+    const urlsOf = (hotel: any) => hotel.images.map((image: any) => image.url);
+    const patch = (hotel: any, body: object, session = admin) => request(http()).patch(`${API}/hotels/${hotel.id}`).set(session.auth).send(body);
+
+    it('keeps the gallery in the order sent, everywhere staff see the hotel', async () => {
+      const gallery = [photo(), photo(), photo()];
+      const created = (await request(http()).post(`${API}/hotels`).set(admin.auth).send({ name: `فندق ${++hotelCounter}`, city: 'مكة', images: gallery }).expect(201)).body;
+      expect(urlsOf(created)).toEqual(gallery);
+
+      const list = await request(http()).get(`${API}/hotels`).set(staff.auth).expect(200);
+      expect(urlsOf(list.body.find((h: any) => h.id === created.id))).toEqual(gallery);
+      const registry = await request(http()).get(`${API}/hotels/registry`).set(staff.auth).expect(200);
+      expect(urlsOf(registry.body.find((h: any) => h.id === created.id))).toEqual(gallery);
+      const detail = await request(http()).get(`${API}/hotels/${created.id}`).set(staff.auth).expect(200);
+      expect(urlsOf(detail.body.hotel)).toEqual(gallery);
+    });
+
+    it('reorders, removes and leaves the gallery alone when it is not sent', async () => {
+      const [a, b, c] = [photo(), photo(), photo()];
+      const hotel = await createHotel();
+      expect(urlsOf((await patch(hotel, { images: [a, b, c] }).expect(200)).body)).toEqual([a, b, c]);
+      expect(urlsOf((await patch(hotel, { images: [c, a] }).expect(200)).body)).toEqual([c, a]);
+      expect(urlsOf((await patch(hotel, { description: 'قريب من الحرم' }).expect(200)).body)).toEqual([c, a]);
+      expect(urlsOf((await patch(hotel, { images: [] }).expect(200)).body)).toEqual([]);
+      expect(await prisma.hotelImage.count({ where: { hotelId: hotel.id } })).toBe(0);
+    });
+
+    it('refuses too many photos, repeats, and anything but an uploaded photo or a web address', async () => {
+      const hotel = await createHotel();
+      await patch(hotel, { images: Array.from({ length: 11 }, photo) }).expect(400);
+      const same = photo();
+      await patch(hotel, { images: [same, same] }).expect(400);
+      await patch(hotel, { images: ['javascript:alert(1)'] }).expect(400);
+      await patch(hotel, { images: ['/trips/images/../../etc/passwd'] }).expect(400);
+      await patch(hotel, { images: [photo()] }, staff).expect(403);
+      expect(await prisma.hotelImage.count({ where: { hotelId: hotel.id } })).toBe(0);
+    });
+
+    it('lets hotel managers upload photos, and keeps everyone else out', async () => {
+      const PNG = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(32)]);
+      // A rank that manages hotels and nothing else that uploads photos.
+      const rank = await prisma.rank.create({ data: { name: `فنادق فقط ${Date.now()}`, role: 'STAFF', jobId: 'job-office', permissions: ['hotels.view', 'hotels.manage'] } });
+      const manager = await loginStaff(app, (await createStaff(prisma, 'STAFF', undefined, rank.id)).phone);
+      const upload = await request(http()).post(`${API}/trips/images`).set(manager.auth).attach('images', PNG, 'hotel.png').expect(201);
+      const hotel = await createHotel();
+      expect(urlsOf((await patch(hotel, { images: [upload.body[0].url] }, manager).expect(200)).body)).toEqual([upload.body[0].url]);
+      await request(http()).post(`${API}/trips/images`).set(staff.auth).attach('images', PNG, 'hotel.png').expect(403);
+      // Signed in first: logging in halfway through building this request would close the server it was opened on.
+      const passenger = await loginPassenger(app);
+      await request(http()).post(`${API}/trips/images`).set(passenger.auth).attach('images', PNG, 'hotel.png').expect(403);
+    });
+
+    it('shows customers the photos of the trip\'s hotel and of a custom package\'s hotel, and nothing else of them', async () => {
+      const gallery = [photo(), photo()];
+      const hotel = (await request(http()).post(`${API}/hotels`).set(admin.auth).send({ name: `فندق ${++hotelCounter}`, city: 'مكة', nightlyRate: 75, images: gallery }).expect(201)).body;
+      const trip = await hotelTrip();
+      await bookHotel(trip, hotel);
+
+      const seen = (await request(http()).get(`${API}/trips/${trip.id}`).expect(200)).body;
+      expect(seen.hotelBookings[0].hotel.images).toEqual(gallery.map((url) => ({ url })));
+      expect(JSON.stringify(seen.hotelBookings[0].hotel.images)).not.toContain('sortOrder');
+
+      await prisma.package.create({
+        data: { name: 'صمم باقتك', kind: 'CUSTOM', status: 'PUBLISHED', price: 0, price2: 0, price3: 0, price4: 0, origin: 'ينبع', destination: 'مكة المكرمة', hotelId: hotel.id, nightlyBedPrice: 50, minDepartureHour: 0 },
+      });
+      const custom = (await request(http()).get(`${API}/packages/custom`).expect(200)).body;
+      expect(custom.find((pkg: any) => pkg.hotel?.name === hotel.name).hotel.images).toEqual(gallery.map((url) => ({ url })));
+    });
+
+    it('goes with the hotel when the hotel is deleted', async () => {
+      const hotel = await createHotel();
+      await patch(hotel, { images: [photo()] }).expect(200);
+      await prisma.hotel.delete({ where: { id: hotel.id } });
+      expect(await prisma.hotelImage.count({ where: { hotelId: hotel.id } })).toBe(0);
     });
   });
 });
