@@ -182,7 +182,7 @@ export class ComplaintsService {
       // Conditional on the status, so two employees answering together cannot overwrite each other's reply.
       const { count } = await tx.customerComplaint.updateMany({
         where: { id: complaintId, status: 'OPEN' },
-        data: { status: 'RESOLVED', resolution, resolvedAt: new Date(), resolvedByName: author?.name ?? null },
+        data: { status: 'RESOLVED', resolution, resolvedAt: new Date(), resolvedById: actorId, resolvedByName: author?.name ?? null },
       });
       if (count === 0) throw new ConflictException('الشكوى غير موجودة أو مغلقة مسبقًا');
       const complaint = await tx.customerComplaint.findUniqueOrThrow({ where: { id: complaintId }, select: { number: true, category: true, userId: true } });
@@ -200,7 +200,7 @@ export class ComplaintsService {
   async reopen(complaintId: string) {
     const { count } = await this.prisma.customerComplaint.updateMany({
       where: { id: complaintId, status: 'RESOLVED' },
-      data: { status: 'OPEN', resolution: null, resolvedAt: null, resolvedByName: null },
+      data: { status: 'OPEN', resolution: null, resolvedAt: null, resolvedById: null, resolvedByName: null },
     });
     if (count === 0) throw new ConflictException('الشكوى غير موجودة أو مفتوحة بالفعل');
     return { success: true };

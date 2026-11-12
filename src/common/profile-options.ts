@@ -68,3 +68,32 @@ export const NATIVE_LANGUAGES = [
 export const NATIVE_LANGUAGE_KEYS = NATIVE_LANGUAGES.map((language) => language.key);
 
 export const GENDERS = ['MALE', 'FEMALE'] as const;
+
+/**
+ * The cities a customer can say they live in, picked when the app first opens.
+ * Kept in Arabic and matched exactly, the same names as SAUDI_CITIES in the app (durob-app/src/utils/cities.js).
+ */
+export const CUSTOMER_CITIES = [
+  'الرياض',
+  'مكة المكرمة',
+  'المدينة المنورة',
+  'جدة',
+  'الدمام',
+  'ينبع',
+  'الطائف',
+  'تبوك',
+  'أبها',
+  'بريدة',
+  'حائل',
+  'جازان',
+  'نجران',
+  'الهفوف',
+  'الجبيل',
+  'الخبر',
+  'خميس مشيط',
+  'عنيزة',
+  'الخرج',
+  'عرعر',
+  'سكاكا',
+  'الباحة',
+];

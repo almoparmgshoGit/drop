@@ -21,6 +21,11 @@ export class PaymentsQuery {
   @IsIn(['mada', 'card', 'wallet_balance', 'cash', 'network', 'transfer'])
   method?: string;
 
+  /** Where the booking was made: the customer's app or a branch counter. */
+  @IsOptional()
+  @IsIn(['APP', 'BRANCH'])
+  source?: 'APP' | 'BRANCH';
+
   @IsOptional()
   @trimmed()
   @IsString()

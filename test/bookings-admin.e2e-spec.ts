@@ -388,7 +388,7 @@ describe('Booking administration (e2e)', () => {
       await request(http()).put(`${API}/trips/${trip.id}`).set(admin.auth).send({ direction: 'ROUND_TRIP' }).expect(409);
     });
 
-    it('opens the reverse trip once, only at the threshold, on the free seats', async () => {
+    it('opens the reverse trip once, on the free seats', async () => {
       const departure = Date.now() + 5 * 24 * 60 * 60 * 1000;
       const trip = await createTrip({
         direction: 'ROUND_TRIP',
@@ -401,7 +401,6 @@ describe('Booking administration (e2e)', () => {
       });
       const open = (body = { boardingPointName: 'فندق العزيزية', channelApp: true }) =>
         request(http()).post(`${API}/trips/${trip.id}/open-reverse`).set(admin.auth).send(body);
-      await open().expect(409);
 
       const user = await loginPassenger(app);
       const seats = ['1', '2', '3', '4', '5'];

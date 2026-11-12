@@ -1,7 +1,7 @@
 import { Controller, Get, Post, Put, Delete, Param, Query, Body } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiBearerAuth, PartialType } from '@nestjs/swagger';
-import { IsArray, IsDateString, IsEnum, IsInt, IsNumber, IsOptional, IsString, Length, Max, MaxLength, Min } from 'class-validator';
-import { PackageStatus } from '@prisma/client';
+import { IsArray, IsDateString, IsEnum, IsInt, IsNumber, IsOptional, IsString, Length, Max, MaxLength, Min, ValidateIf } from 'class-validator';
+import { PackageKind, PackageStatus } from '@prisma/client';
 import { PackagesService } from './packages.service';
 import { Public, RequirePermission } from '../../common/decorators/auth.decorators';
 
@@ -15,10 +15,53 @@ export class CreatePackageDto {
   @MaxLength(2000)
   description?: string;
 
+  /** FIXED: the company's package sold on its trips. CUSTOM: the customer picks the trips and pays the nights. */
+  @IsOptional()
+  @IsEnum(PackageKind)
+  kind?: PackageKind;
+
+  /** A custom package has no group totals: it is priced from its trips and its nights. */
+  @ValidateIf((dto) => dto.kind !== 'CUSTOM')
   @IsNumber({ maxDecimalPlaces: 2 })
   @Min(1, { message: 'سعر الباقة يجب أن يكون أكبر من صفر' })
   @Max(1000000)
   price: number;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(100)
+  origin?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(100)
+  destination?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(60)
+  hotelId?: string;
+
+  /** A bed in a shared room, per person per night. */
+  @IsOptional()
+  @IsNumber({ maxDecimalPlaces: 2 })
+  @Min(0)
+  @Max(100000)
+  nightlyBedPrice?: number | null;
+
+  /** A private room per night. */
+  @IsOptional()
+  @IsNumber({ maxDecimalPlaces: 2 })
+  @Min(0)
+  @Max(100000)
+  nightlyRoomPrice?: number | null;
+
+  /** The earliest hour, Riyadh time, an outbound may leave at. */
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  @Max(23)
+  minDepartureHour?: number;
 
   /** The total for two people together. Left out, it is the one-person price twice. */
   @IsOptional()
@@ -104,6 +147,13 @@ export class PackagesController {
   @ApiOperation({ summary: 'Published packages that have a bookable trip matching the search, with only those trips' })
   async getPublishedPackages(@Query() query: PackageSearchQuery) {
     return this.packagesService.getPublishedPackages(query);
+  }
+
+  @Public()
+  @Get('custom')
+  @ApiOperation({ summary: 'Published packages the customer builds, on the searched route' })
+  async getCustomPackages(@Query() query: PackageSearchQuery) {
+    return this.packagesService.getCustomPackages(query);
   }
 
   @Public()

@@ -5,10 +5,11 @@ import { Gender, IdType } from '@prisma/client';
 import { Type } from 'class-transformer';
 import { ArrayUnique, IsArray, IsBoolean, IsEmail, IsIn, IsInt, IsString, IsNotEmpty, IsNumber, IsOptional, Length, Matches, Max, MaxLength, Min, ValidateIf } from 'class-validator';
 import { MAX_PHOTO_BYTES, UploadedPhoto, UsersService } from './users.service';
+import { StaffAchievementsService } from './staff-achievements.service';
 import { RequirePermission } from '../../common/decorators/auth.decorators';
 import { MESSAGE_LANGUAGES } from '../../common/notification-catalog';
 import { ALL_PERMISSIONS } from '../../common/permissions';
-import { GENDERS, NATIONALITIES, NATIVE_LANGUAGE_KEYS, NATIVE_LANGUAGES } from '../../common/profile-options';
+import { CUSTOMER_CITIES, GENDERS, NATIONALITIES, NATIVE_LANGUAGE_KEYS, NATIVE_LANGUAGES } from '../../common/profile-options';
 import { ID_TYPES, ID_TYPE_LABELS } from '../../common/utils/identity.util';
 
 /** Shown in place, never downloaded; only ever an image, since the bytes were checked on upload. */
@@ -21,6 +22,10 @@ class ProfileDetailsDto {
   @IsString()
   @MaxLength(60)
   nationality?: string | null;
+
+  @ValidateIf((dto) => dto.city !== null && dto.city !== undefined)
+  @IsIn(CUSTOMER_CITIES, { message: 'اختر المدينة من القائمة' })
+  city?: string | null;
 
   @ValidateIf((dto) => dto.nativeLanguage !== null && dto.nativeLanguage !== undefined)
   @IsIn(NATIVE_LANGUAGE_KEYS, { message: 'اختر اللغة الأم من القائمة' })
@@ -187,6 +192,11 @@ class UpdateUserAdminDto extends ProfileDetailsDto {
   birthDate?: string | null;
 }
 
+class UpdateCityDto {
+  @IsIn(CUSTOMER_CITIES, { message: 'اختر المدينة من القائمة' })
+  city: string;
+}
+
 class UpdateMessagingDto {
   @IsOptional()
   @IsIn(MESSAGE_LANGUAGES)
@@ -195,6 +205,25 @@ class UpdateMessagingDto {
   @IsOptional()
   @IsBoolean()
   acceptsOffers?: boolean;
+
+  /** Reminders before the miqat and the gathering point; null minutes follow the trip's settings. */
+  @IsOptional()
+  @IsBoolean()
+  tripAlertsEnabled?: boolean;
+
+  @ValidateIf((dto) => dto.alertLeadMinutes !== null)
+  @IsOptional()
+  @IsInt()
+  @Min(5)
+  @Max(1440)
+  alertLeadMinutes?: number | null;
+
+  @ValidateIf((dto) => dto.alertRepeatMinutes !== null)
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  @Max(720)
+  alertRepeatMinutes?: number | null;
 }
 
 class PromoteUserDto {
@@ -328,6 +357,34 @@ class ListWalletsQuery {
   limit?: number;
 }
 
+class AchievementsQuery {
+  @IsOptional()
+  @Matches(/^\d{4}-\d{2}-\d{2}$/, { message: 'صيغة التاريخ غير صحيحة' })
+  from?: string;
+
+  @IsOptional()
+  @Matches(/^\d{4}-\d{2}-\d{2}$/, { message: 'صيغة التاريخ غير صحيحة' })
+  to?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(100)
+  search?: string;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  skip?: number;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(200)
+  limit?: number;
+}
+
 class ListUsersQuery {
   @IsOptional()
   @IsString()
@@ -336,6 +393,12 @@ class ListUsersQuery {
   @IsOptional()
   @IsIn(['active', 'blocked'])
   status?: string;
+
+  /** A saved city, or "none" for customers who have not chosen one. */
+  @IsOptional()
+  @IsString()
+  @MaxLength(60)
+  city?: string;
 
   /** A saved nationality, or "none" for customers who have not given one. */
   @IsOptional()
@@ -377,7 +440,10 @@ class ListUsersQuery {
 @Controller('users')
 @ApiBearerAuth()
 export class UsersController {
-  constructor(private usersService: UsersService) {}
+  constructor(
+    private usersService: UsersService,
+    private achievements: StaffAchievementsService,
+  ) {}
 
   @Get('profile')
   @ApiOperation({ summary: 'Get current user profile' })
@@ -414,7 +480,13 @@ export class UsersController {
   @Get('profile/options')
   @ApiOperation({ summary: 'The nationalities and native languages a profile can choose from' })
   getProfileOptions() {
-    return { nationalities: NATIONALITIES, nativeLanguages: NATIVE_LANGUAGES, idTypes: ID_TYPES.map((key) => ({ key, label: ID_TYPE_LABELS[key] })) };
+    return { nationalities: NATIONALITIES, cities: CUSTOMER_CITIES, nativeLanguages: NATIVE_LANGUAGES, idTypes: ID_TYPES.map((key) => ({ key, label: ID_TYPE_LABELS[key] })) };
+  }
+
+  @Put('profile/city')
+  @ApiOperation({ summary: 'The city the customer lives in, chosen when the app first opens' })
+  async updateCity(@Req() req, @Body() dto: UpdateCityDto) {
+    return this.usersService.updateCity(req.user.userId, dto.city);
   }
 
   @Put('profile/messaging')
@@ -472,6 +544,20 @@ export class UsersController {
   @ApiOperation({ summary: 'List employees with their ranks' })
   async getEmployees(@Query() query: ListUsersQuery) {
     return this.usersService.getEmployees(query.search, query.page, query.limit, query.jobId, query.branchId);
+  }
+
+  @Get('employees/achievements')
+  @RequirePermission('employees.view')
+  @ApiOperation({ summary: 'Each employee with the orders, packages, cancellations and problems they handled in a period' })
+  async getAchievements(@Query() query: AchievementsQuery) {
+    return this.achievements.leaderboard(query, query.search?.trim() || undefined);
+  }
+
+  @Get('employees/:id/achievements')
+  @RequirePermission('employees.view')
+  @ApiOperation({ summary: "One employee's figures and the record of what they did, newest first" })
+  async getEmployeeAchievements(@Param('id') id: string, @Query() query: AchievementsQuery) {
+    return this.achievements.forEmployee(id, query);
   }
 
   @Get('crew')

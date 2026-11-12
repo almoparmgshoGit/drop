@@ -8,6 +8,7 @@ import {
   IsBoolean,
   IsDateString,
   IsEnum,
+  IsIn,
   IsInt,
   IsNumber,
   IsOptional,
@@ -31,6 +32,10 @@ class ReferralSettingsDto {
   @IsOptional() @IsBoolean() enabled?: boolean;
   @IsOptional() @IsInt() @Min(0) @Max(100000) referrerPoints?: number;
   @IsOptional() @IsInt() @Min(0) @Max(100000) refereePoints?: number;
+  @IsOptional() @IsIn(['COUPON', 'POINTS']) rewardType?: 'COUPON' | 'POINTS';
+  @IsOptional() @IsNumber({ maxDecimalPlaces: 2 }) @Min(0) @Max(100000) referrerCouponValue?: number;
+  @IsOptional() @IsNumber({ maxDecimalPlaces: 2 }) @Min(0) @Max(100000) refereeCouponValue?: number;
+  @IsOptional() @IsInt() @Min(1) @Max(365) couponValidDays?: number;
   @IsOptional() @IsInt() @Min(1) @Max(1000) maxPerUser?: number;
 }
 

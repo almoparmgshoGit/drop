@@ -11,6 +11,11 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const RIYADH_OFFSET_MS = 3 * 60 * 60 * 1000;
 const TIER_WINDOW_DAYS = 365;
 const TX_OPTIONS = { maxWait: 10_000, timeout: 30_000 };
+/** Invite coupons: the new customer's welcome coupon and the inviter's reward, told apart by the start of the code. */
+const WELCOME_PREFIX = 'RW';
+const INVITER_PREFIX = 'RF';
+
+export type ReferralReward = 'COUPON' | 'POINTS';
 
 /** Everything the admin decides. New earning features start off, so nothing costs money until they turn it on. */
 export const DEFAULT_PROGRAM = {
@@ -21,12 +26,36 @@ export const DEFAULT_PROGRAM = {
   minRedeemPoints: 100,
   maxRedeemPercent: 50,
   expiryMonths: 12,
-  referral: { enabled: false, referrerPoints: 200, refereePoints: 200, maxPerUser: 20 },
+  referral: {
+    enabled: false,
+    /** A coupon works without the points programme; points need it running. */
+    rewardType: 'COUPON' as ReferralReward,
+    referrerPoints: 200,
+    refereePoints: 200,
+    referrerCouponValue: 25,
+    refereeCouponValue: 25,
+    couponValidDays: 60,
+    maxPerUser: 20,
+  },
   tiers: { enabled: false, silverTrips: 5, silverMultiplier: 1.25, goldTrips: 15, goldMultiplier: 1.5 },
   challenge: { enabled: false, trips: 5, points: 500 },
 };
 
 export type LoyaltyProgram = typeof DEFAULT_PROGRAM;
+
+type Money = Prisma.Decimal | number | null;
+
+/**
+ * The part of a booking's price that is its transport tickets, from 0 to 1: points are earned on the bus, not the hotel.
+ * A stay sold on top is its housingAmount; a package's price holds its stay, so only the trip's own seat price counts from it.
+ */
+export function transportShare(booking: { subtotal: Money; housingAmount: Money; seats: number; trip: { price: Money; packageId: string | null } }) {
+  const subtotal = Math.round(Number(booking.subtotal ?? 0) * 100);
+  if (subtotal <= 0) return 1;
+  let transport = subtotal - Math.round(Number(booking.housingAmount ?? 0) * 100);
+  if (booking.trip.packageId) transport = Math.min(transport, Math.round(Number(booking.trip.price ?? 0) * 100) * booking.seats);
+  return Math.min(1, Math.max(0, transport / subtotal));
+}
 type Db = Prisma.TransactionClient;
 
 export interface EarnPlan {
@@ -214,6 +243,9 @@ export class LoyaltyService {
         userId: true,
         bookingReference: true,
         loyaltyPlan: true,
+        subtotal: true,
+        housingAmount: true,
+        trip: { select: { price: true, packageId: true } },
         payment: { select: { amount: true, walletAmount: true, status: true } },
         collections: { select: { amount: true } },
         passengers: { select: { ticket: { select: { isBoarded: true } } } },
@@ -226,7 +258,8 @@ export class LoyaltyService {
       const plan = (booking.loyaltyPlan as unknown as EarnPlan | null) ?? { rate: program.enabled ? program.pointsPerRiyal : 0, bonus: 0, rules: [], tier: null };
       // Points follow money actually received, not what a booking still owes.
       const { received, wallet } = paymentFigures(booking.payment, booking.collections);
-      const paid = (received + wallet) / 100;
+      // Only what was paid for the tickets earns: the hotel's share is left out.
+      const paid = ((received + wallet) / 100) * transportShare({ ...booking, seats: booking.passengers.length });
       const travelled = booking.passengers.filter((p) => p.ticket?.isBoarded).length;
       // Only seats that actually travelled earn points.
       const points = Math.floor((paid * plan.rate * travelled) / Math.max(1, booking.passengers.length)) + plan.bonus;
@@ -265,9 +298,45 @@ export class LoyaltyService {
     await this.notifications.toUser(tx, 'POINTS_BONUS', entry.userId, { bonusName: entry.description, points: entry.points, pointsBalance: granted.balanceAfter });
   }
 
+  /** Whether invites are on: coupons stand alone, points need the points programme running too. */
+  referralActive(program: LoyaltyProgram) {
+    return program.referral.enabled && (program.referral.rewardType === 'COUPON' || program.enabled);
+  }
+
+  /** One coupon per reason: its code is derived from the reason, so a repeat run finds it instead of issuing a second. */
+  private async issueReferralCoupon(tx: Db, entry: { userId: string; prefix: string; reason: string; value: number; validDays: number; bonusName: string }) {
+    if (!(entry.value > 0)) return null;
+    const code = `${entry.prefix}${crypto.createHash('sha256').update(entry.reason).digest('hex').slice(0, 10).toUpperCase()}`;
+    if (await tx.coupon.findUnique({ where: { code }, select: { id: true } })) return null;
+    const coupon = await tx.coupon.create({
+      data: {
+        code,
+        type: 'FIXED_TOTAL',
+        value: entry.value,
+        maxUses: 1,
+        perUserLimit: 1,
+        ownerUserId: entry.userId,
+        validUntil: new Date(Date.now() + Math.max(1, entry.validDays) * DAY_MS),
+      },
+      select: { code: true, value: true, validUntil: true },
+    });
+    await this.notifications.toUser(tx, 'REFERRAL_COUPON', entry.userId, { bonusName: entry.bonusName, voucherValue: formatSar(entry.value), voucherCode: code });
+    return { code: coupon.code, value: Number(coupon.value), validUntil: coupon.validUntil };
+  }
+
+  private welcomeCoupon(tx: Db, userId: string, program: LoyaltyProgram) {
+    return this.issueReferralCoupon(tx, {
+      userId,
+      prefix: WELCOME_PREFIX,
+      reason: `referral-in:${userId}`,
+      value: program.referral.refereeCouponValue,
+      validDays: program.referral.couponValidDays,
+      bonusName: 'هدية الانضمام بدعوة صديق',
+    });
+  }
+
   private async applyMilestones(tx: Db, userId: string, program: LoyaltyProgram) {
-    if (!program.enabled) return;
-    if (program.challenge.enabled) {
+    if (program.enabled && program.challenge.enabled) {
       const year = new Date(Date.now() + RIYADH_OFFSET_MS).getUTCFullYear();
       const trips = await tx.loyaltyTransaction.count({
         where: {
@@ -286,9 +355,26 @@ export class LoyaltyService {
         });
       }
     }
-    if (program.referral.enabled) {
+    if (this.referralActive(program)) {
       const user = await tx.user.findUnique({ where: { id: userId }, select: { referredById: true } });
       if (!user?.referredById) return;
+      if (program.referral.rewardType === 'COUPON') {
+        // Normally issued when the code was entered; this covers a code entered while invites paid in points.
+        await this.welcomeCoupon(tx, userId, program);
+        // The inviter's coupon waits for the friend's first real trip, which is what makes fake accounts pointless.
+        const rewarded = await tx.coupon.count({ where: { ownerUserId: user.referredById, code: { startsWith: INVITER_PREFIX } } });
+        if (rewarded < program.referral.maxPerUser) {
+          await this.issueReferralCoupon(tx, {
+            userId: user.referredById,
+            prefix: INVITER_PREFIX,
+            reason: `referral-out:${userId}`,
+            value: program.referral.referrerCouponValue,
+            validDays: program.referral.couponValidDays,
+            bonusName: 'مكافأة دعوة صديق',
+          });
+        }
+        return;
+      }
       // Rewards wait for the friend's first real trip, which is what makes fake accounts pointless.
       await this.grantOnce(tx, {
         userId,
@@ -381,11 +467,14 @@ export class LoyaltyService {
       expiresAt = new Date(user.loyaltyActivityAt);
       expiresAt.setUTCMonth(expiresAt.getUTCMonth() + program.expiryMonths);
     }
-    const referral = program.referral.enabled
+    const referral = this.referralActive(program)
       ? {
           code: await this.referralCodeFor(userId),
+          rewardType: program.referral.rewardType,
           referrerPoints: program.referral.referrerPoints,
           refereePoints: program.referral.refereePoints,
+          referrerCouponValue: program.referral.referrerCouponValue,
+          refereeCouponValue: program.referral.refereeCouponValue,
           canEnterCode: !user.referredById && (await this.prisma.booking.count({ where: { userId } })) === 0,
         }
       : null;
@@ -424,7 +513,7 @@ export class LoyaltyService {
 
   async applyReferralCode(userId: string, code: string) {
     const program = await this.getProgram();
-    if (!program.enabled || !program.referral.enabled) throw new ConflictException('برنامج الدعوات غير متاح حاليًا');
+    if (!this.referralActive(program)) throw new ConflictException('برنامج الدعوات غير متاح حاليًا');
     const normalized = code.trim().toUpperCase();
     return this.prisma.$transaction(async (tx) => {
       const [user, bookings, referrer] = await Promise.all([
@@ -437,7 +526,9 @@ export class LoyaltyService {
       if (!referrer) throw new BadRequestException('رمز الدعوة غير صحيح');
       if (referrer.id === userId) throw new BadRequestException('لا يمكنك استخدام رمزك');
       await tx.user.update({ where: { id: userId }, data: { referredById: referrer.id } });
-      return { success: true };
+      // The friend's discount is for their first booking, so it is theirs at once; the inviter's waits for that trip.
+      const coupon = program.referral.rewardType === 'COUPON' ? await this.welcomeCoupon(tx, userId, program) : null;
+      return { success: true, coupon };
     });
   }
 

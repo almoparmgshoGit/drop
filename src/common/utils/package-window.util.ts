@@ -15,8 +15,10 @@ export function packageWindowProblem(pkg: { startDate: Date | null; endDate: Dat
 
 /** A trip sold under a package must depart inside the package's dates. Returns the package, for its other defaults. */
 export async function assertTripFitsPackage(db: Prisma.TransactionClient, packageId: string, departure: Date) {
-  const pkg = await db.package.findUnique({ where: { id: packageId }, select: { nights: true, startDate: true, endDate: true } });
+  const pkg = await db.package.findUnique({ where: { id: packageId }, select: { nights: true, startDate: true, endDate: true, kind: true } });
   if (!pkg) throw new NotFoundException('الباقة غير موجودة');
+  // A custom package is built by the customer from transport trips; no trip belongs to it.
+  if (pkg.kind === 'CUSTOM') throw new BadRequestException('لا تُربط الرحلات بباقة يصممها العميل، بل يختار العميل رحلاته بنفسه');
   const problem = packageWindowProblem(pkg, departure);
   if (problem) throw new BadRequestException(`موعد الرحلة خارج فترة الباقة: ${problem}`);
   return pkg;

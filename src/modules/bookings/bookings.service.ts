@@ -14,7 +14,7 @@ import { WalletService } from '../../common/services/wallet.service';
 import { BookingCancellationService, lockBookingWithTrip } from '../../common/services/booking-cancellation.service';
 import { BookingEventsService } from '../../common/services/booking-events.service';
 import { InvoiceLedgerService } from '../../common/services/invoice-ledger.service';
-import { LoyaltyService } from '../../common/services/loyalty.service';
+import { LoyaltyService, transportShare } from '../../common/services/loyalty.service';
 import { NotificationsService } from '../../common/services/notifications.service';
 import { PaymentLedgerService } from '../../common/services/payment-ledger.service';
 import { includesHousing } from '../../common/utils/booking-types.util';
@@ -32,6 +32,7 @@ import { tripDayWindow } from '../../common/utils/trip-day.util';
 import { PACKAGE_MAX_PERSONS, PACKAGE_PRICE_SELECT, packageGroupTotal, packagePriceTiers } from '../../common/utils/package-price.util';
 import { BookingLegDto, CreateBookingDto, HoldSeatsDto, QuoteDto, ReviewCancellationDto } from './bookings.dto';
 import { PublicService, SERVICE_SELECT, withHotelServices } from '../../common/utils/services.util';
+import { customPackageStay, loadCustomPackage } from '../../common/utils/custom-package.util';
 
 const DEFAULT_VAT_RATE = 15;
 const CANCELLATION_TX_OPTIONS = { maxWait: 10_000, timeout: 30_000 };
@@ -46,6 +47,8 @@ const BOOKING_INCLUDE = {
       destination: true,
       departureTime: true,
       arrivalTime: true,
+      // When the bus reaches the destination; arrivalTime is the end of the whole trip, the return on a round trip.
+      estimatedArrivalAt: true,
       hijriDate: true,
       busType: true,
       miqat: true,
@@ -64,6 +67,7 @@ const BOOKING_INCLUDE = {
       fullName: true,
       phone: true,
       seatNumber: true,
+      gender: true,
       roomNote: true,
       ticket: true,
       hotelRoom: {
@@ -82,6 +86,9 @@ const BOOKING_INCLUDE = {
       },
     },
   },
+  // The package the customer built and the hotel chosen for its stay.
+  customPackage: { select: { id: true, name: true } },
+  stayHotel: { select: { name: true, city: true, address: true } },
   // Field by field: the collector's follow-up note and the gateway reference stay with staff.
   payment: { select: { id: true, bookingId: true, amount: true, currency: true, status: true, method: true, walletAmount: true, createdAt: true } },
   // Enough for the customer to follow a refund; references and failure reasons stay with staff.
@@ -311,14 +318,25 @@ export class BookingsService {
         },
       },
     });
-    const legs = dto.legs.map((leg) => {
+    // A package the customer builds: its two trips are sold as transport, and its stay is priced by the night on the outbound.
+    const customPackage = dto.customPackageId ? await loadCustomPackage(db, dto.customPackageId) : null;
+    if (customPackage && dto.legs.length !== 2) throw new BadRequestException('اختر رحلة الذهاب ورحلة العودة للباقة');
+    const seated = dto.legs.map((leg) => {
       const trip = trips.find((t) => t.id === leg.tripId);
       this.assertBookable(trip);
-      const seats = normalizeSeats(leg.seats);
+      return { leg, trip, seats: normalizeSeats(leg.seats) };
+    });
+    const customStay = customPackage
+      ? customPackageStay(customPackage, { trip: seated[0].trip, seats: seated[0].seats.length }, { trip: seated[1].trip, seats: seated[1].seats.length }, dto.legs[0].roomChoice)
+      : null;
+
+    const legs = seated.map(({ leg, trip, seats }, index) => {
       // A package charges its total for the group's size; an ordinary trip charges each seat.
       const seatsSubtotal = trip.package ? packageGroupTotal(trip.package, seats.length) : toHalalas(trip.price) * seats.length;
       const unitPrice = seats.length ? Math.round(seatsSubtotal / seats.length) : toHalalas(trip.price);
-      const stay = this.priceStay(trip, leg, seats.length);
+      // A package's price takes its stay with it, so only an ordinary trip can be booked as transport alone.
+      if (dto.transportOnly && trip.package) throw new BadRequestException('الباقة تُحجز كاملة، ولا يمكن حجز النقل منها وحده');
+      const stay = customStay ? (index === 0 ? { amount: customStay.amount, details: customStay.details } : null) : dto.transportOnly ? null : this.priceStay(trip, leg, seats.length);
       const housingAmount = stay?.amount ?? 0;
       return { leg, trip, seats, unitPrice, stay, seatsSubtotal, housingAmount, subtotal: seatsSubtotal + housingAmount };
     });
@@ -373,13 +391,18 @@ export class BookingsService {
 
     // Worked out once here, so the preview and the saved booking can never disagree.
     const plans = await Promise.all(pricedLegs.map((leg) => this.loyalty.earnPlan(db, userId, program, leg.trip, leg.seats.length)));
-    const willEarn = pricedLegs.reduce((sum, leg, idx) => sum + Math.floor((leg.total / 100) * plans[idx].rate) + plans[idx].bonus, 0);
+    // Points are earned on the tickets alone, so the hotel's part of each leg is left out, the same rule as settlement.
+    const willEarn = pricedLegs.reduce((sum, leg, idx) => {
+      const share = transportShare({ subtotal: leg.subtotal / 100, housingAmount: leg.housingAmount / 100, seats: leg.seats.length, trip: { price: leg.trip.price, packageId: leg.trip.packageId } });
+      return sum + Math.floor((leg.total / 100) * share * plans[idx].rate) + plans[idx].bonus;
+    }, 0);
 
     const housing = pricedLegs.map((leg) => leg.stay?.details ?? null);
 
     return {
       coupon,
       housing,
+      customStay,
       walletUsed,
       payable,
       pricedLegs,
@@ -516,6 +539,7 @@ export class BookingsService {
     const passengers = dto.passengers.map((p) => ({
       fullName: p.fullName.trim(),
       phone: this.normalizePassengerPhone(p.phone),
+      gender: p.gender ?? null,
     }));
     const category = dto.category ?? 'FAMILY';
     const ticketSecret = this.config.getOrThrow<string>('TICKET_SIGNING_SECRET');
@@ -569,6 +593,23 @@ export class BookingsService {
                 status: 'CONFIRMED',
                 category,
                 roomChoice: quote.housing[legIndex]?.choice ?? null,
+                // The customer's own package: both legs carry it, and the stay sits on the outbound like a branch's journey.
+                ...(quote.customStay && {
+                  kind: 'PACKAGE_ROUND_STAY' as const,
+                  leg: legIndex === 0 ? ('OUTBOUND' as const) : ('RETURN' as const),
+                  customPackageId: dto.customPackageId,
+                  ...(legIndex === 0 && {
+                    stayHotelId: quote.customStay.hotelId,
+                    stayCheckIn: quote.customStay.checkIn,
+                    stayCheckOut: quote.customStay.checkOut,
+                    stayNights: quote.customStay.nights,
+                  }),
+                }),
+                // Named as transport, so the rooming sheet and the crew know this booking has no stay even on a trip with a hotel.
+                ...(dto.transportOnly && !quote.customStay && {
+                  kind: quote.pricedLegs.length > 1 ? ('TRANSPORT_ROUND' as const) : ('TRANSPORT_OUTBOUND' as const),
+                  leg: legIndex === 0 ? ('OUTBOUND' as const) : ('RETURN' as const),
+                }),
                 housingAmount: toSar(leg.housingAmount),
                 subtotal: toSar(leg.subtotal),
                 discountAmount: toSar(leg.discount),
@@ -584,7 +625,7 @@ export class BookingsService {
                 boardingPointTime: boardingPoint?.time,
                 idempotencyKey: idempotencyKey ? `${userId}:${idempotencyKey}:${legIndex}` : undefined,
                 passengers: {
-                  create: passengers.map((p, idx) => ({ ...p, seatNumber: leg.seats[idx] })),
+                  create: passengers.map((p, idx) => ({ ...p, position: idx, seatNumber: leg.seats[idx] })),
                 },
                 payment: {
                   create: {

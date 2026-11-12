@@ -215,6 +215,29 @@ describe('Supervisor app (e2e)', () => {
       await request(http()).post(`${API}/tickets/trips/${trip.id}/notices`).set(session.auth).send({ message: 'تنبيه' }).expect(201);
     });
 
+    it('lets the crew read the passenger list once the office sends it, without phone numbers', async () => {
+      const { trip, booking, staff, session } = await scenario();
+      const driver = await createStaff(prisma, 'DRIVER');
+      await prisma.tripDriver.create({ data: { tripId: trip.id, userId: driver.id, isPrimary: true } });
+      await prisma.bookingPassenger.updateMany({ where: { bookingId: booking.id }, data: { phone: '+966500000123' } });
+      await moveFar(trip.id);
+      await request(http()).get(`${API}/tickets/manifest/${trip.id}`).set(session.auth).expect(409);
+
+      const sent = await request(http()).post(`${API}/manifests/${trip.id}/send-to-crew`).set(admin.auth).expect(201);
+      expect(sent.body.crew).toBe(2);
+      for (const userId of [staff.id, driver.id]) {
+        expect(await prisma.notification.count({ where: { userId, event: 'CREW_MANIFEST_SENT' } })).toBe(1);
+      }
+
+      const details = await request(http()).get(`${API}/tickets/trips/${trip.id}/details`).set(session.auth).expect(200);
+      expect(details.body.manifestSentAt).toBeTruthy();
+      const manifest = await request(http()).get(`${API}/tickets/manifest/${trip.id}`).set(session.auth).expect(200);
+      expect(manifest.body.passengers.map((p: any) => p.fullName)).toEqual(['مسافر أول', 'مسافر ثان']);
+      expect(JSON.stringify(manifest.body)).not.toContain('500000123');
+      // The list is all they get early: acting on the trip still waits for its opening.
+      await request(http()).post(`${API}/tickets/trips/${trip.id}/notices`).set(session.auth).send({ message: 'تنبيه' }).expect(409);
+    });
+
     it('keeps the details closed to crew of other trips', async () => {
       const { trip } = await scenario();
       const outsider = await loginStaffOf(await createStaff(prisma, 'STAFF', undefined, 'rank-supervisor'));

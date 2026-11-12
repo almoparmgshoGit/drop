@@ -266,6 +266,7 @@ export class TicketsService {
         currentBoardingPointId: true,
         drivers: crewMember,
         supervisors: crewMember,
+        manifestSentAt: true,
       },
     });
     if (!trip) throw new NotFoundException('Trip not found');
@@ -402,14 +403,13 @@ export class TicketsService {
       // Someone already on the bus knows where it is; only arrival is news to everyone.
       const waiting = bookings.filter((booking) => booking.tickets.some((ticket) => !ticket.isBoarded) && !justToldTicket.has(booking.id));
       if (status === 'AT_POINT') {
+        // Arrival at a point is news only to those who board there; the rest of the bus is not told about every stop.
         const here = waiting.filter((booking) => isAtTicketPoint(booking, point) && (booking.boardingPointId || booking.boardingPointName));
-        const elsewhere = waiting.filter((booking) => !here.includes(booking));
         // The company can turn this alert off for all trips or one, from the station alerts page.
         if (await this.stationAlerts.isEnabled(tx, tripId, 'AT_STOP')) {
           await this.notifications.toBookingOwners(tx, 'BUS_AT_YOUR_POINT', here.map((booking) => booking.id), { currentPoint: point!.name });
           if (here.length > 0) await this.stationAlerts.recordMoment(tx, tripId, 'AT_STOP', point!, here.length);
         }
-        await this.notifications.toBookingOwners(tx, 'BUS_AT_OTHER_POINT', elsewhere.map((booking) => booking.id), { currentPoint: point!.name });
       } else if (status === 'ON_ROAD') {
         await this.notifications.toBookingOwners(tx, 'BUS_ON_ROAD', waiting.map((booking) => booking.id), { currentPoint: trip.currentBoardingPoint?.name ?? trip.origin });
       } else if (status === 'ARRIVED') {
@@ -455,11 +455,13 @@ export class TicketsService {
     await this.assertAssigned(actor, tripId);
     const trip = await this.prisma.trip.findUnique({
       where: { id: tripId },
-      select: { id: true, tripCode: true, origin: true, destination: true, arrivalTime: true, busType: true, tripStatus: true, bookingType: true, ...CREW_WINDOW_SELECT },
+      select: { id: true, tripCode: true, origin: true, destination: true, arrivalTime: true, busType: true, tripStatus: true, bookingType: true, manifestSentAt: true, ...CREW_WINDOW_SELECT },
     });
     if (!trip) throw new NotFoundException('Trip not found');
-    this.assertTripOpen(actor, trip);
+    // Once the office has sent the list, the crew may read it before the trip opens for them.
+    if (!trip.manifestSentAt) this.assertTripOpen(actor, trip);
 
+    // The crew's copy leaves phone numbers out: the office reaches the passengers, the crew works from names and seats.
     const tickets = await this.prisma.ticket.findMany({
       where: { booking: { tripId, status: { in: [...TRAVELING_STATUSES] } } },
       include: {
@@ -475,7 +477,6 @@ export class TicketsService {
         ticketNumber: ticket.ticketNumber,
         bookingReference: ticket.booking.bookingReference,
         fullName: ticket.passenger.fullName,
-        phone: ticket.passenger.phone,
         seatNumber: ticket.passenger.seatNumber,
         boardingPointName: ticket.booking.boardingPointName,
         boardingPointTime: ticket.booking.boardingPointTime,
@@ -495,7 +496,6 @@ export class TicketsService {
           ticketNumber: ticket.ticketNumber,
           bookingReference: ticket.booking.bookingReference,
           fullName: ticket.passenger.fullName,
-          phone: ticket.passenger.phone,
           seatNumber: ticket.passenger.seatNumber,
           boardingPointName: null,
           boardingPointTime: null,

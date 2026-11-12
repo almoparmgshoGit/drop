@@ -20,8 +20,8 @@ export class BranchBookingsController {
   @Get('trips')
   @RequirePermission('bookings.create')
   @ApiOperation({ summary: 'Trips open for sale at branches' })
-  trips(@Query() query: TripSearchQuery) {
-    return this.bookings.searchTrips(query);
+  trips(@Req() req, @Query() query: TripSearchQuery) {
+    return this.bookings.searchTrips(query, req.user);
   }
 
   @Get('trips/:id/seats')

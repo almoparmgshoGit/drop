@@ -26,6 +26,7 @@ export interface UserActor {
 
 interface ProfileDetails {
   nationality?: string | null;
+  city?: string | null;
   nativeLanguage?: string | null;
   gender?: Gender | null;
   idType?: IdType | null;
@@ -58,6 +59,7 @@ const profileDetailsData = (existing: { nationality: string | null; nativeLangua
   const movesAlerts = data.nativeLanguage && data.nativeLanguage !== existing.nativeLanguage && MESSAGE_LANGUAGES.includes(data.nativeLanguage as MessageLanguage);
   return {
     ...(data.nationality !== undefined && { nationality }),
+    ...(data.city !== undefined && { city: data.city || null }),
     ...(data.gender !== undefined && { gender: data.gender }),
     ...(data.nativeLanguage !== undefined && { nativeLanguage: data.nativeLanguage }),
     ...(movesAlerts && { messageLanguage: data.nativeLanguage! }),
@@ -97,6 +99,7 @@ const USER_SELECT = {
   walletBalance: true,
   loyaltyPoints: true,
   nationality: true,
+  city: true,
   nativeLanguage: true,
   gender: true,
   idType: true,
@@ -106,6 +109,9 @@ const USER_SELECT = {
   birthDate: true,
   messageLanguage: true,
   marketingOptOutAt: true,
+  tripAlertsEnabled: true,
+  alertLeadMinutes: true,
+  alertRepeatMinutes: true,
   photoUpdatedAt: true,
   createdAt: true,
 } as const;
@@ -212,13 +218,21 @@ export class UsersService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /** The city the customer lives in; asked when the app first opens, before they sign in. */
+  async updateCity(userId: string, city: string) {
+    return this.prisma.user.update({ where: { id: userId }, data: { city }, select: USER_SELECT });
+  }
+
   /** The customer's own choices about what reaches them and in which language. */
-  async updateMessaging(userId: string, data: { messageLanguage?: string; acceptsOffers?: boolean }) {
+  async updateMessaging(userId: string, data: { messageLanguage?: string; acceptsOffers?: boolean; tripAlertsEnabled?: boolean; alertLeadMinutes?: number | null; alertRepeatMinutes?: number | null }) {
     return this.prisma.user.update({
       where: { id: userId },
       data: {
         ...(data.messageLanguage !== undefined && { messageLanguage: data.messageLanguage }),
         ...(data.acceptsOffers !== undefined && { marketingOptOutAt: data.acceptsOffers ? null : new Date() }),
+        ...(data.tripAlertsEnabled !== undefined && { tripAlertsEnabled: data.tripAlertsEnabled }),
+        ...(data.alertLeadMinutes !== undefined && { alertLeadMinutes: data.alertLeadMinutes }),
+        ...(data.alertRepeatMinutes !== undefined && { alertRepeatMinutes: data.alertRepeatMinutes }),
       },
       select: USER_SELECT,
     });
@@ -273,13 +287,14 @@ export class UsersService implements OnModuleInit, OnModuleDestroy {
   }
 
   /** Without customers.list an employee gets no table: only the few customers one exact search points at. */
-  async getCustomers(actor: LookupActor, query: { search?: string; page?: number; limit?: number; status?: string; sort?: string; nationality?: string; gender?: string }, ip?: string) {
+  async getCustomers(actor: LookupActor, query: { search?: string; page?: number; limit?: number; status?: string; sort?: string; nationality?: string; city?: string; gender?: string }, ip?: string) {
     if (!actor.permissions.includes('customers.list')) return this.lookupCustomers(actor, query.search ?? '', ip);
-    const { search, page = 1, limit = 50, status, sort = 'newest', nationality, gender } = query;
+    const { search, page = 1, limit = 50, status, sort = 'newest', nationality, city, gender } = query;
     const where: Prisma.UserWhereInput = { role: 'PASSENGER' };
     if (status === 'blocked') where.blockedAt = { not: null };
     if (status === 'active') where.blockedAt = null;
     if (nationality) where.nationality = nationality === 'none' ? null : nationality;
+    if (city) where.city = city === 'none' ? null : city;
     if (gender) where.gender = gender === 'none' ? null : (gender as Gender);
     if (search) {
       where.OR = [
@@ -288,7 +303,7 @@ export class UsersService implements OnModuleInit, OnModuleDestroy {
         { idNumber: { contains: search.trim().toUpperCase() } },
       ];
     }
-    const [items, total, passengers, staff, walletSum, blocked, joinedThisMonth, nationalities] = await Promise.all([
+    const [items, total, passengers, staff, walletSum, blocked, joinedThisMonth, nationalities, cities] = await Promise.all([
       this.prisma.user.findMany({
         where,
         select: CUSTOMER_ROW_SELECT,
@@ -303,7 +318,9 @@ export class UsersService implements OnModuleInit, OnModuleDestroy {
       this.prisma.user.count({ where: { role: 'PASSENGER', blockedAt: { not: null } } }),
       this.prisma.user.count({ where: { role: 'PASSENGER', createdAt: { gte: startOfRiyadhMonth() } } }),
       this.prisma.user.groupBy({ by: ['nationality'], where: { role: 'PASSENGER' }, _count: { _all: true } }),
+      this.prisma.user.groupBy({ by: ['city'], where: { role: 'PASSENGER' }, _count: { _all: true } }),
     ]);
+    const byCity = cities.map((row) => ({ city: row.city, count: row._count._all })).sort((a, b) => b.count - a.count);
     const byNationality = nationalities.map((row) => ({ nationality: row.nationality, count: row._count._all })).sort((a, b) => b.count - a.count);
     return {
       items: items.map(customerRow),
@@ -311,7 +328,7 @@ export class UsersService implements OnModuleInit, OnModuleDestroy {
       page,
       limit,
       restricted: false,
-      summary: { passengers, staff, walletTotal: Number(walletSum._sum.walletBalance ?? 0), blocked, joinedThisMonth, byNationality },
+      summary: { passengers, staff, walletTotal: Number(walletSum._sum.walletBalance ?? 0), blocked, joinedThisMonth, byNationality, byCity },
     };
   }
 

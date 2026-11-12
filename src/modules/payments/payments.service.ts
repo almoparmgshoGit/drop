@@ -35,7 +35,15 @@ const stateOf = (row: { type: string; status: string; destination: string | null
   return row.destination === 'WALLET' ? 'REFUND_WALLET' : 'REFUND_ORIGINAL';
 };
 
-const ROW_INCLUDE = { booking: { select: { id: true, bookingReference: true, user: { select: { name: true, phone: true } } } } } satisfies Prisma.PaymentTransactionInclude;
+const ROW_INCLUDE = {
+  booking: { select: { id: true, bookingReference: true, source: true, branch: { select: { name: true } }, user: { select: { name: true, phone: true } } } },
+} satisfies Prisma.PaymentTransactionInclude;
+
+const SOURCE_LABELS: Record<'APP' | 'BRANCH', string> = { APP: 'التطبيق', BRANCH: 'فرع' };
+
+/** "التطبيق", or the branch's name for a booking made at a counter. */
+const placeOf = (booking: { source: 'APP' | 'BRANCH'; branch: { name: string } | null }) =>
+  booking.source === 'BRANCH' ? booking.branch?.name ?? SOURCE_LABELS.BRANCH : SOURCE_LABELS.APP;
 
 @Injectable()
 export class PaymentsService {
@@ -44,6 +52,7 @@ export class PaymentsService {
   private buildWhere(query: PaymentsQuery, month: string): Prisma.PaymentTransactionWhereInput {
     const where: Prisma.PaymentTransactionWhereInput = { createdAt: riyadhMonthRange(month), ...(query.state && STATE_FILTER[query.state]) };
     if (query.method) where.method = query.method;
+    if (query.source) where.booking = { source: query.source };
     if (query.search) {
       // A code is shown with its date and type around the number, but the number alone identifies it.
       const number = /^(?:(?:TX|RF)-\d{8}-)?0*(\d{1,9})$/i.exec(query.search)?.[1];
@@ -62,12 +71,17 @@ export class PaymentsService {
     const month = query.month ?? riyadhMonth(new Date());
     const page = query.page ?? 1;
     const where = this.buildWhere(query, month);
-    const [items, total, groups] = await Promise.all([
+    const succeededFrom = (source: 'APP' | 'BRANCH') =>
+      this.prisma.paymentTransaction.aggregate({ where: { createdAt: riyadhMonthRange(month), ...STATE_FILTER.SUCCEEDED, booking: { source } }, _count: true, _sum: { amount: true } });
+    const [items, total, groups, fromApp, fromBranches] = await Promise.all([
       this.prisma.paymentTransaction.findMany({ where, include: ROW_INCLUDE, orderBy: { number: 'desc' }, skip: (page - 1) * PAGE_SIZE, take: PAGE_SIZE }),
       this.prisma.paymentTransaction.count({ where }),
       // The cards describe the month as a whole, so the table's filters do not change them.
       this.prisma.paymentTransaction.groupBy({ by: ['type', 'status', 'destination'], where: { createdAt: riyadhMonthRange(month) }, _count: true, _sum: { amount: true } }),
+      succeededFrom('APP'),
+      succeededFrom('BRANCH'),
     ]);
+    const bySource = (row: typeof fromApp) => ({ count: row._count, amount: sar(halalas(row._sum.amount ?? 0)) });
 
     const figures = (match: (group: (typeof groups)[number]) => boolean) => {
       const rows = groups.filter(match);
@@ -83,6 +97,9 @@ export class PaymentsService {
         walletRefunds: figures((row) => row.type === 'REFUND' && row.destination === 'WALLET' && row.status === 'SUCCEEDED'),
         originalRefunds: figures((row) => row.type === 'REFUND' && row.destination === 'ORIGINAL' && row.status === 'SUCCEEDED'),
         pendingRefunds: figures((row) => row.type === 'REFUND' && row.status === 'PENDING'),
+        // Successful charges split by where the booking was made.
+        fromApp: bySource(fromApp),
+        fromBranches: bySource(fromBranches),
       },
       items: items.map((row) => ({
         id: row.id,
@@ -92,6 +109,8 @@ export class PaymentsService {
         bookingId: row.booking.id,
         reference: row.booking.bookingReference,
         customerName: row.booking.user.name,
+        source: row.booking.source,
+        place: placeOf(row.booking),
         amount: Number(row.amount),
         method: row.method,
         simulated: row.simulated,
@@ -112,10 +131,11 @@ export class PaymentsService {
       data: { userId: actorId, action: 'GET /payments/export', entity: 'PaymentTransaction', ip, details: { filters: { ...query }, rows: rows.length } as Prisma.InputJsonValue },
     });
     return csvFile(
-      ['رقم العملية', 'رقم الحجز', 'العميل', 'الجوال', 'المبلغ', 'الوسيلة', 'الحالة', 'مرجع البوابة', 'التاريخ'],
+      ['رقم العملية', 'رقم الحجز', 'مكان الحجز', 'العميل', 'الجوال', 'المبلغ', 'الوسيلة', 'الحالة', 'مرجع البوابة', 'التاريخ'],
       rows.map((row) => [
         transactionCode(row),
         row.booking.bookingReference,
+        placeOf(row.booking),
         row.booking.user.name,
         row.booking.user.phone,
         Number(row.amount).toFixed(2),

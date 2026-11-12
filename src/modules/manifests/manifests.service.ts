@@ -1,11 +1,14 @@
-import { BadRequestException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
 import { BookingStatus, Prisma } from '@prisma/client';
+import { NotificationsService } from '../../common/services/notifications.service';
 import { PrismaService } from '../../common/services/prisma.service';
 import { BOOKING_KIND_LABELS } from '../../common/utils/booking-kinds.util';
 import { bookingHasStay, includesHousing } from '../../common/utils/booking-types.util';
 import { tripSeatLayout } from '../../common/utils/bus-layout.util';
 import { goOnlyBookings, returningBookingIds, reverseSeatsSummary } from '../../common/utils/linked-seats.util';
 import { hotelBookingCost, paymentFigures } from '../../common/utils/payment.util';
+import { passengerWeights } from '../../common/utils/housing-price.util';
+import { tripInCity } from '../../common/utils/branch-city.util';
 import { allocate, toHalalas, toSar } from '../bookings/bookings.service';
 
 export type ManifestActor = { userId: string; permissions: string[] };
@@ -41,6 +44,8 @@ const MANIFEST_BOOKING_SELECT = {
   branch: { select: { name: true } },
   user: { select: { phone: true } },
   passengers: {
+    // The booking's owner first, so the account phone below lands on them.
+    orderBy: { position: 'asc' },
     // Signed ticket tokens stay out on purpose: a manifest is printed and passed around.
     select: {
       id: true,
@@ -57,18 +62,21 @@ const MANIFEST_BOOKING_SELECT = {
 
 @Injectable()
 export class ManifestsService {
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    private notifications: NotificationsService,
+  ) {}
 
   /** The branch whose passengers this employee may see on a manifest, or null for every branch, the same rule as branch bookings. */
-  private async visibleBranch(actor: ManifestActor): Promise<string | null> {
+  private async visibleBranch(actor: ManifestActor): Promise<{ branchId: string; city: string | null } | null> {
     if (actor.permissions.includes('bookings.all_branches')) return null;
-    const me = await this.prisma.user.findUnique({ where: { id: actor.userId }, select: { branchId: true } });
+    const me = await this.prisma.user.findUnique({ where: { id: actor.userId }, select: { branchId: true, branch: { select: { city: true } } } });
     if (!me?.branchId) throw new ForbiddenException('هذا الفرع خارج نطاق صلاحيتك');
-    return me.branchId;
+    return { branchId: me.branchId, city: me.branch?.city?.trim() || null };
   }
 
   async getManifest(actor: ManifestActor, tripId: string) {
-    const branchId = await this.visibleBranch(actor);
+    const visible = await this.visibleBranch(actor);
     const trip = await this.prisma.trip.findUnique({
       where: { id: tripId },
       include: {
@@ -97,7 +105,8 @@ export class ManifestsService {
     // A seat sold by another branch still shows as taken, but whose it is stays with that branch.
     const takenSeats = new Set(everyone.flatMap(({ booking }) => booking.passengers.map((p) => p.seatNumber)));
     const passengers = everyone
-      .filter(({ booking }) => branchId === null || booking.branchId === branchId)
+      // A city's branch serves every passenger of its city's trips; elsewhere it sees its own sales.
+      .filter(({ booking }) => visible === null || booking.branchId === visible.branchId || (!!visible.city && tripInCity(trip, visible.city)))
       .flatMap(({ booking, isReturning }) =>
         booking.passengers.map((p, idx) => ({
           isReturning,
@@ -180,6 +189,8 @@ export class ManifestsService {
           ? { name: trip.drivers[0].user.name, phone: trip.drivers[0].user.phone, iqamaNumber: trip.drivers[0].user.driverProfile?.iqamaNumber ?? null }
           : null,
         supervisors: trip.supervisors.map((s) => s.user.name).filter(Boolean),
+        manifestSentAt: trip.manifestSentAt,
+        manifestSentByName: trip.manifestSentByName,
         crew: [
           ...trip.drivers.map((d, idx) => ({ name: d.user.name, phone: d.user.phone, label: idx === 0 ? 'السائق الأول' : 'السائق الثاني' })),
           ...trip.supervisors.map((s) => ({ name: s.user.name, phone: s.user.phone, label: 'مشرف' })),
@@ -226,6 +237,29 @@ export class ManifestsService {
     };
   }
 
+  /**
+   * Hands the passenger list to the trip's drivers and supervisors in the app, before the trip opens for them.
+   * They read it without phone numbers; sending again only reminds them, since the list they open is always the current one.
+   */
+  async sendToCrew(actor: { userId: string }, tripId: string) {
+    const trip = await this.prisma.trip.findUnique({
+      where: { id: tripId },
+      select: { tripStatus: true, _count: { select: { drivers: true, supervisors: true } } },
+    });
+    if (!trip) throw new NotFoundException('Trip not found');
+    if (trip.tripStatus !== 'PUBLISHED') throw new ConflictException('يُرسل الكشف لرحلة قائمة فقط');
+    if (trip._count.drivers + trip._count.supervisors === 0) throw new ConflictException('أسند سائقًا أو مشرفًا للرحلة أولًا');
+
+    const sender = await this.prisma.user.findUnique({ where: { id: actor.userId }, select: { name: true } });
+    const passengerCount = await this.prisma.bookingPassenger.count({ where: { booking: { tripId, status: { in: ON_MANIFEST } } } });
+    const sentAt = new Date();
+    await this.prisma.$transaction(async (tx) => {
+      await tx.trip.update({ where: { id: tripId }, data: { manifestSentAt: sentAt, manifestSentByName: sender?.name ?? null } });
+      await this.notifications.toTripCrew(tx, 'CREW_MANIFEST_SENT', tripId, { extra: { senderName: sender?.name ?? 'المكتب', passengerCount } });
+    });
+    return { manifestSentAt: sentAt, crew: trip._count.drivers + trip._count.supervisors };
+  }
+
   /** Only notes of passengers really on this trip are kept, so the stored object stays small and cannot be filled with anything else. */
   async saveHousingSheet(tripId: string, dto: { columns: string[]; note?: string; passengerNotes?: Record<string, unknown> }) {
     const trip = await this.prisma.trip.findUnique({ where: { id: tripId }, select: { id: true } });
@@ -268,7 +302,10 @@ export class ManifestsService {
             payment: { select: { amount: true, walletAmount: true, status: true, method: true } },
             collections: { select: { amount: true, method: true } },
             cashMovements: { where: { type: 'BOOKING_REFUND' }, select: { amount: true } },
-            passengers: { select: { id: true, fullName: true, notes: true, seatNumber: true } },
+            roomChoice: true,
+            housingAmount: true,
+            subtotal: true,
+            passengers: { orderBy: { position: 'asc' }, select: { id: true, fullName: true, notes: true, seatNumber: true } },
           },
         },
       },
@@ -296,7 +333,7 @@ export class ManifestsService {
       } else {
         byChannel[CHANNEL_BY_METHOD[booking.payment?.method ?? ''] ?? 'network'] = online;
       }
-      const weights = booking.passengers.map(() => 1);
+      const weights = passengerWeights(booking);
       const prices = allocate(toHalalas(booking.totalPrice), weights);
       const cashShares = allocate(byChannel.cash, weights);
       const networkShares = allocate(byChannel.network, weights);

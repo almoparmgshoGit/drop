@@ -23,7 +23,7 @@ import {
   ValidateNested,
 } from 'class-validator';
 import { ALL_PERMISSIONS } from '../../common/permissions';
-import { GENDERS } from '../../common/profile-options';
+import { GENDERS, NATIONALITIES } from '../../common/profile-options';
 import { ID_TYPES } from '../../common/utils/identity.util';
 
 const trimmed = () => Transform(({ value }) => (typeof value === 'string' ? value.trim() : value));
@@ -243,6 +243,14 @@ export class JourneyPassengerDto {
   @IsString()
   @MaxLength(20)
   phone?: string;
+
+  @IsOptional()
+  @IsEnum(Gender)
+  gender?: Gender;
+
+  @IsOptional()
+  @IsIn(NATIONALITIES, { message: 'اختر الجنسية من القائمة' })
+  nationality?: string;
 }
 
 export class JourneyPaymentDto {

@@ -35,6 +35,7 @@ export class DeliveryWorkerService implements OnModuleInit, OnModuleDestroy {
     this.every(DELIVERY_SWEEP_MS, 'deliveries', () => this.sweepDeliveries());
     this.every(DELIVERY_SWEEP_MS, 'campaigns', () => this.campaigns.sweep());
     this.every(STATION_SWEEP_MS, 'stations', () => this.stations.sweep());
+    this.every(STATION_SWEEP_MS, 'passenger-reminders', () => this.stations.sweepPassengerReminders());
     this.every(SLOW_SWEEP_MS, 'reminders', async () => {
       await this.stations.sweepDayBeforeReminders();
       await this.stations.sweepExpiredHolds();

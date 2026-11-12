@@ -25,10 +25,20 @@ export function housingCharge(terms: HousingTerms, room: RoomType, seats: number
   const units = stayUnits(terms, nights);
   if (room === 'SHARED') return terms.housingPriceMode === 'ADDED_TO_BASE' ? toHalalas(terms.housingPrice) * seats * units : 0;
 
-  const price = toHalalas(terms.privateRoomPrice) * units;
-  if (terms.privateRoomPriceBasis === 'PER_PERSON') return price * seats;
-  if (terms.privateRoomPriceBasis === 'PER_BOOKING') return price;
-  return price * Math.ceil(seats / Math.max(1, terms.privateRoomCapacity ?? seats));
+  // A private room is the booking owner's: one price per booking, however many companions share it.
+  return toHalalas(terms.privateRoomPrice) * units;
+}
+
+/**
+ * How a booking's price splits across its passengers, in their entered order: each seat the same, and a private room all on the
+ * first passenger, the booking's owner, so the companions carry their transport only.
+ */
+export function passengerWeights(booking: { roomChoice: RoomType | null; housingAmount: Money; subtotal: Money; passengers: unknown[] }) {
+  const equal = booking.passengers.map(() => 1);
+  const room = booking.roomChoice === 'PRIVATE' ? toHalalas(booking.housingAmount) : 0;
+  const seats = toHalalas(booking.subtotal) - room;
+  if (room <= 0 || seats < 0 || booking.passengers.length === 0) return equal;
+  return booking.passengers.map((_, idx) => seats / booking.passengers.length + (idx === 0 ? room : 0));
 }
 
 /** What housing is worth per person inside the base price, for the sales report; nothing is charged for it. */

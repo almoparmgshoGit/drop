@@ -31,6 +31,7 @@ import { imageTypeOf } from '../../common/utils/image-type.util';
 import { CreateTripDto, OpenReverseTripDto, UpdateTripDto } from './trips.dto';
 import { assertTripFitsPackage } from '../../common/utils/package-window.util';
 import { PACKAGE_PRICE_SELECT, PackagePrices, packagePriceTiers } from '../../common/utils/package-price.util';
+import { cityTripWhere, servedCity } from '../../common/utils/branch-city.util';
 import { PublicService, SERVICE_SELECT, withHotelServices } from '../../common/utils/services.util';
 
 const DEFAULT_TRIP_DURATION_MS = 8 * 60 * 60 * 1000;
@@ -88,7 +89,7 @@ const ADMIN_TRIP_INCLUDE = {
   _count: { select: { bookings: true } },
 } satisfies Prisma.TripInclude;
 
-type RentActor = { permissions: string[] };
+type RentActor = { userId?: string; permissions: string[] };
 
 /** The list reaches many sections through their trip filters, but rent belongs to those who manage trips or see the rates. */
 const withoutRentFor = <T extends { busRentalPrice?: unknown }>(actor: RentActor, trip: T) =>
@@ -159,15 +160,17 @@ const housingOfferOf = (trip: PricedTrip) => {
     addedToBase: added,
     bedPrice: added && trip.housingPrice !== null ? Number(trip.housingPrice) : null,
     privateRoomPrice: trip.privateRoomPrice === null ? null : Number(trip.privateRoomPrice),
-    privateRoomPriceBasis: trip.privateRoomPriceBasis,
+    // A private room is always one price per booking, paid by its owner.
+    privateRoomPriceBasis: 'PER_BOOKING' as const,
     privateRoomCapacity: trip.privateRoomCapacity,
     period: trip.housingPricePeriod,
   };
 };
 
-const withSeatPrice = <T extends PricedTrip>(trip: T) => {
+/** Searching transport alone, a trip with housing is sold as its seat, so neither the stay nor its price shows. */
+const withSeatPrice = <T extends PricedTrip>(trip: T, transportOnly = false) => {
   const pricePerSeat = Number(trip.package?.price ?? trip.price);
-  const offer = housingOfferOf(trip);
+  const offer = transportOnly ? null : housingOfferOf(trip);
   return {
     ...trip,
     pricePerSeat,
@@ -193,6 +196,13 @@ const reachesDestinationAt = (trip: OutboundTimes) =>
   trip.estimatedArrivalAt ?? (trip.direction === 'ONE_WAY' ? trip.arrivalTime : trip.departureTime);
 
 const sameMembers = (a: string[], b: string[]) => a.length === b.length && a.every((id) => b.includes(id));
+
+/**
+ * Transport alone is sold on every trip whose stay can be left out: plain transport, and trips with a hotel that are not part of a package.
+ * Any other type matches itself.
+ */
+export const bookingTypeWhere = (bookingType: string): Prisma.TripWhereInput =>
+  bookingType === 'TRANSPORT_ONLY' ? { OR: [{ bookingType: 'TRANSPORT_ONLY' }, { bookingType: 'WITH_HOTEL', packageId: null }] } : { bookingType };
 
 /** A package's trips go on sale with it: while the package is a draft or archived, its trips stay out of the app. */
 const ON_SALE_PACKAGE: Prisma.TripWhereInput = { OR: [{ packageId: null }, { package: { status: 'PUBLISHED' } }] };
@@ -528,6 +538,8 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
         privateRoomPrice: source.privateRoomPrice,
         privateRoomCapacity: source.privateRoomCapacity,
         sharedRoomCapacity: source.sharedRoomCapacity,
+        alertLeadMinutes: source.alertLeadMinutes,
+        alertRepeatMinutes: source.alertRepeatMinutes,
         housingPriceMode: source.housingPriceMode,
         privateRoomPriceBasis: source.privateRoomPriceBasis,
         housingPricePeriod: source.housingPricePeriod,
@@ -596,7 +608,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
   async searchTrips(filters: TripSearchFilters) {
     const where = appTripWhere(filters);
     if (filters.busType) where.busType = filters.busType;
-    if (filters.bookingType) where.bookingType = filters.bookingType;
+    if (filters.bookingType) (where.AND as Prisma.TripWhereInput[]).push(bookingTypeWhere(filters.bookingType));
     if (filters.packageId) where.packageId = filters.packageId;
 
     const trips = await this.prisma.trip.findMany({
@@ -605,7 +617,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
       take: 100,
       include: PUBLIC_TRIP_INCLUDE,
     });
-    return trips.map((trip) => toPublicTrip(withSeatPrice(trip)));
+    return trips.map((trip) => toPublicTrip(withSeatPrice(trip, filters.bookingType === 'TRANSPORT_ONLY')));
   }
 
   /**
@@ -619,6 +631,11 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
       select: { origin: true, destination: true, bookingType: true, packageId: true, boardingPoints: { select: { lat: true, lng: true } } },
       orderBy: { departureTime: 'asc' },
       take: 2000,
+    });
+    // A package the customer builds runs on transport trips, so its route is on the packages tab though no trip belongs to it.
+    const customPackages = await this.prisma.package.findMany({
+      where: { kind: 'CUSTOM', status: 'PUBLISHED', origin: { not: null }, destination: { not: null }, hotel: { isActive: true } },
+      select: { origin: true, destination: true },
     });
     const typeCounts = new Map<string, number>();
     const origins = new Map<string, { lat: number; lng: number; points: number }>();
@@ -635,11 +652,19 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
       origins.set(trip.origin, place);
       const isPackage = !!trip.packageId;
       routes.set(`${trip.origin}|${trip.destination}|${trip.bookingType}|${isPackage}`, { origin: trip.origin, destination: trip.destination, bookingType: trip.bookingType, isPackage });
+      // A trip with a hotel also sells its seat alone, so its route is on the transport tab too.
+      if (trip.bookingType === 'WITH_HOTEL' && !isPackage) {
+        routes.set(`${trip.origin}|${trip.destination}|TRANSPORT_ONLY|false`, { origin: trip.origin, destination: trip.destination, bookingType: 'TRANSPORT_ONLY', isPackage: false });
+        typeCounts.set('TRANSPORT_ONLY', (typeCounts.get('TRANSPORT_ONLY') ?? 0) + 1);
+      }
+    }
+    for (const pkg of customPackages) {
+      routes.set(`${pkg.origin}|${pkg.destination}|CUSTOM|true`, { origin: pkg.origin!, destination: pkg.destination!, bookingType: 'CUSTOM_PACKAGE', isPackage: true });
     }
     return {
       // In the order staff know them, and only the ones a customer can book today.
       types: BOOKING_TYPES.filter((type) => typeCounts.has(type)).map((type) => ({ key: type, label: BOOKING_TYPE_LABELS[type] ?? type, trips: typeCounts.get(type) })),
-      hasPackages: trips.some((trip) => trip.packageId),
+      hasPackages: trips.some((trip) => trip.packageId) || customPackages.length > 0,
       // The centre of a city's gathering points, so the app can tell which city a customer is in; null when none has a map pin.
       origins: [...origins.entries()].map(([name, place]) => ({
         name,
@@ -662,7 +687,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
         availableSeats: { gt: 0 },
         ...(filters.origin && { origin: { contains: filters.origin, mode: 'insensitive' as const } }),
         ...(filters.destination && { destination: { contains: filters.destination, mode: 'insensitive' as const } }),
-        ...(filters.bookingType && { bookingType: filters.bookingType }),
+        ...(filters.bookingType && { AND: [bookingTypeWhere(filters.bookingType)] }),
       },
       orderBy: { departureTime: 'asc' },
       select: { departureTime: true },
@@ -671,7 +696,10 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
   }
 
   async getAllAdminTrips(actor: RentActor) {
+    // An employee of a city's branch works with that city's trips.
+    const city = actor.userId ? await servedCity(this.prisma, { userId: actor.userId, permissions: actor.permissions }) : null;
     const trips = await this.prisma.trip.findMany({
+      ...(city && { where: cityTripWhere(city) }),
       orderBy: { departureTime: 'desc' },
       include: ADMIN_TRIP_INCLUDE,
     });
@@ -931,7 +959,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
           seatLayout: storedSeatLayout(layout),
           maxSeatsPerBooking: dto.maxSeatsPerBooking ?? 5,
           ...crewWindowSettings,
-          miqat: dto.miqat || 'ميقات قرن المنازل',
+          miqat: dto.miqat === undefined ? 'ميقات قرن المنازل' : dto.miqat.trim(),
           tripStatus: dto.tripStatus || 'DRAFT',
           ...schedule,
           direction: dto.direction || 'ONE_WAY',
@@ -943,6 +971,8 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
           privateRoomPrice: dto.privateRoomPrice ?? null,
           privateRoomCapacity: dto.privateRoomCapacity ?? null,
           sharedRoomCapacity: dto.sharedRoomCapacity,
+          alertLeadMinutes: dto.alertLeadMinutes,
+          alertRepeatMinutes: dto.alertRepeatMinutes,
           housingPriceMode: dto.housingPriceMode,
           privateRoomPriceBasis: dto.privateRoomPriceBasis,
           housingPricePeriod: dto.housingPricePeriod,
@@ -1018,9 +1048,6 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
 
   private assertHousingTerms(bookingType: string, terms: HousingTerms) {
     if (!includesHousing(bookingType)) return;
-    if (terms.privateRoomPrice !== null && terms.privateRoomPriceBasis === 'PER_ROOM' && !terms.privateRoomCapacity) {
-      throw new BadRequestException('حدد سعة الغرفة الخاصة ليُحسب عدد الغرف');
-    }
     if (terms.housingPriceMode === 'ADDED_TO_BASE' && terms.housingPrice === null && terms.privateRoomPrice === null) {
       throw new BadRequestException('أدخل سعر السكن، لأنه يضاف إلى السعر الأساسي');
     }
@@ -1103,10 +1130,8 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
       if (dto.direction && dto.direction !== existing.direction && (await hasSales())) {
         throw new ConflictException('لا يمكن تغيير اتجاه الرحلة بعد بيع مقاعد فيها');
       }
-      // Until the outbound leaves, the bus is the same one both ways. Once it has left, a breakdown can leave the way back on another bus.
-      if (existing.reverseOf && dto.busId !== undefined && dto.busId !== existing.busId && existing.reverseOf.departureTime > now) {
-        throw new ConflictException('باص الرحلة العكسية يتبع رحلة الذهاب حتى انطلاقها، غيّره من رحلة الذهاب');
-      }
+      // A reverse trip is edited like any other, its bus too. Its seats are linked to the outbound's, so applySeatLayout below
+      // still refuses a vehicle with a different seat plan; and once it has its own bus, changes to the outbound's bus no longer reach it.
       // The direction decides whether the two trips share seats, and sales already made depend on that.
       if (openReverse && dto.direction && dto.direction !== existing.direction) {
         throw new ConflictException('لا يمكن تغيير اتجاه رحلة لها رحلة عكسية مفتوحة. ألغِ الرحلة العكسية أولًا ثم غيّر الاتجاه وأعد فتحها');
@@ -1229,7 +1254,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
           maxSeatsPerBooking: dto.maxSeatsPerBooking,
           ...crewWindowSettings,
           ...(crewWindowMoved && { crewOpenAnnouncedAt: null, boardingOpenAnnouncedAt: null, boardingCloseAnnouncedAt: null }),
-          miqat: dto.miqat,
+          miqat: dto.miqat?.trim(),
           tripStatus: dto.tripStatus,
           direction: dto.direction,
           bookingType: dto.bookingType,
@@ -1245,6 +1270,8 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
           privateRoomPrice: dto.privateRoomPrice,
           privateRoomCapacity: dto.privateRoomCapacity,
           sharedRoomCapacity: dto.sharedRoomCapacity,
+          alertLeadMinutes: dto.alertLeadMinutes,
+          alertRepeatMinutes: dto.alertRepeatMinutes,
           housingPriceMode: dto.housingPriceMode,
           privateRoomPriceBasis: dto.privateRoomPriceBasis,
           housingPricePeriod: dto.housingPricePeriod,
@@ -1481,13 +1508,13 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
     await this.notifications.toTripCrew(tx, 'CREW_TRIP_TIME_CHANGED', before.id, { userIds: crewAfter.filter((userId) => !added.includes(userId)), extra: previous });
   }
 
-  async getReverseTrips(range: 'week' | 'month' = 'week') {
+  async getReverseTrips(range: 'week' | 'month' | 'all' = 'all') {
     const now = new Date();
     const trips = await this.prisma.trip.findMany({
       where: {
         reverseEnabled: true,
         OR: [
-          { tripStatus: 'PUBLISHED', departureTime: { gt: now, lt: addDays(now, range === 'week' ? 7 : 30) } },
+          { tripStatus: 'PUBLISHED', departureTime: { gt: now, ...(range !== 'all' && { lt: addDays(now, range === 'week' ? 7 : 30) }) } },
           // The outbound has left, but its way back is still ahead: selling, or still waiting to be opened.
           {
             tripStatus: { in: ['PUBLISHED', 'COMPLETED'] },
@@ -1503,7 +1530,14 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
       include: {
         bus: { select: { plateNumber: true } },
         drivers: { where: { isPrimary: true }, select: { user: { select: { name: true } } } },
-        reverseTrip: { include: { bus: { select: { plateNumber: true } }, boardingPoints: { select: { name: true }, take: 1 } } },
+        itineraryStops: { orderBy: { sortOrder: 'asc' }, select: { title: true, time: true, kind: true } },
+        reverseTrip: {
+          include: {
+            bus: { select: { plateNumber: true } },
+            boardingPoints: { select: { name: true, time: true, address: true, lat: true, lng: true }, orderBy: { time: 'asc' } },
+            itineraryStops: { orderBy: { sortOrder: 'asc' }, select: { title: true, time: true, kind: true } },
+          },
+        },
       },
     });
 
@@ -1523,7 +1557,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
       const seatsTaken = trip.totalSeats - trip.availableSeats;
       const bookedSeats = reverse ? booked.get(trip.id)?.seats ?? 0 : seatsTaken;
       const occupancyPercent = trip.totalSeats ? Math.round((bookedSeats / trip.totalSeats) * 100) : 0;
-      const canOpen = trip.totalSeats > 0 && (seatsTaken / trip.totalSeats) * 100 >= trip.reverseOpenPercent;
+      const reachedPercent = trip.totalSeats > 0 && (seatsTaken / trip.totalSeats) * 100 >= trip.reverseOpenPercent;
       const isSelling = reverse?.channelApp || reverse?.channelBranch;
       return {
         id: trip.id,
@@ -1542,13 +1576,16 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
         reverseSeats: trip.direction === 'ONE_WAY' ? trip.totalSeats : trip.availableSeats,
         occupancyPercent,
         openPercent: trip.reverseOpenPercent,
+        reachedPercent,
         reverseDepartureAt: trip.reverseDepartureAt,
         reversePrice: trip.reversePrice === null ? null : Number(trip.reversePrice),
         busPlate: trip.bus?.plateNumber ?? null,
         driverName: trip.drivers[0]?.user.name ?? null,
+        // The way there, stop by stop; the way back runs it the other way round, so the form offers it reversed.
+        outboundStops: trip.itineraryStops,
         status: reverse
           ? reverse.tripStatus !== 'PUBLISHED' ? 'CLOSED' : isSelling ? 'OPEN' : 'PAUSED'
-          : canOpen ? 'READY' : 'NOT_REACHED',
+          : 'READY',
         reverse: reverse && {
           id: reverse.id,
           tripCode: reverse.tripCode,
@@ -1563,6 +1600,8 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
           channelApp: reverse.channelApp,
           channelBranch: reverse.channelBranch,
           boardingPointName: reverse.boardingPoints[0]?.name ?? null,
+          boardingPoints: reverse.boardingPoints,
+          itineraryStops: reverse.itineraryStops,
         },
       };
     });
@@ -1594,15 +1633,14 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
       if (trip.reverseDepartureAt <= new Date()) throw new BadRequestException('موعد الرحلة العكسية قد مضى');
       this.assertReverseAfterOutbound(trip.reverseDepartureAt, trip);
 
-      const occupancyPercent = ((trip.totalSeats - trip.availableSeats) / trip.totalSeats) * 100;
-      if (occupancyPercent < trip.reverseOpenPercent) {
-        throw new ConflictException(`لم يصل إشغال الذهاب إلى ${trip.reverseOpenPercent}%`);
-      }
+      // The reverse can go on sale as soon as the outbound is published; its percent only decides when staff are reminded.
+      // Seats the outbound sells afterwards are closed on the reverse by the seat link.
       // Only a round trip's passengers are still aboard coming back, so only their seats stay closed.
       const seatNumbers = trip.seats.filter((seat) => trip.direction === 'ONE_WAY' || !seat.isBooked).map((seat) => seat.seatNumber);
       if (seatNumbers.length === 0) throw new ConflictException('لا توجد مقاعد متبقية');
 
       const departure = trip.reverseDepartureAt;
+      const route = this.reverseRoute(dto, departure);
       // The road back takes as long as the road there, when that is known.
       const reached = reachesDestinationAt(trip);
       const arrival = new Date(departure.getTime() + (reached > trip.departureTime ? reached.getTime() - trip.departureTime.getTime() : DEFAULT_TRIP_DURATION_MS));
@@ -1618,7 +1656,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
       });
 
       if (trip.reverseTrip) {
-        return this.reopenReverse(tx, trip.reverseTrip, trip, { departure, arrival, seatNumbers, dto }, actor);
+        return this.reopenReverse(tx, trip.reverseTrip, trip, { departure, arrival, seatNumbers, dto, route }, actor);
       }
 
       const reverse = await tx.trip.create({
@@ -1650,11 +1688,10 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
           channelApp: dto.channelApp ?? true,
           channelBranch: dto.channelBranch ?? true,
           seats: { createMany: { data: seatNumbers.map((seatNumber) => ({ seatNumber })) } },
-          // Same bus, same photos; the route and station belong to the outbound direction, so they do not carry over.
+          // Same bus, same photos; the route and gathering points of the way back are the ones given when opening it.
           images: { create: trip.images },
-          boardingPoints: {
-            create: { name: dto.boardingPointName.trim(), time: formatRiyadhTime(departure), address: '' },
-          },
+          boardingPoints: { create: route.boardingPoints },
+          ...(route.itineraryStops.length && { itineraryStops: { create: route.itineraryStops } }),
           services: { create: await busServiceRows(tx, trip.busId) },
           drivers: { create: trip.drivers.map(({ userId, isPrimary }) => ({ userId, isPrimary })) },
           supervisors: { create: trip.supervisors.map(({ userId, isPrimary }) => ({ userId, isPrimary })) },
@@ -1674,20 +1711,37 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
     }, TRIP_TX_OPTIONS);
   }
 
+  /** The gathering points and route of a reverse being opened. A bare point name gathers at the departure time. */
+  private reverseRoute(dto: OpenReverseTripDto, departure: Date) {
+    const boardingPoints = dto.boardingPoints?.length
+      ? dto.boardingPoints.map((point) => this.toBoardingPoint({ ...point, name: point.name.trim() }))
+      : dto.boardingPointName?.trim()
+        ? [{ name: dto.boardingPointName.trim(), time: formatRiyadhTime(departure), address: '', lat: null, lng: null }]
+        : [];
+    if (boardingPoints.length === 0 || boardingPoints.some((point) => !point.name || !point.time)) {
+      throw new BadRequestException('أضف نقطة تجمع واحدة على الأقل للرحلة العكسية، باسمها ووقت حضورها');
+    }
+    const itineraryStops = (dto.itineraryStops ?? []).map((stop, idx) => this.toItineraryStop({ ...stop, title: stop.title.trim() }, idx));
+    if (itineraryStops.some((stop) => !stop.title || !stop.time)) throw new BadRequestException('أكمل اسم ووقت كل محطة في مسار الرحلة العكسية');
+    return { boardingPoints, itineraryStops };
+  }
+
   /** A cancelled reverse comes back as the same trip, so its code and its history stay in one place. Its seats start over from where the outbound stands today. */
   private async reopenReverse(
     tx: Prisma.TransactionClient,
     cancelled: { id: string; busId: string | null },
     outbound: { busId: string | null; seatLayout: Prisma.JsonValue; reversePrice: Prisma.Decimal | null; destination: string; origin: string; drivers: { userId: string; isPrimary: boolean }[]; supervisors: { userId: string; isPrimary: boolean }[] },
-    opening: { departure: Date; arrival: Date; seatNumbers: string[]; dto: OpenReverseTripDto },
+    opening: { departure: Date; arrival: Date; seatNumbers: string[]; dto: OpenReverseTripDto; route: ReturnType<TripsService['reverseRoute']> },
     actor?: CrewActor,
   ) {
-    const { departure, arrival, seatNumbers, dto } = opening;
+    const { departure, arrival, seatNumbers, dto, route } = opening;
     const previous = await tx.trip.findUniqueOrThrow({ where: { id: cancelled.id }, select: { drivers: { select: { userId: true } }, supervisors: { select: { userId: true } } } });
     await tx.seat.deleteMany({ where: { tripId: cancelled.id } });
     await tx.seat.createMany({ data: seatNumbers.map((seatNumber) => ({ tripId: cancelled.id, seatNumber })) });
     await tx.boardingPoint.deleteMany({ where: { tripId: cancelled.id } });
-    await tx.boardingPoint.create({ data: { tripId: cancelled.id, name: dto.boardingPointName.trim(), time: formatRiyadhTime(departure), address: '' } });
+    await tx.boardingPoint.createMany({ data: route.boardingPoints.map((point) => ({ tripId: cancelled.id, ...point })) });
+    await tx.itineraryStop.deleteMany({ where: { tripId: cancelled.id } });
+    if (route.itineraryStops.length) await tx.itineraryStop.createMany({ data: route.itineraryStops.map((stop) => ({ tripId: cancelled.id, ...stop })) });
     await tx.tripDriver.deleteMany({ where: { tripId: cancelled.id } });
     await tx.tripDriver.createMany({ data: outbound.drivers.map(({ userId, isPrimary }) => ({ tripId: cancelled.id, userId, isPrimary })) });
     await tx.tripSupervisor.deleteMany({ where: { tripId: cancelled.id } });

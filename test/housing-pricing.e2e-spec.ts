@@ -50,23 +50,19 @@ describe('Housing prices chosen by the admin', () => {
     expect(body.subtotal).toBe(600);
   });
 
-  it('prices a private room per room, using its capacity to count rooms', async () => {
+  it('prices a private room once per booking, however many companions share it', async () => {
     const trip = await createTrip(await createHotel(), ADDED);
-    const fits = await quote(trip, ['1', '2', '3', '4'], 'PRIVATE');
-    expect(fits.legs[0].housingAmount).toBe(300);
-    const overflows = await quote(trip, FIVE, 'PRIVATE');
-    expect(overflows.legs[0].housingAmount).toBe(600);
-    expect(overflows.subtotal).toBe(1600);
+    expect((await quote(trip, ['1', '2'], 'PRIVATE')).legs[0].housingAmount).toBe(300);
+    const five = await quote(trip, FIVE, 'PRIVATE');
+    expect(five.legs[0].housingAmount).toBe(300);
+    expect(five.subtotal).toBe(1300);
   });
 
-  it('prices a private room per person', async () => {
-    const trip = await createTrip(await createHotel(), { ...ADDED, privateRoomPriceBasis: 'PER_PERSON' });
-    expect((await quote(trip, FIVE, 'PRIVATE')).legs[0].housingAmount).toBe(1500);
-  });
-
-  it('prices a private room once per booking', async () => {
-    const trip = await createTrip(await createHotel(), { ...ADDED, privateRoomPriceBasis: 'PER_BOOKING' });
-    expect((await quote(trip, FIVE, 'PRIVATE')).legs[0].housingAmount).toBe(300);
+  it('ignores an old per-person or per-room setting', async () => {
+    const perPerson = await createTrip(await createHotel(), { ...ADDED, privateRoomPriceBasis: 'PER_PERSON' });
+    expect((await quote(perPerson, FIVE, 'PRIVATE')).legs[0].housingAmount).toBe(300);
+    const perRoom = await createTrip(await createHotel(), { ...ADDED, privateRoomPriceBasis: 'PER_ROOM', privateRoomCapacity: 2 });
+    expect((await quote(perRoom, FIVE, 'PRIVATE')).legs[0].housingAmount).toBe(300);
   });
 
   it('multiplies by the trip nights when priced per night', async () => {
@@ -81,8 +77,8 @@ describe('Housing prices chosen by the admin', () => {
     expect(shared.legs[0].housingAmount).toBe(0);
     expect(shared.subtotal).toBe(400);
     const privately = await quote(trip, ['1', '2'], 'PRIVATE');
-    expect(privately.legs[0].housingAmount).toBe(300);
-    expect(privately.subtotal).toBe(700);
+    expect(privately.legs[0].housingAmount).toBe(150);
+    expect(privately.subtotal).toBe(550);
   });
 
   it('keeps charging existing trips the seat price alone', async () => {
@@ -129,6 +125,27 @@ describe('Housing prices chosen by the admin', () => {
     await request(http()).put(`${API}/trips/${trip.id}`).set(admin.auth).send({ housingPrice: 999 }).expect(200);
     const saved = await prisma.booking.findUniqueOrThrow({ where: { id: booking.id } });
     expect(Number(saved.housingAmount)).toBe(200);
+  });
+
+  it('puts a private room on the booking owner, and the companions carry their transport only', async () => {
+    const trip = await createTrip(await createHotel(), ADDED);
+    const created = await request(http())
+      .post(`${API}/bookings`)
+      .set(customer.auth)
+      .send({ paymentMethod: 'mada', legs: [{ tripId: trip.id, seats: ['3', '1', '2'], roomChoice: 'PRIVATE' }], passengers: [{ fullName: 'صاحب الحجز' }, { fullName: 'مرافق أول' }, { fullName: 'مرافق ثان' }] })
+      .expect(201);
+    const booking = created.body.bookings[0];
+    expect(Number(booking.housingAmount)).toBe(300);
+    expect(Number(booking.totalPrice)).toBe(900);
+
+    const inventory = (await request(http()).get(`${API}/manifests/${trip.id}/inventory`).set(admin.auth).expect(200)).body;
+    const priceOf = (name: string) => inventory.rows.find((row: any) => row.fullName === name).price;
+    expect(priceOf('صاحب الحجز')).toBe(500);
+    expect(priceOf('مرافق أول')).toBe(200);
+    expect(priceOf('مرافق ثان')).toBe(200);
+
+    const found = (await request(http()).get(`${API}/bookings/admin/search?q=${booking.bookingReference}`).set(admin.auth).expect(200)).body;
+    expect(found.items.map((row: any) => [row.fullName, row.price])).toEqual([['صاحب الحجز', 500], ['مرافق أول', 200], ['مرافق ثان', 200]]);
   });
 
   it('refuses a booking when housing is added but the trip has no hotel', async () => {

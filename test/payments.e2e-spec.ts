@@ -104,6 +104,25 @@ describe('Payments register, cancellation review and refunds', () => {
       expect(lastMonth.summary.succeeded.count).toBe(0);
     });
 
+    it('tells bookings made in the app from those made at a branch', async () => {
+      await book(customer, await makeTrip(200));
+      const atCounter = await book(customer, await makeTrip(300));
+      const branch = await prisma.branch.create({ data: { name: 'فرع الحدائق' } });
+      await prisma.booking.update({ where: { id: atCounter.id }, data: { source: 'BRANCH', branchId: branch.id } });
+
+      const all = await payments();
+      expect(all.summary.fromApp).toEqual({ count: 1, amount: 200 });
+      expect(all.summary.fromBranches).toEqual({ count: 1, amount: 300 });
+      expect(all.items.find((row: any) => row.bookingId === atCounter.id)).toMatchObject({ source: 'BRANCH', place: 'فرع الحدائق' });
+
+      const fromBranches = await payments('?source=BRANCH');
+      expect(fromBranches.items.map((row: any) => row.bookingId)).toEqual([atCounter.id]);
+      expect((await payments('?source=APP')).items.map((row: any) => row.place)).toEqual(['التطبيق']);
+
+      const csv = await request(http()).get(`${API}/payments/export?source=BRANCH`).set(admin.auth).expect(200);
+      expect(csv.text).toContain('فرع الحدائق');
+    });
+
     it('exports the filtered rows and logs that it happened', async () => {
       await book(customer, await makeTrip());
       const res = await request(http()).get(`${API}/payments/export`).set(admin.auth).expect(200);

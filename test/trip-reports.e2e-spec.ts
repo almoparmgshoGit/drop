@@ -56,13 +56,13 @@ describe('Bus position, ticket points and crew reports', () => {
   });
 
   describe('where the bus is', () => {
-    it('moves the bus, keeps the history, and tells each passenger what concerns them', async () => {
+    it('moves the bus, keeps the history, and tells only the passengers who board at that point', async () => {
       const { trip, points, passenger, other, atFirst, crew, driverSession, driver } = await setup();
       const res = await setStatus(crew, trip.id, { status: 'AT_POINT', boardingPointId: points[0].id }).expect(201);
       expect(res.body).toMatchObject({ liveStatus: 'AT_POINT', changed: true });
 
       expect((await eventsFor(passenger.user.id, 'BUS_AT_YOUR_POINT'))[0].body).toContain('فرع الرياض');
-      expect((await eventsFor(other.user.id, 'BUS_AT_OTHER_POINT'))[0].body).toContain('فرع الخرج');
+      expect(await prisma.notification.count({ where: { userId: other.user.id, event: { startsWith: 'BUS_' } } })).toBe(0);
       expect(await eventsFor(driver.id, 'CREW_TRIP_STATUS_CHANGED')).toHaveLength(1);
 
       const details = (await request(http()).get(`${API}/tickets/trips/${trip.id}/details`).set(driverSession.auth).expect(200)).body;

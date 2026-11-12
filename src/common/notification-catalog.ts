@@ -479,16 +479,29 @@ export const NOTIFICATION_CATALOG = {
       ur: { title: 'آپ کا واؤچر تیار ہے', body: 'آپ نے {{points}} پوائنٹس کے بدلے {{voucherValue}} مالیت کا {{voucherName}} حاصل کیا ہے۔ واؤچر کوڈ: {{voucherCode}}۔' },
     },
   },
+  REFERRAL_COUPON: {
+    audience: 'PASSENGER',
+    group: 'المحفظة والنقاط',
+    label: 'كوبون دعوة صديق',
+    trigger: 'عند إدخال العميل الجديد رمز الدعوة، وللداعي بعد أول رحلة مكتملة لصديقه',
+    title: 'حصلت على كوبون خصم',
+    body: '{{bonusName}}: كوبون خصم بقيمة {{voucherValue}}. رمز الكوبون: {{voucherCode}}، أدخله عند الدفع.',
+    variables: ['userName', 'bonusName', 'voucherValue', 'voucherCode'],
+    translations: {
+      en: { title: 'You got a discount coupon', body: '{{bonusName}}: a discount coupon worth {{voucherValue}}. Coupon code: {{voucherCode}}. Enter it at checkout.' },
+      ur: { title: 'آپ کو ڈسکاؤنٹ کوپن ملا', body: '{{bonusName}}: {{voucherValue}} مالیت کا ڈسکاؤنٹ کوپن۔ کوپن کوڈ: {{voucherCode}}، ادائیگی کے وقت درج کریں۔' },
+    },
+  },
   REVERSE_TRIP_READY: {
     audience: 'STAFF',
     group: 'الرحلات',
     label: 'رحلة عكسية جاهزة للفتح',
-    trigger: 'عند وصول إشغال الرحلة إلى نسبة فتح رحلتها العكسية',
+    trigger: 'عند وصول إشغال الرحلة إلى نسبة التنبيه وعكسيتها لم تُفتح بعد',
     title: 'رحلة عكسية جاهزة للفتح',
-    body: 'وصلت رحلة {{tripCode}} ({{origin}} ← {{destination}}) إلى نسبة فتح رحلتها العكسية، ويمكن فتحها من شاشة الرحلات العكسية.',
+    body: 'وصلت رحلة {{tripCode}} ({{origin}} ← {{destination}}) إلى نسبة التنبيه ورحلتها العكسية لم تُفتح بعد، ويمكن فتحها من شاشة الرحلات العكسية.',
     variables: TRIP,
     translations: {
-      en: { title: 'Return trip ready to open', body: 'Trip {{tripCode}} ({{origin}} → {{destination}}) has reached the occupancy needed to open its return trip. You can open it from the return trips screen.' },
+      en: { title: 'Return trip ready to open', body: 'Trip {{tripCode}} ({{origin}} → {{destination}}) has reached its reminder occupancy and its return trip is not open yet. You can open it from the return trips screen.' },
       ur: { title: 'واپسی کا سفر کھولنے کے لیے تیار', body: 'سفر {{tripCode}} ({{origin}} ← {{destination}}) واپسی کا سفر کھولنے کی مطلوبہ شرح تک پہنچ گیا ہے، اسے واپسی کے سفروں کی اسکرین سے کھولا جا سکتا ہے۔' },
     },
   },
@@ -555,6 +568,19 @@ export const NOTIFICATION_CATALOG = {
     translations: {
       en: { title: 'Your trip is open', body: 'Trip {{tripCode}} from {{origin}} to {{destination}} is now open and departs on {{departureDate}} at {{departureTime}}. Boarding opens at {{boardingOpensTime}}.' },
       ur: { title: 'آپ کا سفر کھل گیا', body: 'سفر {{tripCode}}، {{origin}} سے {{destination}}، کھل گیا ہے اور {{departureDate}} کو {{departureTime}} بجے روانہ ہوگا۔ سواری {{boardingOpensTime}} بجے شروع ہوگی۔' },
+    },
+  },
+  CREW_MANIFEST_SENT: {
+    audience: 'STAFF',
+    group: 'طاقم الرحلة',
+    label: 'إرسال كشف الركاب للطاقم',
+    trigger: 'عند إرسال المكتب كشف الركاب إلى سائق الرحلة ومشرفها',
+    title: 'كشف ركاب رحلة {{tripCode}}',
+    body: 'أرسل {{senderName}} كشف ركاب رحلة {{tripCode}} من {{origin}} إلى {{destination}} يوم {{departureDate}} ({{passengerCount}} راكب). افتح الرحلة لعرضه.',
+    variables: [...TRIP, 'senderName', 'passengerCount'],
+    translations: {
+      en: { title: 'Passenger list for trip {{tripCode}}', body: '{{senderName}} sent the passenger list of trip {{tripCode}} from {{origin}} to {{destination}} on {{departureDate}} ({{passengerCount}} passengers). Open the trip to view it.' },
+      ur: { title: 'سفر {{tripCode}} کی مسافروں کی فہرست', body: '{{senderName}} نے سفر {{tripCode}}، {{origin}} سے {{destination}}، بتاریخ {{departureDate}} کی مسافروں کی فہرست بھیجی ({{passengerCount}} مسافر)۔ دیکھنے کے لیے سفر کھولیں۔' },
     },
   },
   CREW_BOARDING_OPENED: {
@@ -906,19 +932,6 @@ export const NOTIFICATION_CATALOG = {
     translations: {
       en: { title: 'The bus has reached your point', body: 'The bus is now at {{currentPoint}}, your boarding point for booking {{bookingReference}}. Please head there with your ticket.' },
       ur: { title: 'بس آپ کے مقام پر پہنچ گئی', body: 'بس اب {{currentPoint}} پر ہے، جو بکنگ {{bookingReference}} میں آپ کے سوار ہونے کا مقام ہے۔ اپنا ٹکٹ لے کر وہاں پہنچیں۔' },
-    },
-  },
-  BUS_AT_OTHER_POINT: {
-    audience: 'PASSENGER',
-    group: 'الرحلات',
-    label: 'وصول الحافلة إلى نقطة أخرى',
-    trigger: 'عند تحديد الطاقم نقطة الحافلة، لمن لم يصعد وصعوده من نقطة أخرى',
-    title: 'الحافلة الآن في {{currentPoint}}',
-    body: 'وصلت حافلة رحلتك إلى {{currentPoint}}، ونقطة صعودك {{boardingPoint}} الساعة {{boardingTime}}.',
-    variables: [...BOOKING, 'currentPoint'],
-    translations: {
-      en: { title: 'The bus is now at {{currentPoint}}', body: 'Your trip\'s bus has reached {{currentPoint}}. Your boarding point is {{boardingPoint}} at {{boardingTime}}.' },
-      ur: { title: 'بس اب {{currentPoint}} پر ہے', body: 'آپ کے سفر کی بس {{currentPoint}} پہنچ گئی ہے، اور آپ کے سوار ہونے کا مقام {{boardingPoint}} ہے، وقت {{boardingTime}}۔' },
     },
   },
   BUS_ON_ROAD: {
@@ -1289,6 +1302,20 @@ export const NOTIFICATION_CATALOG = {
     translations: {
       en: { title: 'Stop location changed', body: 'The location of {{stopName}} has changed to: {{newValue}}. Trip {{tripCode}} to {{destination}}.' },
       ur: { title: 'اسٹاپ کی جگہ تبدیل ہو گئی', body: '{{stopName}} کی جگہ اب یہ ہے: {{newValue}}۔ سفر {{tripCode}} برائے {{destination}}۔' },
+    },
+  },
+  GATHERING_REMINDER: {
+    audience: 'PASSENGER',
+    group: 'تنبيهات المحطات',
+    label: 'تذكير موعد التجمع',
+    trigger: 'تلقائيًا قبل وقت نقطة تجمع الراكب، ويتكرر حتى موعدها حسب إعدادات الرحلة أو المسافر',
+    title: 'اقترب موعد التجمع',
+    body: 'موعد التجمع في {{stopName}} بعد نحو {{minutes}} دقيقة. نرجو الحضور قبل الموعد. رحلة {{tripCode}} إلى {{destination}}.',
+    variables: [...BOOKING, 'stopName', 'minutes'],
+    expiresMinutes: LIVE_ALERT_EXPIRES_MINUTES,
+    translations: {
+      en: { title: 'Gathering time is near', body: 'Gathering at {{stopName}} is in about {{minutes}} minutes. Please arrive early. Trip {{tripCode}} to {{destination}}.' },
+      ur: { title: 'جمع ہونے کا وقت قریب ہے', body: '{{stopName}} پر جمع ہونے میں تقریباً {{minutes}} منٹ باقی ہیں۔ براہ کرم وقت سے پہلے پہنچیں۔ سفر {{tripCode}} برائے {{destination}}۔' },
     },
   },
   STATION_MIQAT_REMINDER: {

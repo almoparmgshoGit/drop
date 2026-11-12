@@ -290,7 +290,7 @@ describe('Loyalty program (e2e)', () => {
     });
 
     it('rewards both sides only after the friend completes a trip, and only once', async () => {
-      await setProgram({ referral: { enabled: true, referrerPoints: 200, refereePoints: 150 } });
+      await setProgram({ referral: { enabled: true, rewardType: 'POINTS', referrerPoints: 200, refereePoints: 150 } });
       const inviter = await loginPassenger(app);
       const friend = await loginPassenger(app);
       const { code } = (await summary(inviter)).referral;
@@ -307,6 +307,33 @@ describe('Loyalty program (e2e)', () => {
       const second = await createTrip({ price: 100 });
       await completeTrip(second, await book(friend, second));
       expect(await balance(inviter)).toBe(200);
+    });
+
+    it('pays invites in coupons without the points programme: the friend at once, the inviter after the friend completes a trip', async () => {
+      await setProgram({ enabled: false, referral: { enabled: true, rewardType: 'COUPON', referrerCouponValue: 30, refereeCouponValue: 20, couponValidDays: 10, maxPerUser: 1 } });
+      const inviter = await loginPassenger(app);
+      const friend = await loginPassenger(app);
+      const { code, rewardType } = (await summary(inviter)).referral;
+      expect(rewardType).toBe('COUPON');
+      const applied = await request(http()).post(`${API}/users/profile/loyalty/referral`).set(friend.auth).send({ code }).expect(201);
+      expect(applied.body.coupon).toMatchObject({ value: 20 });
+      expect((await summary(friend)).myVouchers).toEqual([expect.objectContaining({ code: applied.body.coupon.code, value: 20, isUsed: false })]);
+      expect((await summary(inviter)).myVouchers).toHaveLength(0);
+
+      const first = await createTrip({ price: 100 });
+      await completeTrip(first, await book(friend, first));
+      expect((await summary(inviter)).myVouchers).toEqual([expect.objectContaining({ value: 30, isUsed: false })]);
+      expect((await summary(friend)).myVouchers).toHaveLength(1);
+      expect(await balance(inviter)).toBe(0);
+
+      // A second trip by the same friend, and a second friend past the cap, earn nothing more.
+      const second = await createTrip({ price: 100 });
+      await completeTrip(second, await book(friend, second));
+      const other = await loginPassenger(app);
+      await request(http()).post(`${API}/users/profile/loyalty/referral`).set(other.auth).send({ code }).expect(201);
+      const third = await createTrip({ price: 100 });
+      await completeTrip(third, await book(other, third));
+      expect((await summary(inviter)).myVouchers).toHaveLength(1);
     });
 
     it('rejects own code, unknown code, a second code and existing customers', async () => {
@@ -327,7 +354,7 @@ describe('Loyalty program (e2e)', () => {
     });
 
     it('stops rewarding the inviter at the admin cap', async () => {
-      await setProgram({ pointsPerRiyal: 0.01, referral: { enabled: true, referrerPoints: 200, refereePoints: 0, maxPerUser: 1 } });
+      await setProgram({ pointsPerRiyal: 0.01, referral: { enabled: true, rewardType: 'POINTS', referrerPoints: 200, refereePoints: 0, maxPerUser: 1 } });
       const inviter = await loginPassenger(app);
       const { code } = (await summary(inviter)).referral;
       for (let i = 0; i < 2; i++) {

@@ -350,7 +350,7 @@ export class HotelsService {
       // Conditional on the status, so two employees closing it together cannot overwrite each other's note.
       const { count } = await tx.hotelComplaint.updateMany({
         where: { id: complaintId, hotelId, status: 'OPEN' },
-        data: { status: 'RESOLVED', resolution, resolvedAt: new Date(), resolvedByName: author?.name ?? null },
+        data: { status: 'RESOLVED', resolution, resolvedAt: new Date(), resolvedById: actor.userId, resolvedByName: author?.name ?? null },
       });
       if (count === 0) throw new ConflictException('الشكوى غير موجودة أو مغلقة مسبقًا');
       const complaint = await tx.hotelComplaint.findUniqueOrThrow({ where: { id: complaintId }, include: { hotel: { select: { name: true } } } });
@@ -404,7 +404,7 @@ export class HotelsService {
   async reopenComplaint(hotelId: string, complaintId: string) {
     const { count } = await this.prisma.hotelComplaint.updateMany({
       where: { id: complaintId, hotelId, status: 'RESOLVED' },
-      data: { status: 'OPEN', resolution: null, resolvedAt: null, resolvedByName: null },
+      data: { status: 'OPEN', resolution: null, resolvedAt: null, resolvedById: null, resolvedByName: null },
     });
     if (count === 0) throw new ConflictException('الشكوى غير موجودة أو مفتوحة بالفعل');
     return { success: true };
@@ -416,10 +416,6 @@ export class HotelsService {
   }
 
   /** The number of rooms cannot be worked out from a room price without knowing how many fit in one. */
-  private assertPrivateRoomTerms(price: unknown, basis: string, capacity: number | null | undefined) {
-    if (price != null && basis === 'PER_ROOM' && !capacity) throw new BadRequestException('حدد سعة الغرفة الخاصة ليُحسب عدد الغرف');
-  }
-
   /**
    * The service ids a hotel form asks for, or undefined when it did not touch the list. Names from older
    * clients join the service of that name, which is created, with a guessed icon, when missing.
@@ -441,7 +437,6 @@ export class HotelsService {
 
   async createHotel(dto: CreateHotelDto) {
     this.assertOffersRoomType(dto.offersSharedRoom ?? true, dto.offersPrivateRoom ?? true);
-    this.assertPrivateRoomTerms(dto.privateRoomPrice, dto.privateRoomPriceBasis ?? 'PER_ROOM', dto.privateRoomCapacity);
     const { serviceIds: _ids, features: _names, ...fields } = dto;
     return this.prisma.$transaction(async (tx) => {
       const serviceIds = await this.resolveHotelServices(tx, dto);
@@ -454,14 +449,9 @@ export class HotelsService {
   }
 
   async updateHotel(id: string, dto: UpdateHotelDto) {
-    const hotel = await this.prisma.hotel.findUnique({ where: { id }, select: { offersSharedRoom: true, offersPrivateRoom: true, privateRoomPrice: true, privateRoomCapacity: true, privateRoomPriceBasis: true } });
+    const hotel = await this.prisma.hotel.findUnique({ where: { id }, select: { offersSharedRoom: true, offersPrivateRoom: true } });
     if (!hotel) throw new NotFoundException('الفندق غير موجود');
     this.assertOffersRoomType(dto.offersSharedRoom ?? hotel.offersSharedRoom, dto.offersPrivateRoom ?? hotel.offersPrivateRoom);
-    this.assertPrivateRoomTerms(
-      dto.privateRoomPrice === undefined ? hotel.privateRoomPrice : dto.privateRoomPrice,
-      dto.privateRoomPriceBasis ?? hotel.privateRoomPriceBasis,
-      dto.privateRoomCapacity === undefined ? hotel.privateRoomCapacity : dto.privateRoomCapacity,
-    );
     const { serviceIds: _ids, features: _names, ...fields } = dto;
     return this.prisma.$transaction(async (tx) => {
       const serviceIds = await this.resolveHotelServices(tx, dto);

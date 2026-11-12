@@ -9,12 +9,14 @@ import { AppSettingsService, withinHours } from '../../common/services/app-setti
 import { csvCell } from '../../common/utils/csv.util';
 import { tripSeatLayout } from '../../common/utils/bus-layout.util';
 import { goOnlyBookings, lockTripsWithLinked, releaseLinkedSeats, returnRideOf, reverseSeatsSummary, takeLinkedSeats } from '../../common/utils/linked-seats.util';
+import { passengerWeights } from '../../common/utils/housing-price.util';
 import { paymentFigures } from '../../common/utils/payment.util';
 import { normalizeSaudiPhone } from '../../common/utils/phone.util';
 import { CustomerLookup, parseCustomerLookup } from '../../common/utils/identity.util';
 import { CustomerLookupService, LOOKUP_RESULT_LIMIT } from '../../common/services/customer-lookup.service';
 import { signTicketToken } from '../../common/utils/ticket-token.util';
 import { AdminBookingsQuery, BoardingOverrideDto, ChangeBoardingPointDto, ChangeSeatDto, UpdatePassengerDto } from './bookings.dto';
+import { cityTripWhere, tripInCity } from '../../common/utils/branch-city.util';
 import { allocate, BookingsService, holdAvailableTo, randomCode, toHalalas, toSar } from './bookings.service';
 
 const EDIT_TX_OPTIONS = { maxWait: 10_000, timeout: 30_000 };
@@ -32,8 +34,8 @@ export interface BookingsActor {
 
 const LIST_INCLUDE = {
   branch: { select: { id: true, name: true } },
-  trip: { select: { id: true, tripCode: true, origin: true, destination: true, departureTime: true, bookingType: true } },
-  passengers: { select: { id: true, fullName: true, phone: true, nationalId: true, seatNumber: true, hotelRoom: { select: { number: true, type: true, hotelBooking: { select: { hotel: { select: { id: true, name: true } } } } } }, ticket: TICKET_SELECT } },
+  trip: { select: { id: true, tripCode: true, origin: true, destination: true, departureTime: true, estimatedArrivalAt: true, busType: true, bookingType: true } },
+  passengers: { orderBy: { position: 'asc' }, select: { id: true, fullName: true, phone: true, nationalId: true, gender: true, nationality: true, seatNumber: true, hotelRoom: { select: { number: true, type: true, hotelBooking: { select: { hotel: { select: { id: true, name: true } } } } } }, ticket: TICKET_SELECT } },
   payment: true,
   collections: { select: { amount: true } },
   user: { select: { id: true, name: true, phone: true } },
@@ -92,22 +94,27 @@ export class BookingsAdminService {
   }
 
   /** Limits a query to the employee's branch. The branch is read from the database, so moving someone applies immediately. */
+  /** A branch with a city also serves its city's trips: their bookings from the app and other branches show there too. */
   private async branchScope(actor: BookingsActor, requested?: string): Promise<Prisma.BookingWhereInput> {
     if (actor.permissions.includes('bookings.all_branches')) return requested ? { branchId: requested } : {};
-    const me = await this.prisma.user.findUnique({ where: { id: actor.userId }, select: { branchId: true } });
+    const me = await this.prisma.user.findUnique({ where: { id: actor.userId }, select: { branchId: true, branch: { select: { city: true } } } });
     if (!me?.branchId || (requested && requested !== me.branchId)) throw new ForbiddenException('لا يمكنك عرض حجوزات خارج فرعك');
-    return { branchId: me.branchId };
+    const city = me.branch?.city?.trim();
+    // Under AND, so it never replaces an OR the search itself builds.
+    return city ? { AND: [{ OR: [{ branchId: me.branchId }, { trip: cityTripWhere(city) }] }] } : { branchId: me.branchId };
   }
 
   /** A booking of another branch reads as missing or refused the same way everywhere on these routes. */
   async assertVisible(actor: BookingsActor, bookingId: string) {
     if (actor.permissions.includes('bookings.all_branches')) return;
     const [booking, me] = await Promise.all([
-      this.prisma.booking.findUnique({ where: { id: bookingId }, select: { branchId: true } }),
-      this.prisma.user.findUnique({ where: { id: actor.userId }, select: { branchId: true } }),
+      this.prisma.booking.findUnique({ where: { id: bookingId }, select: { branchId: true, trip: { select: { origin: true, destination: true } } } }),
+      this.prisma.user.findUnique({ where: { id: actor.userId }, select: { branchId: true, branch: { select: { city: true } } } }),
     ]);
     if (!booking) throw new NotFoundException('Booking not found');
-    if (!me?.branchId || booking.branchId !== me.branchId) throw new ForbiddenException('هذا الحجز خارج نطاق فرعك');
+    const city = me?.branch?.city?.trim();
+    const inMyCity = !!city && tripInCity(booking.trip, city);
+    if (!me?.branchId || (booking.branchId !== me.branchId && !inMyCity)) throw new ForbiddenException('هذا الحجز خارج نطاق فرعك');
   }
 
   private buildWhere(query: AdminBookingsQuery): Prisma.BookingWhereInput {
@@ -213,7 +220,8 @@ export class BookingsAdminService {
 
     const rows = bookings.flatMap((booking) => {
       const isCancelled = booking.status === 'CANCELLED';
-      const weights = booking.passengers.map(() => 1);
+      // A private room is the owner's alone, so it shows on the first passenger and not on the companions.
+      const weights = passengerWeights(booking);
       const shares = allocate(toHalalas(booking.totalPrice), weights);
       const figures = paymentFigures(booking.payment, booking.collections);
       const owed = allocate(isCancelled ? 0 : figures.remaining, weights);
@@ -293,6 +301,7 @@ export class BookingsAdminService {
             bus: { select: { plateNumber: true } },
             boardingPoints: true,
             supervisors: { where: { isPrimary: true }, select: { user: { select: { name: true } } } },
+            drivers: { where: { isPrimary: true }, select: { user: { select: { name: true } } } },
           },
         },
         passengers: { select: { id: true, fullName: true, phone: true, nationalId: true, notes: true, roomNote: true, seatNumber: true, hotelRoom: { select: { number: true, type: true, hotelBooking: { select: { hotel: { select: { id: true, name: true } } } } } }, ticket: TICKET_SELECT } },

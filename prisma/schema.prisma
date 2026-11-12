@@ -52,6 +52,12 @@ enum PackageStatus {
   ARCHIVED
 }
 
+/// A fixed package is the company's, sold on its trips at set totals. A custom one the customer builds: any outbound and return on its route, priced by the night.
+enum PackageKind {
+  FIXED
+  CUSTOM
+}
+
 enum WalletTransactionType {
   CREDIT_ADDED
   DEBIT_SPENT
@@ -339,6 +345,8 @@ model User {
   loyaltyActivityAt   DateTime?
   /// Chosen from NATIONALITIES by the customer or staff; the customers' audience filter reads it.
   nationality         String?
+  /// Chosen from CUSTOMER_CITIES when the customer first opens the app; the customers list filters by it.
+  city                String?
   gender              Gender?
   /// Chosen by the customer at registration: national ID, iqama or passport. Both are set together or neither.
   idType              IdType?
@@ -394,6 +402,10 @@ model User {
   crewAssignments     CrewAssignmentLog[]
   /// When the customer's photo last changed; null while they have none. The bytes live in UserPhoto.
   photoUpdatedAt      DateTime?
+  /// The customer's own reminders before the miqat and their gathering point. Null minutes follow the trip's.
+  tripAlertsEnabled   Boolean              @default(true)
+  alertLeadMinutes    Int?
+  alertRepeatMinutes  Int?
   photo               UserPhoto?
   customerComplaints  CustomerComplaint[]
 
@@ -495,6 +507,9 @@ model Trip {
   crewOpenAnnouncedAt        DateTime?
   boardingOpenAnnouncedAt    DateTime?
   boardingCloseAnnouncedAt   DateTime?
+  /// When the office sent the passenger manifest to the crew; from then the crew reads it in the app, without phone numbers, before the trip opens.
+  manifestSentAt             DateTime?
+  manifestSentByName         String?
   tripStatus                 TripStatus            @default(DRAFT)
   scheduleType               TripScheduleType      @default(TEMPORARY)
   /// Which calendar a fixed trip repeats on; the employee picks it per trip.
@@ -541,10 +556,13 @@ model Trip {
   privateRoomPrice           Decimal?              @db.Decimal(10, 2)
   privateRoomCapacity        Int?
   housingPriceMode           HousingPriceMode      @default(INCLUDED_IN_BASE)
-  privateRoomPriceBasis      PrivateRoomPriceBasis @default(PER_ROOM)
+  privateRoomPriceBasis      PrivateRoomPriceBasis @default(PER_BOOKING)
   housingPricePeriod         HousingPricePeriod    @default(PER_STAY)
   /// Beds in each shared room, set by whoever creates the trip. The supervisor is refused beyond it.
   sharedRoomCapacity         Int                   @default(4)
+  /// How long before the miqat and the gathering point passengers are reminded, and how often it repeats until then. Null uses the company's defaults.
+  alertLeadMinutes           Int?
+  alertRepeatMinutes         Int?
   housingSheet               TripHousingSheet?
   hotelBookings              HotelBooking[]
   custodies                  Custody[]
@@ -721,28 +739,41 @@ model Accommodation {
 }
 
 model Package {
-  id          String           @id @default(uuid())
-  name        String
-  description String?
+  id               String           @id @default(uuid())
+  name             String
+  description      String?
   /// What one person pays for the whole package. A package is sold to one to four people, each size at its own total.
-  price       Decimal          @db.Decimal(10, 2)
+  price            Decimal          @db.Decimal(10, 2)
   /// The total for two people together, not each.
-  price2      Decimal          @db.Decimal(10, 2)
+  price2           Decimal          @db.Decimal(10, 2)
   /// The total for three people together.
-  price3      Decimal          @db.Decimal(10, 2)
+  price3           Decimal          @db.Decimal(10, 2)
   /// The total for four people together, the most one package booking takes.
-  price4      Decimal          @db.Decimal(10, 2)
-  nights      Int              @default(1)
-  type        String           @default("OMRA")
-  startDate   DateTime?
-  endDate     DateTime?
-  status      PackageStatus    @default(DRAFT)
-  terms       String?
-  createdAt   DateTime         @default(now())
-  updatedAt   DateTime         @updatedAt
-  trips       Trip[]
-  images      PackageImage[]
-  services    PackageService[]
+  price4           Decimal          @db.Decimal(10, 2)
+  nights           Int              @default(1)
+  type             String           @default("OMRA")
+  startDate        DateTime?
+  endDate          DateTime?
+  status           PackageStatus    @default(DRAFT)
+  terms            String?
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+  trips            Trip[]
+  images           PackageImage[]
+  services         PackageService[]
+  kind             PackageKind      @default(FIXED)
+  /// A custom package's route: the outbound runs origin to destination and the return back.
+  origin           String?
+  destination      String?
+  hotelId          String?
+  hotel            Hotel?           @relation(fields: [hotelId], references: [id], onDelete: Restrict)
+  /// What one bed in a shared room costs a person a night.
+  nightlyBedPrice  Decimal?         @db.Decimal(10, 2)
+  /// What a private room costs a night, whoever shares it.
+  nightlyRoomPrice Decimal?         @db.Decimal(10, 2)
+  /// The customer picks any outbound leaving at this hour or later, in Riyadh time.
+  minDepartureHour Int              @default(17)
+  bookings         Booking[]
 }
 
 model PackageImage {
@@ -996,6 +1027,9 @@ model Booking {
   pointsDiscount      Decimal              @default(0) @db.Decimal(10, 2)
   loyaltyPlan         Json?
   loyaltySettledAt    DateTime?
+  /// The customer-built package this booking belongs to.
+  customPackageId     String?
+  customPackage       Package?             @relation(fields: [customPackageId], references: [id], onDelete: Restrict)
 
   @@index([userId])
   @@index([tripId])
@@ -1003,6 +1037,9 @@ model Booking {
   @@index([groupReference])
   @@index([branchId])
   @@index([stayHotelId])
+  @@index([createdById])
+  @@index([cancelReviewedById])
+  @@index([customPackageId])
 }
 
 model BookingPassenger {
@@ -1014,6 +1051,11 @@ model BookingPassenger {
   nationalId      String?
   notes           String?
   seatNumber      String
+  /// The order the passengers were entered in; the first is the booking's owner, who carries the private room's price.
+  position        Int              @default(0)
+  gender          Gender?
+  /// From NATIONALITIES, as for customers.
+  nationality     String?
   roomNote        String?
   hotelRoomId     String?
   hotelRoom       HotelRoom?       @relation(fields: [hotelRoomId], references: [id], onDelete: SetNull)
@@ -1189,13 +1231,14 @@ model Hotel {
   privateRoomPrice      Decimal?              @db.Decimal(10, 2)
   privateRoomCapacity   Int?
   housingPriceMode      HousingPriceMode      @default(INCLUDED_IN_BASE)
-  privateRoomPriceBasis PrivateRoomPriceBasis @default(PER_ROOM)
+  privateRoomPriceBasis PrivateRoomPriceBasis @default(PER_BOOKING)
   housingPricePeriod    HousingPricePeriod    @default(PER_STAY)
   createdAt             DateTime              @default(now())
   bookings              HotelBooking[]
   complaints            HotelComplaint[]
   roomBlocks            HotelRoomBlock[]
   customerStays         Booking[]
+  packages              Package[]
 }
 
 model HotelBooking {
@@ -1273,6 +1316,8 @@ model HotelComplaint {
   roomNumber          String?
   resolution          String?
   resolvedAt          DateTime?
+  /// The employee who closed it, so their record counts it.
+  resolvedById        String?
   resolvedByName      String?
   createdById         String?
   createdByName       String?
@@ -1280,6 +1325,7 @@ model HotelComplaint {
   updatedAt           DateTime             @updatedAt
 
   @@index([hotelId, status])
+  @@index([resolvedById])
   @@index([passengerId])
   @@index([bookingId])
 }
@@ -1333,12 +1379,15 @@ model CustomerComplaint {
   customerPhone   String?
   resolution      String?
   resolvedAt      DateTime?
+  /// The employee who answered it, so their record counts it; the name stays for the screen.
+  resolvedById    String?
   resolvedByName  String?
   createdAt       DateTime                  @default(now())
   updatedAt       DateTime                  @updatedAt
 
   @@index([status, category])
   @@index([userId])
+  @@index([resolvedById])
 }
 
 /// Append-only history of a booking; a database trigger rejects UPDATE and DELETE.
@@ -1430,6 +1479,7 @@ model AuditLog {
 
   @@index([userId])
   @@index([action])
+  @@index([userId, createdAt])
 }
 
 model Coupon {
@@ -2578,4 +2628,10 @@ model PromoOffer {
   updatedAt    DateTime       @updatedAt
 
   @@index([isActive, priority])
+}
+
+/// One reminder sent to one booking before a stop; the key holds the stop and the repeat, so each goes once.
+model TripReminderLog {
+  key       String   @id
+  createdAt DateTime @default(now())
 }

@@ -290,6 +290,72 @@ describe('Reverse trips (e2e)', () => {
     });
   });
 
+  describe('opening', () => {
+    it('opens as soon as the outbound is published, however far ahead and however empty', async () => {
+      const departure = Date.now() + 120 * DAY;
+      const trip = (await request(http()).post(`${API}/trips`).set(admin.auth).send(tripPayload({
+        direction: 'ROUND_TRIP',
+        departureTime: new Date(departure).toISOString(),
+        arrivalTime: new Date(departure + 5 * HOUR).toISOString(),
+        estimatedArrivalAt: new Date(departure + 5 * HOUR).toISOString(),
+        reverseEnabled: true,
+        reverseOpenPercent: 80,
+        reverseDepartureAt: new Date(departure + 8 * HOUR).toISOString(),
+        reversePrice: 90,
+      })).expect(201)).body;
+
+      const all = (await request(http()).get(`${API}/trips/admin/reverse`).set(admin.auth).expect(200)).body;
+      expect(all.find((row: any) => row.id === trip.id)).toMatchObject({ status: 'READY', reachedPercent: false });
+      const month = (await request(http()).get(`${API}/trips/admin/reverse?range=month`).set(admin.auth).expect(200)).body;
+      expect(month.some((row: any) => row.id === trip.id)).toBe(false);
+
+      const reverse = await openReverse(trip.id);
+      expect(reverse.totalSeats).toBe(trip.totalSeats);
+      // A seat the outbound sells afterwards is kept for its passenger on the way back.
+      await book(trip.id, ['1']);
+      expect((await prisma.trip.findUniqueOrThrow({ where: { id: reverse.id } })).availableSeats).toBe(trip.totalSeats - 1);
+    });
+  });
+
+  describe('route and gathering points', () => {
+    it('opens with its own gathering points and route, offers the outbound route reversed, and edits them later', async () => {
+      const trip = await createOutbound('ONE_WAY', {
+        itineraryStops: [{ title: 'الطائف', time: '10:00', kind: 'STOP' }, { title: 'ميقات السيل', time: '11:00', kind: 'MIQAT' }],
+      });
+      await book(trip.id, ['1']);
+      const before = await reverseRow(trip.id);
+      expect(before.outboundStops.map((stop: any) => stop.title)).toEqual(['الطائف', 'ميقات السيل']);
+
+      await request(http()).post(`${API}/trips/${trip.id}/open-reverse`).set(admin.auth).send({}).expect(400);
+      await request(http()).post(`${API}/trips/${trip.id}/open-reverse`).set(admin.auth)
+        .send({ boardingPoints: [{ name: 'فندق العزيزية', time: '' }] }).expect(400);
+
+      const reverse = await openReverse(trip.id, {
+        boardingPointName: undefined,
+        boardingPoints: [{ name: 'فندق العزيزية', time: '20:00', address: 'شارع الحج' }, { name: 'محطة الحرم', time: '20:30' }],
+        itineraryStops: [{ title: 'الطائف', time: '22:00', kind: 'REST' }],
+      });
+      expect(reverse.boardingPoints.map((point: any) => point.name).sort()).toEqual(['فندق العزيزية', 'محطة الحرم']);
+      expect(reverse.itineraryStops).toEqual([expect.objectContaining({ title: 'الطائف', time: '22:00', kind: 'REST' })]);
+
+      const row = await reverseRow(trip.id);
+      expect(row.reverse.boardingPoints).toHaveLength(2);
+      expect(row.reverse.itineraryStops.map((stop: any) => stop.title)).toEqual(['الطائف']);
+
+      await edit(reverse.id, { boardingPoints: [{ name: 'محطة الحرم', time: '21:00' }], itineraryStops: [] }).expect(200);
+      const after = await reverseRow(trip.id);
+      expect(after.reverse.boardingPoints.map((point: any) => point.name)).toEqual(['محطة الحرم']);
+      expect(after.reverse.itineraryStops).toEqual([]);
+    });
+
+    it('still opens with a single point name', async () => {
+      const trip = await createOutbound('ONE_WAY');
+      await book(trip.id, ['1']);
+      const reverse = await openReverse(trip.id);
+      expect(reverse.boardingPoints).toEqual([expect.objectContaining({ name: 'فندق العزيزية' })]);
+    });
+  });
+
   describe('the reverse screen', () => {
     it('counts real bookings, not seats closed by the link', async () => {
       const trip = await createOutbound('ROUND_TRIP');

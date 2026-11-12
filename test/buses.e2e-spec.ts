@@ -307,8 +307,6 @@ describe('Buses, drivers and office statements (e2e)', () => {
         reverseDepartureAt: new Date(Date.now() + 3000 * 24 * 3600000).toISOString(),
         reversePrice: 100,
       });
-      // Skips filling half the seats, which is not what this test is about.
-      await prisma.trip.update({ where: { id: outbound.id }, data: { reverseOpenPercent: 0 } });
       const reverse = await request(http()).post(`${API}/trips/${outbound.id}/open-reverse`).set(admin.auth).send({ boardingPointName: 'مكة' }).expect(201);
       expect(reverse.body.services.map((s: any) => s.serviceId)).toEqual([charger.id]);
     });

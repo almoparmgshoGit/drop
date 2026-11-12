@@ -17,6 +17,7 @@ import { allocate, BookingsService, holdAvailableTo, randomCode, toSar } from '.
 import { CashActor, CashService } from '../cash/cash.service';
 import { CollectionsService } from '../cash/collections.service';
 import { CreateJourneyDto, JourneyQuoteDto, TripSearchQuery } from './branches.dto';
+import { cityTripWhere, servedCity } from '../../common/utils/branch-city.util';
 import { PACKAGE_PRICE_SELECT, packageGroupTotal, packagePriceTiers } from '../../common/utils/package-price.util';
 
 type Db = Prisma.TransactionClient;
@@ -130,9 +131,16 @@ export class BranchBookingsService {
     };
   }
 
-  async searchTrips(query: TripSearchQuery) {
+  async searchTrips(query: TripSearchQuery, actor?: { userId: string; permissions: string[] }) {
     const now = new Date();
-    const open = { tripStatus: 'PUBLISHED' as const, channelBranch: true, departureTime: { gt: now }, OR: [{ packageId: null }, { package: { status: 'PUBLISHED' as const } }] };
+    // A city's branch sells its city's trips: leaving from it or arriving at it.
+    const city = actor ? await servedCity(this.prisma, actor) : null;
+    const open: Prisma.TripWhereInput = {
+      tripStatus: 'PUBLISHED' as const,
+      channelBranch: true,
+      departureTime: { gt: now },
+      AND: [{ OR: [{ packageId: null }, { package: { status: 'PUBLISHED' as const } }] }, ...(city ? [cityTripWhere(city)] : [])],
+    };
     const day = query.date ? new Date(`${query.date}T00:00:00+03:00`) : null;
     const [items, places] = await Promise.all([
       this.prisma.trip.findMany({
@@ -157,13 +165,16 @@ export class BranchBookingsService {
           bookingType: true,
           package: { select: PACKAGE_PRICE_SELECT },
           boardingPoints: { select: { id: true, name: true, time: true } },
+          hotelBookings: { where: { status: 'CONFIRMED' }, select: { hotelId: true } },
         },
       }),
       this.prisma.trip.findMany({ where: open, distinct: ['origin', 'destination'], select: { origin: true, destination: true } }),
     ]);
     return {
-      items: items.map(({ package: pack, price, ...trip }) => ({
+      items: items.map(({ package: pack, price, hotelBookings, ...trip }) => ({
         ...trip,
+        // The counter starts the stay at the trip's own hotel, whose price the trip already set.
+        hotelIds: [...new Set(hotelBookings.map((row) => row.hotelId))],
         price: Number(pack?.price ?? price),
         packagePriceTiers: pack ? packagePriceTiers(pack) : null,
       })),
@@ -214,7 +225,7 @@ export class BranchBookingsService {
     // A companion booked under someone else's account can still be found by the phone typed for them.
     const where: Prisma.BookingWhereInput = { OR: [{ user: { phone } }, { passengers: { some: { phone: { in: [phone, `0${local}`, local, `966${local}`] } } } }] };
     const [user, bookings, total, cancelled, boarded] = await Promise.all([
-      this.prisma.user.findUnique({ where: { phone }, select: { name: true, idType: true, idNumber: true, createdAt: true } }),
+      this.prisma.user.findUnique({ where: { phone }, select: { name: true, idType: true, idNumber: true, gender: true, nationality: true, createdAt: true } }),
       this.prisma.booking.findMany({
         where,
         orderBy: { createdAt: 'desc' },
@@ -246,7 +257,7 @@ export class BranchBookingsService {
       // A trip counts as ridden once anyone on the booking was scanned onto the bus.
       this.prisma.booking.count({ where: { AND: [where, { OR: [{ status: 'BOARDED' }, { tickets: { some: { isBoarded: true } } }] }] } }),
     ]);
-    if (!user && bookings.length === 0) return { found: false, name: null, nationalId: null, idType: null, lastBoardingPoint: null, stats: null, history: [] };
+    if (!user && bookings.length === 0) return { found: false, name: null, nationalId: null, idType: null, gender: null, nationality: null, lastBoardingPoint: null, stats: null, history: [] };
 
     // This phone's own passenger row comes first; the account holder is the fallback.
     const own = (booking: (typeof bookings)[number]) =>
@@ -262,6 +273,9 @@ export class BranchBookingsService {
       found: true,
       name: user?.name || lastNamed?.fullName || null,
       nationalId,
+      // What the counter fills for the first passenger when the customer is known.
+      gender: user?.gender ?? null,
+      nationality: user?.nationality ?? null,
       idType: user?.idNumber ? user.idType : null,
       lastBoardingPoint,
       stats: {
@@ -457,9 +471,12 @@ export class BranchBookingsService {
     const offers: RoomType[] = [...(hotel.offersSharedRoom ? (['SHARED'] as const) : []), ...(hotel.offersPrivateRoom ? (['PRIVATE'] as const) : [])];
     if (!offers.includes(stay.roomType)) throw new BadRequestException('نوع السكن المختار غير متاح في هذا الفندق');
 
-    // A trip already sold with this hotel keeps its own terms. A hotel the counter adds to a plain trip is not part of its base price, so it is always charged on top.
+    // The trip's own housing price decides the charge: first a trip already sold with this hotel, then any trip of the journey
+    // whose housing price was set when it was created. Only a trip with no housing price at all falls back on the hotel's rate,
+    // and that hotel is not part of its base price, so it is charged on top.
     const tripWithHotel = trips.find((trip) => trip.hotelBookings.some((booking) => booking.hotelId === hotel.id));
-    const terms: HousingTerms = tripWithHotel ?? {
+    const tripWithHousingPrice = trips.find((trip) => trip.housingPrice !== null || trip.privateRoomPrice !== null);
+    const terms: HousingTerms = tripWithHotel ?? tripWithHousingPrice ?? {
       housingPrice: hotel.bedPrice,
       privateRoomPrice: hotel.privateRoomPrice,
       privateRoomCapacity: hotel.privateRoomCapacity,
@@ -505,6 +522,8 @@ export class BranchBookingsService {
     const passengers = dto.passengers.map((passenger, index) => ({
       fullName: passenger.fullName,
       nationalId: passenger.nationalId || null,
+      gender: passenger.gender ?? null,
+      nationality: passenger.nationality ?? null,
       // Reaching the first passenger is what the customer's phone is for.
       phone: passenger.phone?.trim() ? normalizeSaudiPhone(passenger.phone) : index === 0 ? phone : null,
     }));
@@ -572,7 +591,7 @@ export class BranchBookingsService {
               boardingPointName: point?.name,
               boardingPointTime: point?.time,
               idempotencyKey: keyOf(index),
-              passengers: { create: passengers.map((passenger, position) => ({ ...passenger, seatNumber: leg.seats[position] })) },
+              passengers: { create: passengers.map((passenger, position) => ({ ...passenger, position, seatNumber: leg.seats[position] })) },
               // What is owed until the collections below settle it, the same as any booking paid at a counter.
               payment: { create: { amount: toSar(leg.total), currency: 'SAR', status: leg.total === 0 ? 'COMPLETED' : 'PENDING', method: null } },
             },

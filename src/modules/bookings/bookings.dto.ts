@@ -18,7 +18,7 @@ import {
   Min,
   ValidateNested,
 } from 'class-validator';
-import { BookingCategory, BookingStatus, RefundDestination, RoomType } from '@prisma/client';
+import { BookingCategory, BookingStatus, Gender, RefundDestination, RoomType } from '@prisma/client';
 
 const SEAT_NUMBER = /^\d{1,3}$/;
 const trimmed = () => Transform(({ value }) => (typeof value === 'string' ? value.trim() : value));
@@ -54,6 +54,11 @@ export class PassengerDto {
   @IsString()
   @MaxLength(20)
   phone?: string;
+
+  /** Optional so an app installed before it was asked still books. */
+  @IsOptional()
+  @IsEnum(Gender)
+  gender?: Gender;
 }
 
 export class QuoteDto {
@@ -82,6 +87,17 @@ export class QuoteDto {
   @IsOptional()
   @IsEnum(BookingCategory)
   category?: BookingCategory;
+
+  /** The customer is booking the bus alone: a trip's hotel is left out and not charged. */
+  @IsOptional()
+  @IsBoolean()
+  transportOnly?: boolean;
+
+  /** A package the customer builds: legs are its outbound then its return, and the first leg's roomChoice is the stay's room. */
+  @IsOptional()
+  @IsString()
+  @Length(1, 60)
+  customPackageId?: string;
 }
 
 export class CreateBookingDto extends QuoteDto {

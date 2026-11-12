@@ -248,6 +248,21 @@ describe('Branches, their staff and counter bookings', () => {
       expect(hotels.body[0]).not.toHaveProperty('nightlyRate');
     });
 
+    it('prices a counter stay by the housing price set on the trip, not the hotel rate', async () => {
+      const priced = (await request(http()).post(`${API}/trips`).set(admin.auth).send(tripPayload({ price: 120, housingPrice: 90, housingPriceMode: 'ADDED_TO_BASE', housingPricePeriod: 'PER_NIGHT' })).expect(201)).body;
+      const checkIn = dateOf(priced.departureTime);
+      const checkOut = new Date(new Date(checkIn).getTime() + 2 * 86_400_000).toISOString().slice(0, 10);
+      const res = await request(http()).post(`${API}/branch-bookings/quote`).set(clerk.auth).send({
+        kind: 'PACKAGE_OUTBOUND_STAY',
+        legs: [{ leg: 'OUTBOUND', tripId: priced.id, seats: ['40', '41'] }],
+        stay: { hotelId, roomType: 'SHARED', checkIn, checkOut },
+      }).expect(201);
+      // 90 a bed a night from the trip, for 2 people and 2 nights; the hotel's own 80 would give 320.
+      expect(res.body.stay.amount).toBe(360);
+      expect(res.body.legs[0].pricePerSeat).toBe(120);
+      expect(res.body.listTotal).toBe(240 + 360);
+    });
+
     it('creates one linked booking per trip, carries the stay on the first, and fills invoices in order', async () => {
       const seats = ['33', '34'];
       const stay = stayBody();

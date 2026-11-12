@@ -327,6 +327,20 @@ export class CreateTripDto {
   @Max(50)
   sharedRoomCapacity?: number;
 
+  /** How long before the miqat and each gathering point passengers are reminded. Null uses the company's rule. */
+  @IsOptional()
+  @IsInt()
+  @Min(5)
+  @Max(1440)
+  alertLeadMinutes?: number | null;
+
+  /** How often the reminder repeats until the moment; 0 sends it once. */
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  @Max(720)
+  alertRepeatMinutes?: number | null;
+
   @IsOptional()
   @IsEnum(HousingPriceMode)
   housingPriceMode?: HousingPriceMode;
@@ -394,9 +408,27 @@ export class CreateTripDto {
 export class UpdateTripDto extends PartialType(CreateTripDto) {}
 
 export class OpenReverseTripDto {
+  /** A single gathering point by name, for callers that send only that; boardingPoints takes its place when given. */
+  @IsOptional()
   @IsString()
   @Length(1, 150)
-  boardingPointName: string;
+  boardingPointName?: string;
+
+  /** Where passengers of the way back gather: one at least, here or as boardingPointName. */
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(20)
+  @ValidateNested({ each: true })
+  @Type(() => BoardingPointDto)
+  boardingPoints?: BoardingPointDto[];
+
+  /** The stops on the way back, in road order. */
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(50)
+  @ValidateNested({ each: true })
+  @Type(() => ItineraryStopDto)
+  itineraryStops?: ItineraryStopDto[];
 
   @IsOptional()
   @IsBoolean()
@@ -416,6 +448,7 @@ export class StopSeriesDto {
 
 export class ReverseTripsQuery {
   @IsOptional()
-  @IsIn(['week', 'month'])
-  range?: 'week' | 'month';
+  /** Without a range, every upcoming trip: a reverse can be opened as soon as its outbound is published. */
+  @IsIn(['week', 'month', 'all'])
+  range?: 'week' | 'month' | 'all';
 }

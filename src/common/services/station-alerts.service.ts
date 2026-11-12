@@ -27,6 +27,10 @@ const TX_OPTIONS = { maxWait: 10_000, timeout: 30_000 };
 export const DESTINATION_KEY = 'destination';
 const ROOM_NOT_SET = 'تُحدد عند الوصول';
 const HOLD_GRACE_MS = HOUR_MS;
+/** How often a reminder repeats until the moment, when neither the trip nor the passenger chose. */
+export const DEFAULT_REMINDER_REPEAT_MINUTES = 15;
+/** The longest anyone may ask to be reminded ahead, which is also how far ahead the sweep looks. */
+export const MAX_REMINDER_LEAD_MINUTES = 24 * 60;
 
 const TRIP_SELECT = {
   id: true,
@@ -48,6 +52,8 @@ const TRIP_SELECT = {
   itineraryStops: { orderBy: { sortOrder: 'asc' }, select: { id: true, time: true, title: true, desc: true, kind: true } },
   statusUpdates: { orderBy: { createdAt: 'asc' }, select: { status: true, boardingPointId: true, pointName: true, createdAt: true } },
   stationRules: { select: { ruleKey: true, isActive: true } },
+  alertLeadMinutes: true,
+  alertRepeatMinutes: true,
 } satisfies Prisma.TripSelect;
 
 type WatchedTrip = Prisma.TripGetPayload<{ select: typeof TRIP_SELECT }>;
@@ -219,16 +225,7 @@ export class StationAlertsService {
       }
     }
 
-    const miqat = rules.get('MIQAT');
-    if (miqat?.isActive && trip.liveStatus !== 'NOT_STARTED' && trip.liveStatus !== 'ARRIVED') {
-      for (const stop of trip.itineraryStops.filter((row) => row.kind === 'MIQAT')) {
-        const stopAt = trip.departureTime.getTime() + minutesAfterDeparture(stop.time, trip.departureTime) * MINUTE_MS;
-        const left = stopAt - now;
-        if (left > 0 && left <= (miqat.minutes ?? 30) * MINUTE_MS) {
-          await this.announce(trip, 'MIQAT', { name: stop.title }, await this.travelling(this.prisma, trip), { stopName: stop.title, minutes: Math.ceil(left / MINUTE_MS) });
-        }
-      }
-    }
+    // The miqat and gathering reminders go to each passenger on their own schedule, in sweepPassengerReminders.
 
     const destination = rules.get('DESTINATION');
     if (destination?.isActive && trip.liveStatus === 'ARRIVED') {
@@ -244,6 +241,82 @@ export class StationAlertsService {
       );
       await this.announce(trip, 'DESTINATION', { name: trip.destination }, [], {}, values);
     }
+  }
+
+  /**
+   * Reminders before the miqat and before each passenger's gathering point, from the trip's schedule rather than the bus's
+   * position, so they reach passengers even when the crew has not started the trip in the app. Each starts its lead time
+   * ahead and repeats every interval until the moment: the passenger's own choice first, then the trip's, then the company's.
+   */
+  async sweepPassengerReminders() {
+    const now = Date.now();
+    const trips = await this.prisma.trip.findMany({
+      where: {
+        tripStatus: 'PUBLISHED',
+        liveStatus: { not: 'ARRIVED' },
+        departureTime: { lte: new Date(now + MAX_REMINDER_LEAD_MINUTES * MINUTE_MS), gte: new Date(now - 24 * HOUR_MS) },
+      },
+      select: {
+        ...TRIP_SELECT,
+        bookings: {
+          where: { status: { in: [...TRAVELING_STATUSES] } },
+          select: { id: true, boardingPointName: true, boardingPointTime: true, user: { select: { tripAlertsEnabled: true, alertLeadMinutes: true, alertRepeatMinutes: true } } },
+        },
+      },
+    });
+    if (trips.length === 0) return;
+    const rules = await this.rules();
+    for (const trip of trips) {
+      try {
+        const active = this.activeRules(trip, rules);
+        const gathering = active.get('GATHERING');
+        const miqat = active.get('MIQAT');
+        const momentOf = (time: string) => trip.departureTime.getTime() + minutesAfterDeparture(time, trip.departureTime) * MINUTE_MS;
+        const miqatStops = miqat?.isActive ? trip.itineraryStops.filter((stop) => stop.kind === 'MIQAT' && stop.time) : [];
+        const remindedOfMiqat = new Map<string, number>();
+
+        for (const booking of trip.bookings) {
+          if (!booking.user.tripAlertsEnabled) continue;
+          const repeat = booking.user.alertRepeatMinutes ?? trip.alertRepeatMinutes ?? DEFAULT_REMINDER_REPEAT_MINUTES;
+          const leadFor = (rule: { minutes: number | null } | undefined) => booking.user.alertLeadMinutes ?? trip.alertLeadMinutes ?? rule?.minutes ?? 30;
+          const moments: { key: StationRuleKey; name: string; at: number; lead: number }[] = [];
+          // Once the bus is on the road, the crew's live alerts take over at the points.
+          if (gathering?.isActive && booking.boardingPointTime && booking.boardingPointName && trip.liveStatus === 'NOT_STARTED') {
+            moments.push({ key: 'GATHERING', name: booking.boardingPointName, at: momentOf(booking.boardingPointTime), lead: leadFor(gathering) });
+          }
+          for (const stop of miqatStops) moments.push({ key: 'MIQAT', name: stop.title, at: momentOf(stop.time), lead: leadFor(miqat) });
+
+          for (const moment of moments) {
+            const left = moment.at - now;
+            const lead = Math.min(moment.lead, MAX_REMINDER_LEAD_MINUTES) * MINUTE_MS;
+            if (left <= 0 || left > lead) continue;
+            // Which repeat this is: the first at the lead time, then one every interval until the moment.
+            const round = repeat > 0 ? Math.floor((lead - left) / (repeat * MINUTE_MS)) : 0;
+            const sent = await this.remind(booking.id, moment.key, moment.name, round, { stopName: moment.name, minutes: Math.max(1, Math.round(left / MINUTE_MS)) });
+            if (sent && moment.key === 'MIQAT') remindedOfMiqat.set(moment.name, (remindedOfMiqat.get(moment.name) ?? 0) + 1);
+          }
+        }
+        // The route page shows the miqat reminder as sent once its first round went out.
+        for (const [name, count] of remindedOfMiqat) {
+          await this.prisma.stationAlert.createMany({
+            data: [{ tripId: trip.id, stopKey: name, stopName: name, ruleKey: 'MIQAT', message: STATION_RULES.MIQAT.label, recipients: count, channels: ['AUTO'], dedupeKey: `${trip.id}:MIQAT:${name}` }],
+            skipDuplicates: true,
+          });
+        }
+      } catch (err) {
+        this.logger.error(`Passenger reminders for trip ${trip.id} failed: ${(err as Error).message}`);
+      }
+    }
+  }
+
+  /** One round of one reminder to one booking, claimed in the transaction it is sent in, so it goes once on any number of servers. */
+  private async remind(bookingId: string, key: StationRuleKey, stopName: string, round: number, values: NotificationValues) {
+    return this.prisma.$transaction(async (tx) => {
+      const claimed = await tx.tripReminderLog.createMany({ data: [{ key: `${bookingId}:${key}:${stopName}:${round}` }], skipDuplicates: true });
+      if (claimed.count === 0) return false;
+      await this.notifications.toBookingOwners(tx, STATION_RULES[key].event, [bookingId], values);
+      return true;
+    }, TX_OPTIONS);
   }
 
   /** The day-before reminder, told once per trip. */
@@ -351,9 +424,10 @@ export class StationAlertsService {
             alertState('BEFORE_STOP', leg.name, {}, leg.isPassed || leg.isCurrent),
             alertState('AT_STOP', leg.name, {}, leg.isPassed),
             alertState('LATE_BOARDING', leg.name, leg.isCurrent ? { label: `بعد ${lateMinutes} د` } : {}, leg.isPassed),
+            alertState('GATHERING', leg.name, { label: `قبل ${trip.alertLeadMinutes ?? active.get('GATHERING')?.minutes ?? 60} د` }, leg.isPassed || leg.isCurrent || trip.liveStatus !== 'NOT_STARTED'),
           ]
         : leg.kind === 'MIQAT'
-          ? [alertState('MIQAT', leg.name, { at: new Date(trip.departureTime.getTime() + (minutesAfterDeparture(leg.time, trip.departureTime) - (active.get('MIQAT')?.minutes ?? 30)) * MINUTE_MS) }, leg.isPassed)]
+          ? [alertState('MIQAT', leg.name, { at: new Date(trip.departureTime.getTime() + (minutesAfterDeparture(leg.time, trip.departureTime) - (trip.alertLeadMinutes ?? active.get('MIQAT')?.minutes ?? 30)) * MINUTE_MS) }, leg.isPassed)]
           : [];
       return {
         key: leg.name,

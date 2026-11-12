@@ -37,16 +37,16 @@ export class ServicesController {
   }
 
   @Post()
-  @RequirePermission('packages.manage', 'trips.manage', 'buses.manage')
+  @RequirePermission('packages.manage', 'trips.manage', 'buses.manage', 'hotels.manage')
   @ApiBearerAuth()
   @ApiOperation({ summary: 'Create new service' })
   async createService(@Body() dto: CreateServiceDto) {
     return this.servicesService.createService(dto);
   }
 
-  /** Renaming changes the service everywhere it appears: trips, packages and buses. */
+  /** Renaming changes the service everywhere it appears: trips, packages, buses and hotels, so whoever manages any of them may. */
   @Put(':id')
-  @RequirePermission('packages.manage')
+  @RequirePermission('packages.manage', 'trips.manage', 'buses.manage', 'hotels.manage')
   @ApiBearerAuth()
   @ApiOperation({ summary: 'Update service' })
   async updateService(@Param('id') id: string, @Body() dto: UpdateServiceDto) {

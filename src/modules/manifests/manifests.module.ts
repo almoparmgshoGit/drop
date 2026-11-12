@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Module, Param, Put, Req } from '@nestjs/common';
+import { Body, Controller, Get, Module, Param, Post, Put, Req } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { ArrayMaxSize, IsArray, IsObject, IsOptional, IsString, MaxLength } from 'class-validator';
 import { RequirePermission } from '../../common/decorators/auth.decorators';
@@ -31,6 +31,13 @@ class ManifestsController {
   @ApiOperation({ summary: 'Passenger, housing and seat sheets of a trip' })
   getManifest(@Req() req, @Param('tripId') tripId: string) {
     return this.manifests.getManifest(req.user, tripId);
+  }
+
+  @Post(':tripId/send-to-crew')
+  @RequirePermission('manifests.view')
+  @ApiOperation({ summary: 'Send the passenger list to the trip drivers and supervisors in the app, without phone numbers' })
+  sendToCrew(@Req() req, @Param('tripId') tripId: string) {
+    return this.manifests.sendToCrew(req.user, tripId);
   }
 
   @Put(':tripId/housing-sheet')
