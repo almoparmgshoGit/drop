@@ -22,6 +22,7 @@ import { CollectionsService } from '../cash/collections.service';
 import { CreateJourneyDto, JourneyQuoteDto, TripSearchQuery } from './branches.dto';
 import { cityTripWhere, servedCity } from '../../common/utils/branch-city.util';
 import { PACKAGE_PRICE_SELECT, packageGroupTotal, packagePriceTiers } from '../../common/utils/package-price.util';
+import { assertBookingOpened, bookingOpenedWhere } from '../../common/utils/booking-opens.util';
 
 type Db = Prisma.TransactionClient;
 
@@ -46,6 +47,7 @@ const JOURNEY_TRIP = {
   departureTime: true,
   tripStatus: true,
   channelBranch: true,
+  bookingOpensAt: true,
   price: true,
   totalSeats: true,
   availableSeats: true,
@@ -144,7 +146,8 @@ export class BranchBookingsService {
       tripStatus: 'PUBLISHED' as const,
       channelBranch: true,
       departureTime: { gt: now },
-      AND: [{ OR: [{ packageId: null }, { package: { status: 'PUBLISHED' as const } }] }, ...(city ? [cityTripWhere(city)] : [])],
+      // The counter sells only what the app could: a trip waiting for its opening day stays out of the picker.
+      AND: [{ OR: [{ packageId: null }, { package: { status: 'PUBLISHED' as const } }] }, bookingOpenedWhere(now), ...(city ? [cityTripWhere(city)] : [])],
     };
     const day = query.date ? new Date(`${query.date}T00:00:00+03:00`) : null;
     const [items, places] = await Promise.all([
@@ -390,6 +393,7 @@ export class BranchBookingsService {
     // A package's trips go on sale with it, the same rule as the app.
     if (trip.package && trip.package.status !== 'PUBLISHED') throw new BadRequestException(`باقة الرحلة ${trip.tripCode} غير منشورة`);
     if (trip.departureTime <= new Date()) throw new BadRequestException(`انتهى موعد الحجز للرحلة ${trip.tripCode}`);
+    assertBookingOpened(trip);
   }
 
   /** The only place a branch price is calculated: the screen shows the result and never supplies a listed amount. */

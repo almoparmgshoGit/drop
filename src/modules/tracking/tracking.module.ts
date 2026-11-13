@@ -8,18 +8,49 @@ import { RealtimeService } from '../../common/services/realtime.service';
 import { RoutingService } from '../../common/services/routing.service';
 import { CREW_WINDOW_SELECT, crewWindow } from '../../common/utils/crew-window.util';
 import { distanceInMeters } from '../../common/utils/geo.util';
+import { bookedOnTrips } from '../../common/utils/linked-seats.util';
 import { formatRiyadhTime } from '../../common/utils/time.util';
 import { boardingOfBookings } from '../../common/utils/ticket-boarding.util';
 import { tripDayWindow } from '../../common/utils/trip-day.util';
-import { clockMinutes, markPassedLegs, orderRouteLegs } from '../../common/utils/trip-route.util';
+import { clockMinutes, markPassedLegs, minutesAfterDeparture, orderRouteLegs } from '../../common/utils/trip-route.util';
 
 const HOUR_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * HOUR_MS;
+const MINUTE_MS = 60_000;
 const RIYADH_OFFSET_MS = 3 * HOUR_MS;
 /** A position older than this no longer describes where the bus is now. */
 const LIVE_FOR_MS = 2 * 60 * 1000;
+/** Behind the timetable by this much or more and the operations map marks the trip late. */
+const LATE_AFTER_MINUTES = 5;
+/** A trip leaving within this many hours with no supervisor is raised on the map, so there is time to assign one. */
+const SUPERVISOR_ALERT_HOURS = 12;
 const MAX_NOTICES = 10;
 /** Far more buses than the company runs at once; only a guard against an unbounded answer. */
 const MAX_LIVE_TRIPS = 300;
+const MAX_ALERTS = 20;
+const REPORT_LABELS: Record<string, string> = { DELAY: 'تأخير', BREAKDOWN: 'عطل', ACCIDENT: 'حادث', PASSENGER: 'راكب', OTHER: 'بلاغ' };
+
+/** Midnight to midnight in Riyadh, the day the office means by "today". */
+function riyadhDay(now: number) {
+  const start = Math.floor((now + RIYADH_OFFSET_MS) / DAY_MS) * DAY_MS - RIYADH_OFFSET_MS;
+  return { start: new Date(start), end: new Date(start + DAY_MS) };
+}
+
+type Checkpoint = { scheduledAt: number; reachedAt: number | null };
+
+/**
+ * How far behind the timetable the trip is now, in minutes: how late it reached the last place the crew reported,
+ * or, once the next place's time has passed without it, how long it has been due there. Departure and the arrival
+ * at the destination count as places, so a bus that has not left, or is still out past its arrival, is late too.
+ */
+function delayMinutes(checkpoints: Checkpoint[], now: number) {
+  const ordered = [...checkpoints].sort((a, b) => a.scheduledAt - b.scheduledAt);
+  const lastReached = ordered.reduce((last, point, index) => (point.reachedAt !== null ? index : last), -1);
+  const behindAtLast = lastReached >= 0 ? ordered[lastReached].reachedAt! - ordered[lastReached].scheduledAt : 0;
+  const next = ordered.slice(lastReached + 1).find((point) => point.reachedAt === null);
+  const overdue = next ? now - next.scheduledAt : 0;
+  return Math.max(0, Math.floor(Math.max(behindAtLast, overdue) / MINUTE_MS));
+}
 
 class ReportLocationDto {
   @IsNumber()
@@ -114,6 +145,83 @@ class TrackingService {
   async live() {
     const now = Date.now();
     const limits = await this.appSettings.numbers('trackingOpensBeforeHours', 'trackingClosesAfterHours');
+    const today = riyadhDay(now);
+    const [trips, waiting, arrived, unsupervised] = await Promise.all([
+      this.liveTrips(now, limits),
+      // Published for today and not yet moving, the earliest first: the next ones the office has to watch go out.
+      this.prisma.trip.findMany({
+        where: { tripStatus: 'PUBLISHED', liveStatus: 'NOT_STARTED', location: { is: null }, departureTime: { gte: today.start, lt: today.end } },
+        orderBy: { departureTime: 'asc' },
+        select: { id: true, tripCode: true, departureTime: true },
+      }),
+      this.prisma.trip.findMany({
+        where: { liveStatus: 'ARRIVED', liveStatusAt: { gte: today.start, lt: today.end } },
+        orderBy: { liveStatusAt: 'desc' },
+        select: { id: true, tripCode: true, liveStatusAt: true },
+      }),
+      this.prisma.trip.findMany({
+        where: {
+          tripStatus: 'PUBLISHED',
+          liveStatus: { not: 'ARRIVED' },
+          departureTime: { gte: new Date(now - limits.trackingClosesAfterHours * HOUR_MS), lte: new Date(now + SUPERVISOR_ALERT_HOURS * HOUR_MS) },
+          supervisors: { none: {} },
+        },
+        orderBy: { departureTime: 'asc' },
+        take: MAX_ALERTS,
+        select: { id: true, tripCode: true, departureTime: true },
+      }),
+    ]);
+    const liveIds = trips.trips.map((trip) => trip.id);
+    const reports = liveIds.length
+      ? await this.prisma.tripReport.findMany({
+          where: { tripId: { in: liveIds }, status: { not: 'RESOLVED' } },
+          orderBy: { createdAt: 'desc' },
+          take: MAX_ALERTS,
+          select: { id: true, tripId: true, category: true, type: true, details: true, createdAt: true, trip: { select: { tripCode: true } } },
+        })
+      : [];
+    const upcoming = waiting.find((trip) => trip.departureTime.getTime() >= now) ?? null;
+    const notLeft = waiting.filter((trip) => now - trip.departureTime.getTime() >= LATE_AFTER_MINUTES * MINUTE_MS);
+
+    const alerts = [
+      ...reports.map((report) => ({
+        id: `report:${report.id}`,
+        tone: report.category === 'SOS' ? ('danger' as const) : ('warning' as const),
+        tripId: report.tripId,
+        message: `${report.trip.tripCode}: ${report.category === 'SOS' ? 'استغاثة' : REPORT_LABELS[report.type] ?? 'بلاغ'} من الطاقم — ${report.details.slice(0, 80)}`,
+        at: report.createdAt,
+        href: '/trip-reports',
+      })),
+      ...notLeft.map((trip) => ({
+        id: `not-left:${trip.id}`,
+        tone: 'warning' as const,
+        tripId: trip.id,
+        message: `${trip.tripCode} لم تنطلق بعد، وموعدها ${formatRiyadhTime(trip.departureTime)}`,
+        at: trip.departureTime,
+        href: `/trips/${trip.id}`,
+      })),
+      ...unsupervised.map((trip) => ({
+        id: `no-supervisor:${trip.id}`,
+        tone: 'warning' as const,
+        tripId: trip.id,
+        message: `${trip.tripCode} ${trip.departureTime < today.end ? 'اليوم' : 'غدًا'} ${formatRiyadhTime(trip.departureTime)} بلا مشرف — أسند مشرفًا قبل الانطلاق`,
+        at: trip.departureTime,
+        href: `/trips/${trip.id}`,
+      })),
+    ].slice(0, MAX_ALERTS);
+
+    return {
+      ...trips,
+      lateAfterMinutes: LATE_AFTER_MINUTES,
+      today: {
+        waiting: { count: waiting.length, next: upcoming && { id: upcoming.id, tripCode: upcoming.tripCode, departureTime: upcoming.departureTime } },
+        arrived: { count: arrived.length, last: arrived[0] ? { id: arrived[0].id, tripCode: arrived[0].tripCode, at: arrived[0].liveStatusAt } : null },
+      },
+      alerts,
+    };
+  }
+
+  private async liveTrips(now: number, limits: { trackingOpensBeforeHours: number; trackingClosesAfterHours: number }) {
     const trips = await this.prisma.trip.findMany({
       where: {
         tripStatus: 'PUBLISHED',
@@ -131,30 +239,57 @@ class TrackingService {
         destination: true,
         departureTime: true,
         arrivalTime: true,
+        estimatedArrivalAt: true,
         liveStatus: true,
         liveStatusAt: true,
         currentBoardingPointId: true,
         boardingPoints: { select: { id: true, name: true, time: true, lat: true, lng: true } },
-        statusUpdates: { where: { status: 'AT_POINT' }, select: { boardingPointId: true, pointName: true } },
+        statusUpdates: { orderBy: { createdAt: 'asc' }, select: { status: true, boardingPointId: true, pointName: true, createdAt: true } },
         bus: { select: { plateNumber: true } },
         location: { select: { lat: true, lng: true, speed: true, recordedAt: true } },
         drivers: { select: { user: { select: { name: true, phone: true } } } },
         supervisors: { orderBy: { isPrimary: 'desc' }, select: { user: { select: { name: true, phone: true } } } },
       },
     });
+    const booked = await bookedOnTrips(this.prisma, trips.map((trip) => trip.id));
     return {
       serverTime: new Date(now),
       liveForMs: LIVE_FOR_MS,
-      trips: trips.map(({ boardingPoints, statusUpdates, location, drivers, supervisors, bus, currentBoardingPointId, ...trip }) => {
-        const reached = new Set(statusUpdates.flatMap((row) => [row.boardingPointId, row.pointName]));
+      trips: trips.map(({ boardingPoints, statusUpdates, location, drivers, supervisors, bus, currentBoardingPointId, estimatedArrivalAt, ...trip }) => {
+        // The first time the crew said so: a point visited twice was still reached when it was first reported.
+        const reachedAt = new Map<string, Date>();
+        for (const row of statusUpdates.filter((update) => update.status === 'AT_POINT')) {
+          for (const key of [row.boardingPointId, row.pointName]) if (key && !reachedAt.has(key)) reachedAt.set(key, row.createdAt);
+        }
+        const departedAt = statusUpdates.find((row) => row.status === 'ON_ROAD')?.createdAt ?? null;
+        const departure = trip.departureTime.getTime();
+        // The customers' arrival time, not the end of a round trip.
+        const scheduledArrival = estimatedArrivalAt ?? trip.arrivalTime;
+        const points = [...boardingPoints]
+          .sort((a, b) => minutesAfterDeparture(a.time, trip.departureTime) - minutesAfterDeparture(b.time, trip.departureTime))
+          .map((point) => {
+            const at = reachedAt.get(point.id) ?? reachedAt.get(point.name) ?? null;
+            return { ...point, isCurrent: point.id === currentBoardingPointId, reached: at !== null, reachedAt: at };
+          });
+        const delay = delayMinutes(
+          [
+            ...points.map((point) => ({ scheduledAt: departure + minutesAfterDeparture(point.time, trip.departureTime) * MINUTE_MS, reachedAt: point.reachedAt?.getTime() ?? null })),
+            { scheduledAt: departure, reachedAt: departedAt?.getTime() ?? null },
+            { scheduledAt: scheduledArrival.getTime(), reachedAt: null },
+          ],
+          now,
+        );
         return {
           ...trip,
+          scheduledArrivalAt: scheduledArrival,
+          departedAt,
+          delayMinutes: delay,
+          expectedArrivalAt: new Date(Math.max(scheduledArrival.getTime() + delay * MINUTE_MS, now)),
+          bookedSeats: booked.get(trip.id)?.seats ?? 0,
           busPlate: bus?.plateNumber ?? null,
           drivers: drivers.map((row) => row.user),
           supervisors: supervisors.map((row) => row.user),
-          points: [...boardingPoints]
-            .sort((a, b) => a.time.localeCompare(b.time))
-            .map((point) => ({ ...point, isCurrent: point.id === currentBoardingPointId, reached: reached.has(point.id) || reached.has(point.name) })),
+          points,
           location: location ? { ...location, isLive: now - location.recordedAt.getTime() <= LIVE_FOR_MS } : null,
         };
       }),

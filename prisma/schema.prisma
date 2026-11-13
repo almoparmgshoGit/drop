@@ -529,7 +529,7 @@ model Trip {
   recurrenceDoneAt           DateTime?
   /// Weekdays the trip repeats on, 0 for Sunday to 6 for Saturday in Riyadh. Empty for a one-off or a yearly trip.
   repeatWeekdays             Int[]                 @default([])
-  /// The last day a temporary weekly trip repeats; a fixed weekly trip keeps going a year ahead.
+  /// The last day a temporary weekly trip repeats; a fixed weekly trip keeps going, drafted a month at a time.
   repeatUntil                DateTime?
   /// The trips made from one weekly schedule share this: the id of the trip that started it.
   seriesId                   String?
@@ -560,7 +560,9 @@ model Trip {
   reverseTrip                Trip?                 @relation("TripReverse")
   channelApp                 Boolean               @default(true)
   channelBranch              Boolean               @default(true)
-  busRentalPrice             Decimal?              @db.Decimal(10, 2)
+  /// No booking is taken before this moment, even once published. Null opens booking on publish.
+  bookingOpensAt             DateTime?
+  busRentalPrice          Decimal?              @db.Decimal(10, 2)
   /// The bed price: charged per person when added to the base price, or its value inside it for reports.
   housingPrice               Decimal?              @db.Decimal(10, 2)
   /// When housing is included in the base price, this is the extra a private room costs.

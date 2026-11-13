@@ -3,9 +3,9 @@ import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { randomUUID } from 'crypto';
 import { VehicleKind } from '@prisma/client';
 import { Transform, Type } from 'class-transformer';
-import { ArrayMaxSize, IsArray, IsBoolean, IsEnum, IsInt, IsNumber, IsObject, IsOptional, IsString, Length, Matches, Max, MaxLength, Min, ValidateNested } from 'class-validator';
+import { ArrayMaxSize, IsArray, IsBoolean, IsEnum, IsIn, IsInt, IsNumber, IsObject, IsOptional, IsString, Length, Matches, Max, MaxLength, Min, ValidateNested } from 'class-validator';
 import { PrismaService } from '../../common/services/prisma.service';
-import { AppSettingsService, FLAG_SETTINGS, NUMBER_SETTINGS } from '../../common/services/app-settings.service';
+import { AppSettingsService, BOOKING_OPENS_MODES, FLAG_SETTINGS, NUMBER_SETTINGS, SCHEDULE_TEXT_DEFAULTS } from '../../common/services/app-settings.service';
 import { BUS_SEAT_COUNT, MAX_BUS_SEATS, MIN_SMALL_VEHICLE_SEATS, seatLimitsFor } from '../../common/utils/bus-layout.util';
 import { assertSinglesFitRange, assertValidSinglesRange } from '../../common/utils/singles-seats.util';
 import { openTripsWhere } from '../buses/buses.service';
@@ -362,6 +362,23 @@ class UpdateSettingsDto {
   @Max(10_000)
   customerLookupDailyLimit?: number;
 
+  // ---- Fixed weekly trips, drafted a month at a time. 28 keeps every value inside the shortest month.
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(28)
+  scheduleGenerateDaysBefore?: number;
+
+  @IsOptional()
+  @IsIn(BOOKING_OPENS_MODES, { message: 'اختر موعد فتح الحجز: عند النشر أو أول الشهر أو قبله بأيام' })
+  scheduleBookingOpens?: string;
+
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(28)
+  scheduleOpenDaysBefore?: number;
+
   // ---- Human resources
   @IsOptional() @IsNumber({ maxDecimalPlaces: 2 }) @Min(0) @Max(50) gosiSaudiEmployeePercent?: number;
   @IsOptional() @IsNumber({ maxDecimalPlaces: 2 }) @Min(0) @Max(50) gosiSaudiEmployerPercent?: number;
@@ -486,15 +503,16 @@ class SettingsService {
 
   /** Everything the settings page edits, except integration keys, which have their own permission. */
   async getAdmin() {
-    const [general, appText, google, panel, numbers, flags] = await Promise.all([
+    const [general, appText, google, panel, numbers, flags, schedule] = await Promise.all([
       this.getAll(),
       this.textValues(APP_TEXT_DEFAULTS),
       this.textValues(GOOGLE_SIGN_IN_DEFAULTS),
       this.textValues(PANEL_DEFAULTS),
       this.numberValues(),
       this.flagValues(),
+      this.textValues(SCHEDULE_TEXT_DEFAULTS),
     ]);
-    return { ...general, ...appText, ...google, ...panel, ...numbers, ...flags };
+    return { ...general, ...appText, ...google, ...panel, ...numbers, ...flags, ...schedule };
   }
 
   /** What each copy of the app asks for on opening, before anyone signs in. */

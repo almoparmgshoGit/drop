@@ -1,9 +1,9 @@
-import { Controller, Get, Header, Post, Put, Delete, Param, Query, Body, Req, StreamableFile, UploadedFiles, UseInterceptors } from '@nestjs/common';
+import { Controller, ForbiddenException, Get, Header, Post, Put, Delete, Param, Query, Body, Req, StreamableFile, UploadedFiles, UseInterceptors } from '@nestjs/common';
 import { FilesInterceptor } from '@nestjs/platform-express';
 import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
 import { IsBoolean, IsOptional, IsString, MaxLength } from 'class-validator';
 import { MAX_PUBLIC_IMAGE_BYTES, MAX_PUBLIC_IMAGES_PER_UPLOAD, TripsService, UploadedImage } from './trips.service';
-import { CreateTripDto, DuplicateTripDto, OpenReverseTripDto, ReverseTripsQuery, SeriesMonthDto, StopSeriesDto, UpdateTripDto } from './trips.dto';
+import { AdminTripsQuery, CreateTripDto, DuplicateTripDto, OpenReverseTripDto, ReverseTripsQuery, SeriesMonthDto, StopSeriesDto, UpdateTripDto } from './trips.dto';
 import { Public, RequirePermission } from '../../common/decorators/auth.decorators';
 
 class TripSearchQuery {
@@ -61,8 +61,8 @@ export class TripsController {
   @RequirePermission('trips.view', 'trips.manage', 'bookings.view', 'manifests.view', 'hotels.view', 'loyalty.view')
   @ApiBearerAuth()
   @ApiOperation({ summary: 'Get all trips for admin management' })
-  async getAllAdminTrips(@Req() req) {
-    return this.tripsService.getAllAdminTrips(req.user);
+  async getAllAdminTrips(@Req() req, @Query() query: AdminTripsQuery) {
+    return this.tripsService.getAllAdminTrips(req.user, query.from);
   }
 
   @Get('admin/reverse')
@@ -87,6 +87,16 @@ export class TripsController {
   @ApiOperation({ summary: 'Draft every running weekly schedule on all its weekdays of a month, skipping days it already has' })
   async generateSeriesMonth(@Req() req, @Body() dto: SeriesMonthDto) {
     return this.tripsService.generateSeriesMonth(dto.month, req.user);
+  }
+
+  @Post('series/far-drafts/delete')
+  @RequirePermission('trips.manage')
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Admin only: delete unbooked weekly drafts beyond next month, left by the old year-ahead drafting' })
+  async deleteFarFutureDrafts(@Req() req) {
+    // Deleting trips in bulk is the admin's call alone, not every trip manager's.
+    if (req.user.role !== 'ADMIN') throw new ForbiddenException('هذا الإجراء لمدير النظام فقط');
+    return this.tripsService.deleteFarFutureDrafts();
   }
 
   @Post('series/:seriesId/publish')

@@ -16,8 +16,9 @@ import { normalizeSaudiPhone } from '../../common/utils/phone.util';
 import { CustomerLookup, parseCustomerLookup } from '../../common/utils/identity.util';
 import { CustomerLookupService, LOOKUP_RESULT_LIMIT } from '../../common/services/customer-lookup.service';
 import { signTicketToken } from '../../common/utils/ticket-token.util';
-import { AdminBookingsQuery, BoardingOverrideDto, ChangeBoardingPointDto, ChangeSeatDto, UpdatePassengerDto } from './bookings.dto';
+import { AdminBookingsQuery, BoardingOverrideDto, ChangeBoardingPointDto, ChangeSeatDto, QUICK_SEARCH_FIELDS, QuickSearchField, UpdatePassengerDto } from './bookings.dto';
 import { cityTripWhere, tripInCity } from '../../common/utils/branch-city.util';
+import { startOfRiyadhMonth } from '../../common/utils/time.util';
 import { allocate, BookingsService, holdAvailableTo, randomCode, toHalalas, toSar } from './bookings.service';
 
 const EDIT_TX_OPTIONS = { maxWait: 10_000, timeout: 30_000 };
@@ -145,6 +146,8 @@ export class BookingsAdminService {
           lt: new Date(Date.UTC(year, month, 1) - offset),
         },
       };
+    } else if (query.from === 'currentMonth') {
+      where.trip = { departureTime: { gte: startOfRiyadhMonth() } };
     }
     return where;
   }
@@ -193,24 +196,30 @@ export class BookingsAdminService {
     };
   }
 
-  async quickSearch(actor: BookingsActor, typed: string, ip?: string) {
+  async quickSearch(actor: BookingsActor, typed: string, ip?: string, fields?: QuickSearchField[]) {
     // A printed branch ticket scans as its reference plus a signature; only the reference is searchable.
     const q = typed.replace(PAPER_CODE, '$1');
     const restricted = !actor.permissions.includes('bookings.list');
     const scoped = restricted ? await this.lookupScope(actor, typed, ip) : null;
     if (restricted && !scoped) throw new BadRequestException('اكتب ما تبحث عنه');
-    const where: Prisma.BookingWhereInput = scoped?.where ?? {
-      ...(await this.branchScope(actor)),
-      OR: [
-        { bookingReference: { contains: q, mode: 'insensitive' } },
-        { user: { phone: { contains: q } } },
-        { trip: { tripCode: { equals: q, mode: 'insensitive' } } },
-        { tickets: { some: { ticketNumber: { equals: q, mode: 'insensitive' } } } },
-        { passengers: { some: { fullName: { contains: q, mode: 'insensitive' } } } },
-        { passengers: { some: { phone: { contains: q } } } },
+    // "البحث في": each field the user leaves on adds its own conditions; none chosen means all of them.
+    const byField: Record<QuickSearchField, Prisma.BookingWhereInput[]> = {
+      name: [{ passengers: { some: { fullName: { contains: q, mode: 'insensitive' } } } }],
+      nationalId: [
         { passengers: { some: { nationalId: { contains: q, mode: 'insensitive' } } } },
         { user: { idNumber: { contains: q.toUpperCase() } } },
       ],
+      phone: [{ user: { phone: { contains: q } } }, { passengers: { some: { phone: { contains: q } } } }],
+      reference: [
+        { bookingReference: { contains: q, mode: 'insensitive' } },
+        { tickets: { some: { ticketNumber: { equals: q, mode: 'insensitive' } } } },
+      ],
+      trip: [{ trip: { tripCode: { equals: q, mode: 'insensitive' } } }],
+    };
+    const chosen = fields?.length ? fields : QUICK_SEARCH_FIELDS;
+    const where: Prisma.BookingWhereInput = scoped?.where ?? {
+      ...(await this.branchScope(actor)),
+      OR: chosen.flatMap((field) => byField[field]),
     };
     const take = restricted ? LOOKUP_RESULT_LIMIT : SEARCH_LIMIT;
     const [bookings, total] = await Promise.all([
@@ -250,6 +259,41 @@ export class BookingsAdminService {
       restricted,
       remainingTotal: toSar(rows.reduce((sum, row) => sum + toHalalas(row.remaining), 0)),
     };
+  }
+
+  /** The quick search results as CSV, one line per passenger, audited like the bookings export. */
+  async exportQuickSearch(actor: BookingsActor, typed: string, ip?: string, fields?: QuickSearchField[]) {
+    const result = await this.quickSearch(actor, typed, ip, fields);
+    await this.prisma.auditLog.create({
+      data: {
+        userId: actor.userId,
+        action: 'GET /bookings/admin/search/export',
+        entity: 'Bookings',
+        ip,
+        details: { q: typed, fields: fields ?? null, rows: result.items.length } as Prisma.InputJsonValue,
+      },
+    });
+    const payState = (row: (typeof result.items)[number]) =>
+      row.status === 'CANCELLED' ? 'ملغى' : row.remaining <= 0 ? 'مكتمل' : row.paid > 0 ? 'غير مكتمل' : 'غير مدفوع';
+    const header = ['اسم الراكب', 'رقم الهوية', 'رقم الجوال', 'الإيصال', 'الرحلة', 'تاريخ الرحلة', 'سعر التذكرة', 'المدفوع', 'المتبقي', 'حالة الدفع', 'رقم الفاتورة'];
+    const lines = result.items.map((row) =>
+      [
+        row.fullName,
+        row.nationalId ?? '',
+        row.phone ?? '',
+        row.bookingReference,
+        row.tripCode,
+        row.departureTime.toISOString().slice(0, 10),
+        row.price.toFixed(2),
+        row.paid.toFixed(2),
+        row.remaining.toFixed(2),
+        payState(row),
+        row.invoiceNumber ?? '',
+      ]
+        .map(csvCell)
+        .join(','),
+    );
+    return '﻿' + `﻿${[header.map(csvCell).join(','), ...lines].join('\r\n')}`;
   }
 
   async exportCsv(actor: BookingsActor, query: AdminBookingsQuery, ip?: string) {

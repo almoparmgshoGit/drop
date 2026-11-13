@@ -50,7 +50,16 @@ export class BookingsAdminController {
   @RequirePermission('bookings.view')
   @ApiOperation({ summary: 'Quick passenger search across bookings' })
   async search(@Req() req, @Query() query: QuickSearchQuery) {
-    return this.admin.quickSearch(req.user, query.q, req.ip);
+    return this.admin.quickSearch(req.user, query.q, req.ip, query.fields);
+  }
+
+  @Get('search/export')
+  @RequirePermission('bookings.export')
+  @Header('Content-Type', 'text/csv; charset=utf-8')
+  @Header('Content-Disposition', 'attachment; filename="quick-search.csv"')
+  @ApiOperation({ summary: 'Export the quick search results as CSV (audited)' })
+  async exportSearch(@Req() req, @Query() query: QuickSearchQuery) {
+    return this.admin.exportQuickSearch(req.user, query.q, req.ip, query.fields);
   }
 
   @Get('export')

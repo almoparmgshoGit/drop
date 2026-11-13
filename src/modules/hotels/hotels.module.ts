@@ -5,6 +5,7 @@ import { RequirePermission } from '../../common/decorators/auth.decorators';
 import {
   AssignBookingRoomDto,
   AssignRoomDto,
+  BulkAssignRoomsDto,
   CancelHotelBookingDto,
   ComplaintTravelersQuery,
   CreateHotelBookingDto,
@@ -17,6 +18,7 @@ import {
   HotelsOverviewQuery,
   ResolveHotelComplaintDto,
   UpdateHotelDto,
+  UpdateRoomingProfileDto,
 } from './hotels.dto';
 import { HotelsService } from './hotels.service';
 
@@ -82,6 +84,13 @@ class HotelsController {
     return this.hotels.assignRoom(req.user, id, dto, req.ip);
   }
 
+  @Post('bookings/:id/rooms/bulk')
+  @RequirePermission('hotels.book')
+  @ApiOperation({ summary: 'Save a whole room plan at once; one refused room keeps every passenger where they were' })
+  assignRooms(@Req() req, @Param('id') id: string, @Body() dto: BulkAssignRoomsDto) {
+    return this.hotels.assignRooms(req.user, id, dto, req.ip);
+  }
+
   @Post('bookings/:id/cancel')
   @RequirePermission('hotels.manage')
   @ApiOperation({ summary: 'Cancel a hotel booking and release its passengers (Admin only)' })
@@ -101,6 +110,13 @@ class HotelsController {
   @ApiOperation({ summary: 'Take a passenger out of their room' })
   unassign(@Req() req, @Param('passengerId') passengerId: string) {
     return this.hotels.unassign(req.user, passengerId, req.ip);
+  }
+
+  @Patch('passengers/:passengerId/profile')
+  @RequirePermission('hotels.book')
+  @ApiOperation({ summary: 'Set the gender and nationality housing filters and places by' })
+  updateProfile(@Req() req, @Param('passengerId') passengerId: string, @Body() dto: UpdateRoomingProfileDto) {
+    return this.hotels.updateRoomingProfile(req.user, passengerId, dto, req.ip);
   }
 
   @Get(':id/complaint-travelers')

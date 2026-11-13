@@ -1,4 +1,4 @@
-import { Transform } from 'class-transformer';
+import { Transform, Type } from 'class-transformer';
 import { OmitType, PartialType } from '@nestjs/swagger';
 import {
   ArrayMaxSize,
@@ -15,8 +15,10 @@ import {
   Max,
   MaxLength,
   Min,
+  ValidateIf,
+  ValidateNested,
 } from 'class-validator';
-import { HotelComplaintSource, HotelRateUnit, HotelRoomBlockType, HousingPriceMode, HousingPricePeriod, PrivateRoomPriceBasis, RoomType } from '@prisma/client';
+import { Gender, HotelComplaintSource, HotelRateUnit, HotelRoomBlockType, HousingPriceMode, HousingPricePeriod, PrivateRoomPriceBasis, RoomType } from '@prisma/client';
 import { GalleryImages } from '../../common/utils/gallery.util';
 
 const trimmed = () => Transform(({ value }) => (typeof value === 'string' ? value.trim() : value));
@@ -325,6 +327,65 @@ export class AssignRoomDto extends RoomFieldsDto {
   @ArrayMaxSize(50)
   @IsString({ each: true })
   passengerIds: string[];
+
+  /** The employee confirmed putting men and women from different bookings in one shared room. */
+  @IsOptional()
+  @IsBoolean()
+  allowMixedGender?: boolean;
+}
+
+export class PlannedRoomDto {
+  @trimmed()
+  @IsString()
+  @Length(1, 30, { message: 'أدخل رقم الغرفة' })
+  roomNumber: string;
+
+  @IsEnum(RoomType)
+  roomType: RoomType;
+
+  /** Left out for a room already in use, which keeps its own. */
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(50)
+  capacity?: number;
+
+  @IsArray()
+  @ArrayMinSize(1)
+  @ArrayMaxSize(50)
+  @IsString({ each: true })
+  passengerIds: string[];
+}
+
+/** A whole plan from the automatic distribution, saved together or not at all. */
+export class BulkAssignRoomsDto {
+  @IsArray()
+  @ArrayMinSize(1)
+  @ArrayMaxSize(80)
+  @ValidateNested({ each: true })
+  @Type(() => PlannedRoomDto)
+  rooms: PlannedRoomDto[];
+
+  @IsOptional()
+  @trimmed()
+  @IsString()
+  @MaxLength(300)
+  roomNote?: string;
+}
+
+/** What housing needs to know about a passenger the booking left blank. Null clears it. */
+export class UpdateRoomingProfileDto {
+  @IsOptional()
+  @ValidateIf((_, value) => value !== null)
+  @IsEnum(Gender)
+  gender?: Gender | null;
+
+  @IsOptional()
+  @ValidateIf((_, value) => value !== null)
+  @trimmed()
+  @IsString()
+  @MaxLength(60)
+  nationality?: string | null;
 }
 
 export class CrewAssignRoomDto {

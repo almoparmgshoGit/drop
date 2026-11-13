@@ -4,9 +4,29 @@ import { PrismaService } from '../src/common/services/prisma.service';
 import { BUS_SEAT_LAYOUT, generateSeatLayout, seatNumbersOf } from '../src/common/utils/bus-layout.util';
 import { nextWeeklyDate, riyadhWeekday } from '../src/common/utils/recurrence.util';
 import { TripsService } from '../src/modules/trips/trips.service';
-import { API, createStaff, createTestApp, loginStaff, resetDatabase, tripPayload } from './helpers';
+import { bookingOpensAtFor, startOfNextRiyadhMonth } from '../src/common/utils/booking-opens.util';
+import { riyadhMonth, startOfRiyadhMonth } from '../src/common/utils/time.util';
+import { API, createStaff, createTestApp, loginPassenger, loginStaff, resetDatabase, tripPayload } from './helpers';
 
 const DAY = 86_400_000;
+/** YYYY-MM of this Riyadh month and the next, the only two a weekly schedule is drafted for. */
+const thisMonth = () => riyadhMonth(new Date());
+const nextMonth = () => riyadhMonth(startOfNextRiyadhMonth(new Date()));
+
+describe('When booking opens on a weekly copy', () => {
+  const now = new Date('2026-11-13T09:00:00Z');
+  const december = new Date('2026-12-10T05:00:00Z');
+
+  it('opens on publish, on the 1st of the month at midnight Riyadh, or days before it', () => {
+    expect(bookingOpensAtFor(december, { bookingOpens: 'ON_PUBLISH', openDaysBefore: 7 }, now)).toBeNull();
+    expect(bookingOpensAtFor(december, { bookingOpens: 'MONTH_START', openDaysBefore: 7 }, now)!.toISOString()).toBe('2026-11-30T21:00:00.000Z');
+    expect(bookingOpensAtFor(december, { bookingOpens: 'DAYS_BEFORE', openDaysBefore: 7 }, now)!.toISOString()).toBe('2026-11-23T21:00:00.000Z');
+  });
+
+  it('stores nothing once that moment has passed', () => {
+    expect(bookingOpensAtFor(new Date('2026-11-20T05:00:00Z'), { bookingOpens: 'MONTH_START', openDaysBefore: 7 }, now)).toBeNull();
+  });
+});
 
 describe('Seat plans drawn from a count', () => {
   it('seats two by two across the aisle, with five left over as a back bench', () => {
@@ -103,6 +123,8 @@ describe('Vehicles and weekly trips (e2e)', () => {
     });
     expect(first.seriesDrafting).toBe(true);
     await trips.extendSeries(first.id);
+    // The sweep reaches next month only close to it; the button drafts it at once. 31 days from now never pass next month's end.
+    await request(http()).post(`${API}/trips/series/generate-month`).set(admin.auth).send({ month: nextMonth() }).expect(201);
 
     const series = await prisma.trip.findMany({ where: { seriesId: first.id }, orderBy: { departureTime: 'asc' } });
     expect(series).toHaveLength(5);
@@ -121,7 +143,10 @@ describe('Vehicles and weekly trips (e2e)', () => {
       repeatWeekdays: [riyadhWeekday(departure)],
     });
     await trips.extendSeries(first.id);
-    expect(await prisma.trip.count({ where: { seriesId: first.id } })).toBeGreaterThan(50);
+    await request(http()).post(`${API}/trips/series/generate-month`).set(admin.auth).send({ month: nextMonth() }).expect(201);
+    expect(await prisma.trip.count({ where: { seriesId: first.id } })).toBeGreaterThan(3);
+    // A month at a time: nothing beyond next month.
+    expect(await prisma.trip.count({ where: { seriesId: first.id, departureTime: { gte: startOfNextRiyadhMonth(startOfNextRiyadhMonth(new Date())) } } })).toBe(0);
 
     await request(http()).post(`${API}/trips/series/${first.id}/stop`).set(admin.auth).send({ deleteDrafts: true }).expect(201);
     expect(await prisma.trip.count({ where: { seriesId: first.id } })).toBe(1);
@@ -137,11 +162,10 @@ describe('Vehicles and weekly trips (e2e)', () => {
       repeatWeekdays: [riyadhWeekday(departure)],
     });
     await trips.extendSeries(first.id);
-    // Two months ahead is wholly inside the year the series is kept drafted for.
-    const ahead = new Date(Date.now() + 3 * 3_600_000);
-    const month = new Date(Date.UTC(ahead.getUTCFullYear(), ahead.getUTCMonth() + 2, 1)).toISOString().slice(0, 7);
+    const month = nextMonth();
+    await request(http()).post(`${API}/trips/series/generate-month`).set(admin.auth).send({ month }).expect(201);
     const inMonth = await prisma.trip.findMany({ where: { seriesId: first.id, codePeriod: month }, orderBy: { departureTime: 'asc' } });
-    expect(inMonth.length).toBeGreaterThanOrEqual(4);
+    expect(inMonth.length).toBeGreaterThanOrEqual(3);
     await request(http()).delete(`${API}/trips/${inMonth[1].id}`).set(admin.auth).expect(200);
 
     const ofSeries = (body: any) => body.bySeries.find((entry: any) => entry.seriesId === first.id);
@@ -157,6 +181,95 @@ describe('Vehicles and weekly trips (e2e)', () => {
     const again = (await request(http()).post(`${API}/trips/series/generate-month`).set(admin.auth).send({ month }).expect(201)).body;
     expect(ofSeries(again)).toMatchObject({ created: 0, skipped: inMonth.length });
     await request(http()).post(`${API}/trips/series/generate-month`).set(admin.auth).send({ month: '2026-13' }).expect(400);
+    // Only this month and next; the rest follow in their time.
+    const later = riyadhMonth(startOfNextRiyadhMonth(startOfNextRiyadhMonth(new Date())));
+    const refused = await request(http()).post(`${API}/trips/series/generate-month`).set(admin.auth).send({ month: later }).expect(400);
+    expect(refused.body.message).toContain('الشهر القادم');
+  });
+
+  it("copies next month from the series' latest trip, edits included, and sets its booking opening from the settings", async () => {
+    await request(http()).put(`${API}/settings`).set(admin.auth).send({ scheduleBookingOpens: 'MONTH_START' }).expect(200);
+    const departure = new Date(Date.now() + 2 * DAY);
+    const first = await createTrip({
+      departureTime: departure.toISOString(),
+      arrivalTime: new Date(departure.getTime() + 5 * 3_600_000).toISOString(),
+      scheduleType: 'FIXED',
+      repeatWeekdays: [riyadhWeekday(departure)],
+    });
+    await trips.extendSeries(first.id);
+    const latest = await prisma.trip.findFirstOrThrow({ where: { seriesId: first.id, departureTime: { lt: startOfNextRiyadhMonth(new Date()) } }, orderBy: { departureTime: 'desc' } });
+    await request(http()).put(`${API}/trips/${latest.id}`).set(admin.auth).send({ price: 222 }).expect(200);
+
+    await request(http()).post(`${API}/trips/series/generate-month`).set(admin.auth).send({ month: nextMonth() }).expect(201);
+    const copies = await prisma.trip.findMany({ where: { seriesId: first.id, departureTime: { gte: startOfNextRiyadhMonth(new Date()) } } });
+    expect(copies.length).toBeGreaterThan(0);
+    expect(copies.every((copy) => Number(copy.price) === 222 && copy.tripStatus === 'DRAFT')).toBe(true);
+    expect(copies.every((copy) => copy.bookingOpensAt?.getTime() === startOfNextRiyadhMonth(new Date()).getTime())).toBe(true);
+    await request(http()).put(`${API}/settings`).set(admin.auth).send({ scheduleBookingOpens: 'ON_PUBLISH' }).expect(200);
+  });
+
+  it('publishes only drafts up to next month, reports older far drafts and lets only an admin delete them', async () => {
+    const departure = new Date(Date.now() + 2 * DAY);
+    const first = await createTrip({
+      departureTime: departure.toISOString(),
+      arrivalTime: new Date(departure.getTime() + 5 * 3_600_000).toISOString(),
+      scheduleType: 'FIXED',
+      repeatWeekdays: [riyadhWeekday(departure)],
+    });
+    await trips.extendSeries(first.id);
+    // A draft from the old year-ahead rule, some months out.
+    const far = await trips.duplicateTrip(first.id, new Date(departure.getTime() + 140 * DAY).toISOString());
+    await prisma.trip.update({ where: { id: far.id }, data: { seriesId: first.id, scheduleType: 'FIXED', repeatWeekdays: [riyadhWeekday(departure)] } });
+
+    const plan = (await request(http()).get(`${API}/trips/series/month-plan?month=${thisMonth()}`).set(admin.auth).expect(200)).body;
+    expect(plan.farFutureDrafts).toBeGreaterThanOrEqual(1);
+    expect(plan.months).toEqual([thisMonth(), nextMonth()]);
+    // The sweep adds nothing after a far draft, and publishing leaves it a draft.
+    expect(await trips.extendSeries(first.id)).toBe(0);
+    await request(http()).post(`${API}/trips/series/${first.id}/publish`).set(admin.auth);
+    expect((await prisma.trip.findUniqueOrThrow({ where: { id: far.id } })).tripStatus).toBe('DRAFT');
+
+    const staff = await loginStaff(app, (await createStaff(prisma, 'STAFF')).phone);
+    await request(http()).post(`${API}/trips/series/far-drafts/delete`).set(staff.auth).expect(403);
+    const cleaned = (await request(http()).post(`${API}/trips/series/far-drafts/delete`).set(admin.auth).expect(201)).body;
+    expect(cleaned.deleted).toBeGreaterThanOrEqual(1);
+    expect(await prisma.trip.count({ where: { id: far.id } })).toBe(0);
+  });
+
+  it('refuses bookings before the opening moment, everywhere, and keeps such trips out of the app and the counter', async () => {
+    const opensAt = new Date(Date.now() + DAY);
+    const trip = await createTrip({ bookingOpensAt: opensAt.toISOString() });
+    expect(new Date(trip.bookingOpensAt).getTime()).toBe(opensAt.getTime());
+    await request(http()).post(`${API}/trips`).set(admin.auth).send(tripPayload({ bookingOpensAt: new Date(Date.now() + 365 * DAY).toISOString() })).expect(400);
+
+    const search = (await request(http()).get(`${API}/trips/search`).expect(200)).body;
+    expect(search.some((row: any) => row.id === trip.id)).toBe(false);
+    const counter = (await request(http()).get(`${API}/branch-bookings/trips`).set(admin.auth).expect(200)).body;
+    expect(counter.items.some((row: any) => row.id === trip.id)).toBe(false);
+
+    const customer = await loginPassenger(app);
+    const held = await request(http()).post(`${API}/bookings/holds`).set(customer.auth).send({ tripId: trip.id, seats: ['4'] }).expect(400);
+    expect(held.body.message).toContain('يفتح');
+    await request(http())
+      .post(`${API}/branch-bookings/quote`)
+      .set(admin.auth)
+      .send({ kind: 'TRANSPORT_OUTBOUND', legs: [{ leg: 'OUTBOUND', tripId: trip.id, seats: ['4'] }] })
+      .expect(400);
+
+    // Cleared, it opens at once.
+    await request(http()).put(`${API}/trips/${trip.id}`).set(admin.auth).send({ bookingOpensAt: null }).expect(200);
+    await request(http()).post(`${API}/bookings/holds`).set(customer.auth).send({ tripId: trip.id, seats: ['4'] }).expect(201);
+  });
+
+  it('lists only this month onward with from=currentMonth, and every trip without it', async () => {
+    const old = await createTrip();
+    const lastMonth = new Date(startOfRiyadhMonth().getTime() - 5 * DAY);
+    await prisma.trip.update({ where: { id: old.id }, data: { departureTime: lastMonth, arrivalTime: new Date(lastMonth.getTime() + 5 * 3_600_000), tripStatus: 'COMPLETED' } });
+    const scoped = (await request(http()).get(`${API}/trips/admin/all?from=currentMonth`).set(admin.auth).expect(200)).body;
+    expect(scoped.some((row: any) => row.id === old.id)).toBe(false);
+    const all = (await request(http()).get(`${API}/trips/admin/all`).set(admin.auth).expect(200)).body;
+    expect(all.some((row: any) => row.id === old.id)).toBe(true);
+    await request(http()).get(`${API}/trips/admin/all?from=lastYear`).set(admin.auth).expect(400);
   });
 
   it('copies a trip to a new date as a one-off draft with a new number and no bookings', async () => {

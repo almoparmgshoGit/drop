@@ -34,6 +34,29 @@ const ACCOUNT_WIDE_FAILURES_FACTOR = 10;
 const GOOGLE_LINK_TTL_SECONDS = 15 * 60;
 const googleLinkKey = (linkToken: string) => `google_link:${linkToken}`;
 
+/** Time to receive the WhatsApp code after a correct password on a new device and type it. */
+const STAFF_CHALLENGE_TTL_SECONDS = 10 * 60;
+const staffChallengeKey = (token: string) => `staff_login_challenge:${token}`;
+
+/** How long a device the employee chose to remember skips the WhatsApp code. */
+const TRUSTED_DEVICE_TTL_SECONDS = 30 * 24 * 60 * 60;
+const trustedDeviceKey = (userId: string, deviceToken: string) =>
+  `trusted_device:${userId}:${crypto.createHash('sha256').update(deviceToken).digest('hex')}`;
+/** Ties a remembered device to the password it was trusted under, so any password change forgets every device at once. */
+const passwordFingerprint = (passwordHash: string) => crypto.createHash('sha256').update(passwordHash).digest('hex').slice(0, 32);
+
+/** Shows the employee which number the code went to without printing all of it: +966 •• ••• 4580. */
+const maskPhone = (phone: string) => `${phone.slice(0, 4)} •• ••• ${phone.slice(-4)}`;
+
+/** Permissions that let an employee work in any branch, so any branch may be chosen at sign-in. */
+const ALL_BRANCHES_PERMISSIONS = ['bookings.all_branches', 'cash.all_branches'];
+
+/** What the panel adds to a staff sign-in: the branch chosen on the form, and the token of a device remembered earlier. */
+export interface PanelLoginOptions {
+  branchId?: string;
+  deviceToken?: string;
+}
+
 /** A refreshed session moves the last-login time only when it is older than this, so frequent refreshes do not each write to the account. */
 const LAST_LOGIN_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 
@@ -275,7 +298,150 @@ export class AuthService {
     return { googleId: payload.sub, email };
   }
 
+  /** Active branches for the sign-in form. Only names: nothing here is private. */
+  async loginBranches() {
+    return this.prisma.branch.findMany({
+      where: { isActive: true },
+      select: { id: true, name: true, city: true },
+      orderBy: { name: 'asc' },
+    });
+  }
+
+  /**
+   * The panel asks for a WhatsApp code on a device it does not know only when codes can really reach the employee.
+   * In the client's trial, codes go to the admins' notifications, which an admin signing in on a new device could not read.
+   */
+  private async staffSecondStepAvailable() {
+    if (this.config.get('OTP_DEV_ECHO') === 'true') return true;
+    return this.whatsapp.isOtpConfigured();
+  }
+
+  private async isTrustedDevice(user: { id: string; passwordHash: string | null }, deviceToken?: string) {
+    if (!deviceToken || !user.passwordHash) return false;
+    const stored = await this.redis.get(trustedDeviceKey(user.id, deviceToken));
+    return !!stored && stored === passwordFingerprint(user.passwordHash);
+  }
+
+  /** An employee of one branch signs in to that branch only; holders of all-branch access may choose any. */
+  private async assertBranchChoice(
+    user: { id: string; role: string; branchId: string | null; extraPermissions: string[]; revokedPermissions: string[]; rank: { permissions: string[] } | null },
+    branchId?: string,
+  ) {
+    const permissions = permissionsOf(user);
+    const allBranches = ALL_BRANCHES_PERMISSIONS.some((key) => permissions.includes(key));
+    if (!branchId) {
+      if (allBranches || !user.branchId) return null;
+      throw new BadRequestException('اختر فرعك لتسجيل الدخول');
+    }
+    const branch = await this.prisma.branch.findFirst({ where: { id: branchId, isActive: true }, select: { id: true, name: true } });
+    if (!branch) throw new BadRequestException('الفرع المختار غير موجود أو موقوف');
+    if (!allBranches && user.branchId !== branch.id) {
+      throw new ForbiddenException(user.branchId ? 'هذا الحساب غير مرتبط بالفرع المختار' : 'حسابك غير مرتبط بأي فرع، اختر «كل الفروع» أو راجع مدير النظام');
+    }
+    return branch;
+  }
+
+  /**
+   * The panel's sign-in: the password, then the chosen branch, then a WhatsApp code unless this device was remembered.
+   * The mobile app keeps the plain staffLogin, whose response it already understands.
+   */
+  async panelLogin(rawIdentifier: string, password: string, options: PanelLoginOptions, ip?: string, userAgent?: string) {
+    const user = await this.verifyStaffPassword(rawIdentifier, password, ip);
+    const full = await this.prisma.user.findUniqueOrThrow({
+      where: { id: user.id },
+      select: { id: true, phone: true, role: true, branchId: true, passwordHash: true, extraPermissions: true, revokedPermissions: true, rank: { select: { permissions: true } } },
+    });
+    const branch = await this.assertBranchChoice(full, options.branchId);
+
+    if ((await this.staffSecondStepAvailable()) && !(await this.isTrustedDevice(full, options.deviceToken))) {
+      const sent = await this.sendOtp(full.phone);
+      const challengeToken = crypto.randomBytes(32).toString('hex');
+      await this.redis.set(staffChallengeKey(challengeToken), JSON.stringify({ userId: full.id, branchId: branch?.id ?? null }), STAFF_CHALLENGE_TTL_SECONDS);
+      return {
+        needsVerification: true as const,
+        challengeToken,
+        phoneHint: maskPhone(full.phone),
+        ...('devCode' in sent && { devCode: sent.devCode }),
+      };
+    }
+
+    const tokens = await this.generateAuthTokens(full.id, full.role, ip, userAgent);
+    return { ...tokens, branch };
+  }
+
+  private async readChallenge(challengeToken: string) {
+    const saved = await this.redis.get(staffChallengeKey(challengeToken));
+    if (!saved) throw new BadRequestException('انتهت مهلة التحقق، سجّل الدخول من جديد');
+    const challenge = JSON.parse(saved) as { userId: string; branchId: string | null };
+    const user = await this.prisma.user.findUnique({
+      where: { id: challenge.userId },
+      select: { id: true, phone: true, role: true, blockedAt: true, passwordHash: true },
+    });
+    if (!user || user.blockedAt || !user.passwordHash || user.role === 'PASSENGER') {
+      await this.redis.del(staffChallengeKey(challengeToken));
+      throw new ForbiddenException('هذا الحساب موقوف. راجع الإدارة');
+    }
+    return { challenge, user };
+  }
+
+  /** Second step of the panel's sign-in on a new device. A remembered device gets a token that skips this step next time. */
+  async verifyPanelLogin(challengeToken: string, code: string, rememberDevice: boolean, ip?: string, userAgent?: string) {
+    const { challenge, user } = await this.readChallenge(challengeToken);
+    await this.checkOtp(user.phone, code);
+    await this.consumeOtp(user.phone);
+    await this.redis.del(staffChallengeKey(challengeToken));
+
+    const tokens = await this.generateAuthTokens(user.id, user.role, ip, userAgent);
+    const branch = challenge.branchId ? await this.prisma.branch.findUnique({ where: { id: challenge.branchId }, select: { id: true, name: true } }) : null;
+    if (!rememberDevice) return { ...tokens, branch };
+
+    const deviceToken = crypto.randomBytes(32).toString('hex');
+    await this.redis.set(trustedDeviceKey(user.id, deviceToken), passwordFingerprint(user.passwordHash!), TRUSTED_DEVICE_TTL_SECONDS);
+    return { ...tokens, branch, deviceToken };
+  }
+
+  async resendPanelCode(challengeToken: string) {
+    const { user } = await this.readChallenge(challengeToken);
+    const sent = await this.sendOtp(user.phone);
+    return { success: true, message: 'تم إرسال رمز جديد إلى واتساب', ...('devCode' in sent && { devCode: sent.devCode }) };
+  }
+
+  // ---- Forgotten staff password ----
+
+  /** The reply is the same whether or not the number belongs to an employee, so the form cannot be used to list staff. */
+  async forgotStaffPassword(rawPhone: string) {
+    const phone = normalizeSaudiPhone(rawPhone);
+    const reply = { success: true, message: 'إن كان الرقم مسجلًا لموظف فسيصله رمز الاستعادة على واتساب' };
+    const user = await this.prisma.user.findUnique({ where: { phone }, select: { role: true, passwordHash: true, blockedAt: true } });
+    if (!user || user.role === 'PASSENGER' || !user.passwordHash || user.blockedAt) return reply;
+    const sent = await this.sendOtp(phone);
+    return { ...reply, ...('devCode' in sent && { devCode: sent.devCode }) };
+  }
+
+  /** Sets a new password after the WhatsApp code, and signs the account out everywhere: whoever knew the old one is out too. */
+  async resetStaffPassword(rawPhone: string, code: string, newPassword: string) {
+    const phone = normalizeSaudiPhone(rawPhone);
+    await this.checkOtp(phone, code);
+    const user = await this.prisma.user.findUnique({ where: { phone }, select: { id: true, role: true, passwordHash: true, blockedAt: true } });
+    if (!user || user.role === 'PASSENGER' || !user.passwordHash) throw new BadRequestException('رمز التحقق غير صحيح أو منتهي الصلاحية');
+    if (user.blockedAt) throw new ForbiddenException('هذا الحساب موقوف. راجع الإدارة');
+    await this.consumeOtp(phone);
+
+    await this.prisma.$transaction([
+      this.prisma.user.update({ where: { id: user.id }, data: { passwordHash: await argon2.hash(newPassword) } }),
+      this.prisma.refreshToken.updateMany({ where: { userId: user.id, revoked: false }, data: { revoked: true } }),
+    ]);
+    await this.redis.del(`login_failures_total:${user.id}`);
+    return { success: true, message: 'تم تغيير كلمة المرور، سجّل الدخول بها الآن' };
+  }
+
   async staffLogin(rawIdentifier: string, password: string, ip?: string, userAgent?: string) {
+    const user = await this.verifyStaffPassword(rawIdentifier, password, ip);
+    return this.generateAuthTokens(user.id, user.role, ip, userAgent);
+  }
+
+  /** Checks a staff password with the lockout rules and returns the account; it issues no session. */
+  private async verifyStaffPassword(rawIdentifier: string, password: string, ip?: string) {
     const identifier = rawIdentifier.trim();
     const where = identifier.includes('@') ? { email: identifier.toLowerCase() } : { phone: normalizeSaudiPhone(identifier) };
     const user = await this.prisma.user.findUnique({ where, include: { driverProfile: { select: { isActive: true } } } });
@@ -309,7 +475,7 @@ export class AuthService {
 
     await this.redis.del(lockKey);
     await this.redis.del(accountLockKey);
-    return this.generateAuthTokens(user.id, user.role, ip, userAgent);
+    return user;
   }
 
   async refresh(refreshToken: string, ip?: string, userAgent?: string) {

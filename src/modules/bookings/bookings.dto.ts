@@ -262,11 +262,21 @@ export class AddNoteDto {
   text: string;
 }
 
+export const QUICK_SEARCH_FIELDS = ['name', 'nationalId', 'phone', 'reference', 'trip'] as const;
+export type QuickSearchField = (typeof QUICK_SEARCH_FIELDS)[number];
+
 export class QuickSearchQuery {
   @trimmed()
   @IsString()
   @Length(2, 100, { message: 'اكتب حرفين على الأقل' })
   q: string;
+
+  /** The fields to search in, comma separated; all of them when left out. */
+  @IsOptional()
+  @Transform(({ value }) => (typeof value === 'string' ? value.split(',').map((field) => field.trim()).filter(Boolean) : value))
+  @IsArray()
+  @IsIn(QUICK_SEARCH_FIELDS, { each: true })
+  fields?: QuickSearchField[];
 }
 
 export class AdminBookingsQuery {
@@ -300,6 +310,11 @@ export class AdminBookingsQuery {
   @IsOptional()
   @Matches(/^\d{4}-(0[1-9]|1[0-2])$/)
   month?: string;
+
+  /** currentMonth: bookings on trips leaving from the 1st of this Riyadh month, the bookings page's default. A month, when given, wins. */
+  @IsOptional()
+  @IsIn(['currentMonth'])
+  from?: 'currentMonth';
 
   @IsOptional()
   @Type(() => Number)

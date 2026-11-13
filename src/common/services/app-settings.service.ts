@@ -54,7 +54,16 @@ export const NUMBER_SETTINGS = {
   advanceMinServiceMonths: 3,
   /** Labour law article 92: an installment takes at most this share of the wage. */
   advanceMaxInstallmentPercent: 10,
+  /** Days before a month starts that the fixed weekly trips' drafts for it are made. */
+  scheduleGenerateDaysBefore: 10,
+  /** With bookings opening some days before the month, how many. */
+  scheduleOpenDaysBefore: 7,
 } as const;
+
+/** When booking opens on a weekly trip's monthly draft: once published, on the 1st of its month, or some days before that. */
+export const BOOKING_OPENS_MODES = ['ON_PUBLISH', 'MONTH_START', 'DAYS_BEFORE'] as const;
+export type BookingOpensMode = (typeof BOOKING_OPENS_MODES)[number];
+export const SCHEDULE_TEXT_DEFAULTS: Record<string, string> = { scheduleBookingOpens: 'ON_PUBLISH' };
 
 export const FLAG_SETTINGS = {
   maintenanceMode: false,
@@ -103,6 +112,16 @@ export class AppSettingsService {
     if (bus) return { from: bus.singlesFromSeat, to: bus.singlesToSeat };
     const defaults = await this.numbers('defaultSinglesFromSeat', 'defaultSinglesToSeat');
     return { from: defaults.defaultSinglesFromSeat, to: defaults.defaultSinglesToSeat };
+  }
+
+  /** How the fixed weekly trips are drafted month by month, and when booking on them opens. */
+  async monthlySchedule() {
+    const [numbers, row] = await Promise.all([
+      this.numbers('scheduleGenerateDaysBefore', 'scheduleOpenDaysBefore'),
+      this.prisma.setting.findUnique({ where: { key: 'scheduleBookingOpens' } }),
+    ]);
+    const mode = BOOKING_OPENS_MODES.find((value) => value === row?.value) ?? 'ON_PUBLISH';
+    return { generateDaysBefore: numbers.scheduleGenerateDaysBefore, bookingOpens: mode as BookingOpensMode, openDaysBefore: numbers.scheduleOpenDaysBefore };
   }
 
   async flag(key: FlagSetting): Promise<boolean> {

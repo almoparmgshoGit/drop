@@ -16,6 +16,7 @@ import { returningBookingIds } from '../../common/utils/linked-seats.util';
 import { paymentFigures } from '../../common/utils/payment.util';
 import { TICKET_BOARDING_TRIP_SELECT, ticketBoarding } from '../../common/utils/ticket-boarding.util';
 import { verifyPaperCode, verifyTicketToken } from '../../common/utils/ticket-token.util';
+import { PROFILE_ACCOUNT_SELECT, PROFILE_PASSENGER_SELECT, passengerProfiles } from '../../common/utils/passenger-profile.util';
 
 interface Actor {
   userId: string;
@@ -467,13 +468,28 @@ export class TicketsService {
       include: {
         passenger: { include: { hotelRoom: { select: { number: true, type: true } } } },
         booking: {
-          select: { bookingReference: true, boardingPointName: true, boardingPointTime: true, kind: true, roomChoice: true, stayHotelId: true, _count: { select: { passengers: true } }, ...RIDE_STATE_SELECT },
+          select: {
+            bookingReference: true,
+            boardingPointName: true,
+            boardingPointTime: true,
+            kind: true,
+            roomChoice: true,
+            stayHotelId: true,
+            user: { select: PROFILE_ACCOUNT_SELECT },
+            passengers: { select: PROFILE_PASSENGER_SELECT },
+            _count: { select: { passengers: true } },
+            ...RIDE_STATE_SELECT,
+          },
         },
       },
     });
     const returning = await this.returningTickets(tripId);
+    const profileOf = (ticket: (typeof tickets)[number]) =>
+      passengerProfiles(ticket.booking.passengers, ticket.booking.user).get(ticket.passengerId ?? '') ?? { gender: null, nationality: null };
     const passengers = tickets
       .map((ticket) => ({
+        gender: profileOf(ticket).gender as string | null,
+        nationality: profileOf(ticket).nationality,
         ticketNumber: ticket.ticketNumber,
         bookingReference: ticket.booking.bookingReference,
         fullName: ticket.passenger.fullName,
@@ -493,6 +509,8 @@ export class TicketsService {
       }))
       .concat(
         returning.map((ticket) => ({
+          gender: (ticket.passenger.gender ?? null) as string | null,
+          nationality: ticket.passenger.nationality ?? null,
           ticketNumber: ticket.ticketNumber,
           bookingReference: ticket.booking.bookingReference,
           fullName: ticket.passenger.fullName,

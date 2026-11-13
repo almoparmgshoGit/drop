@@ -158,6 +158,85 @@ describe('Hotels and rooming (e2e)', () => {
     });
   });
 
+  describe('gender and nationality', () => {
+    const rooming = async (trip: any) => (await request(http()).get(`${API}/hotels/trips/${trip.id}`).set(staff.auth).expect(200)).body;
+    const setProfile = (passengerId: string, body: object, session = staff) =>
+      request(http()).patch(`${API}/hotels/passengers/${passengerId}/profile`).set(session.auth).send(body);
+    const assign = (hotelBookingId: string, passengerIds: string[], extra: object = {}) =>
+      request(http()).post(`${API}/hotels/bookings/${hotelBookingId}/rooms`).set(staff.auth).send({ passengerIds, roomNumber: '50', roomType: 'SHARED', ...extra });
+
+    it('lists them, takes the owner\'s from their account, and lets housing staff fill in the rest', async () => {
+      const trip = await hotelTrip();
+      const { user, booking } = await book(trip, ['1', '2']);
+      await prisma.user.update({ where: { id: user.user.id }, data: { gender: 'FEMALE', nationality: 'مصري' } });
+      const [owner, companion] = booking.passengers;
+
+      let listed = (await rooming(trip)).passengers;
+      expect(listed.find((p: any) => p.passengerId === owner.id)).toMatchObject({ gender: 'FEMALE', nationality: 'مصري', fromAccount: true });
+      expect(listed.find((p: any) => p.passengerId === companion.id)).toMatchObject({ gender: null, nationality: null, fromAccount: false });
+
+      await setProfile(companion.id, { gender: 'MALE', nationality: 'غير موجودة' }).expect(400);
+      await setProfile(companion.id, { gender: 'MALE', nationality: 'مصري' }, await loginPassenger(app)).expect(403);
+      await setProfile(companion.id, { gender: 'MALE', nationality: 'مصري' }).expect(200);
+      listed = (await rooming(trip)).passengers;
+      expect(listed.find((p: any) => p.passengerId === companion.id)).toMatchObject({ gender: 'MALE', nationality: 'مصري', fromAccount: false });
+
+      const event = await prisma.bookingEvent.findFirstOrThrow({ where: { bookingId: booking.id, action: 'PASSENGER_UPDATED' } });
+      expect(event.after).toMatchObject({ gender: 'MALE', nationality: 'مصري' });
+    });
+
+    it('keeps men and women of different bookings out of one shared room, but not a family', async () => {
+      const hotel = await createHotel();
+      const trip = await hotelTrip();
+      const family = await book(trip, ['1', '2']);
+      const man = await book(trip, ['3']);
+      const woman = await book(trip, ['4']);
+      await prisma.bookingPassenger.update({ where: { id: family.booking.passengers[0].id }, data: { gender: 'MALE' } });
+      await prisma.bookingPassenger.update({ where: { id: family.booking.passengers[1].id }, data: { gender: 'FEMALE' } });
+      await prisma.bookingPassenger.update({ where: { id: man.booking.passengers[0].id }, data: { gender: 'MALE' } });
+      await prisma.bookingPassenger.update({ where: { id: woman.booking.passengers[0].id }, data: { gender: 'FEMALE' } });
+      const { id } = await bookHotel(trip, hotel);
+
+      await assign(id, family.booking.passengers.map((p: any) => p.id)).expect(201);
+      const refused = await assign(id, [man.booking.passengers[0].id]).expect(409);
+      expect(refused.body.message).toContain('رجالًا ونساءً');
+      await assign(id, [man.booking.passengers[0].id, woman.booking.passengers[0].id], { roomNumber: '51' }).expect(409);
+      // Someone the office chose to place there anyway, knowingly.
+      await assign(id, [man.booking.passengers[0].id], { allowMixedGender: true }).expect(201);
+    });
+
+    it('saves a whole plan at once, or nothing when one room is refused', async () => {
+      const hotel = await createHotel();
+      const trip = await hotelTrip();
+      const men = await book(trip, ['1', '2']);
+      const women = await book(trip, ['3']);
+      const ids = [...men.booking.passengers, ...women.booking.passengers].map((p: any) => p.id);
+      await prisma.bookingPassenger.updateMany({ where: { id: { in: ids.slice(0, 2) } }, data: { gender: 'MALE' } });
+      await prisma.bookingPassenger.update({ where: { id: ids[2] }, data: { gender: 'FEMALE' } });
+      const { id } = await bookHotel(trip, hotel);
+      const bulk = (rooms: object[]) => request(http()).post(`${API}/hotels/bookings/${id}/rooms/bulk`).set(staff.auth).send({ rooms });
+
+      await bulk([{ roomNumber: '1', roomType: 'SHARED', capacity: 4, passengerIds: ids }]).expect(409);
+      await bulk([
+        { roomNumber: '1', roomType: 'SHARED', capacity: 4, passengerIds: [ids[0]] },
+        { roomNumber: '1', roomType: 'SHARED', capacity: 4, passengerIds: [ids[1]] },
+      ]).expect(400);
+      await bulk([
+        { roomNumber: '1', roomType: 'SHARED', capacity: 4, passengerIds: [ids[0]] },
+        { roomNumber: '2', roomType: 'SHARED', capacity: 4, passengerIds: [ids[0]] },
+      ]).expect(400);
+      expect(await prisma.bookingPassenger.count({ where: { id: { in: ids }, hotelRoomId: { not: null } } })).toBe(0);
+
+      const saved = await bulk([
+        { roomNumber: '1', roomType: 'SHARED', capacity: 4, passengerIds: ids.slice(0, 2) },
+        { roomNumber: '2', roomType: 'SHARED', capacity: 2, passengerIds: [ids[2]] },
+      ]).expect(201);
+      expect(saved.body).toEqual({ rooms: 2, passengers: 3 });
+      const rooms = await prisma.hotelRoom.findMany({ where: { hotelBookingId: id }, orderBy: { number: 'asc' }, include: { _count: { select: { occupants: true } } } });
+      expect(rooms.map((r) => [r.number, r.capacity, r._count.occupants])).toEqual([['1', 4, 2], ['2', 2, 1]]);
+    });
+  });
+
   describe('booking-table shortcut', () => {
     it('finds the trip itself, opens the hotel booking and houses the whole booking', async () => {
       const hotel = await createHotel();

@@ -24,10 +24,13 @@ import { seatLayoutFor, seatNumbersOf, storedSeatLayout, tripSeatLayout } from '
 import { assertSinglesFitRange } from '../../common/utils/singles-seats.util';
 import { applySeatLayout } from '../../common/utils/trip-seats.util';
 import { bookedOnTrips, goOnlyBookings, lockTripsWithLinked, returningBookingIds } from '../../common/utils/linked-seats.util';
-import { RIYADH_OFFSET_MS, addDays, formatRiyadhDate, formatRiyadhTime, riyadhDate, riyadhDayRange, riyadhMonthRange, toHijriLabel } from '../../common/utils/time.util';
+import { RIYADH_OFFSET_MS, addDays, formatRiyadhDate, formatRiyadhTime, riyadhDate, riyadhDayRange, riyadhMonth, riyadhMonthRange, startOfRiyadhMonth, toHijriLabel } from '../../common/utils/time.util';
+import { bookingOpenedWhere, bookingOpensAtFor, startOfNextRiyadhMonth } from '../../common/utils/booking-opens.util';
 import { applyBusServices, busServiceRows } from '../../common/utils/bus-services.util';
 import { WEEKLY_HORIZON_DAYS, nextWeeklyDate, nextYearlyDate, riyadhWeekday } from '../../common/utils/recurrence.util';
 import { AppSettingsService } from '../../common/services/app-settings.service';
+
+type MonthlySchedule = Awaited<ReturnType<AppSettingsService['monthlySchedule']>>;
 import { imageTypeOf } from '../../common/utils/image-type.util';
 import { GALLERY_SELECT } from '../../common/utils/gallery.util';
 import { CreateTripDto, OpenReverseTripDto, UpdateTripDto } from './trips.dto';
@@ -216,7 +219,8 @@ const ON_SALE_PACKAGE: Prisma.TripWhereInput = { OR: [{ packageId: null }, { pac
 /** The trips a customer can find and book in the app, narrowed to what they searched for. */
 export function appTripWhere(filters: Pick<TripSearchFilters, 'origin' | 'destination' | 'date'>): Prisma.TripWhereInput {
   const now = new Date();
-  const where: Prisma.TripWhereInput = { tripStatus: 'PUBLISHED', channelApp: true, departureTime: { gt: now }, AND: [ON_SALE_PACKAGE] };
+  // A trip waiting for its booking to open stays out of the app until then: the app has nowhere to show the opening date.
+  const where: Prisma.TripWhereInput = { tripStatus: 'PUBLISHED', channelApp: true, departureTime: { gt: now }, AND: [ON_SALE_PACKAGE, bookingOpenedWhere(now)] };
   if (filters.origin) where.origin = { contains: filters.origin, mode: 'insensitive' };
   if (filters.destination) where.destination = { contains: filters.destination, mode: 'insensitive' };
   if (filters.date) {
@@ -412,7 +416,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
     return completed;
   }
 
-  /** Keeps every weekly schedule drafted to its horizon; it also finishes a series whose first drafting was interrupted. */
+  /** Keeps every weekly schedule drafted through its monthly horizon; it also finishes a series whose first drafting was interrupted. */
   async extendWeeklySeries() {
     const rows = await this.prisma.trip.findMany({
       where: { seriesId: { not: null }, repeatWeekdays: { isEmpty: false } },
@@ -429,16 +433,32 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Drafts the series' next departures, one transaction each, up to its horizon: a year ahead for a fixed trip, its last
-   * day for a temporary one. The office publishes the drafts. Returns how many were made.
+   * Where the sweep stops drafting weekly schedules (exclusive): the end of this Riyadh month, or of next month once that is
+   * generateDaysBefore days away. A month at a time, so each month is copied from the latest edits rather than a year-old plan.
+   */
+  private async weeklyHorizon(now = new Date()) {
+    const { generateDaysBefore } = await this.appSettings.monthlySchedule();
+    const nextMonth = startOfNextRiyadhMonth(now);
+    return now >= addDays(nextMonth, -generateDaysBefore) ? startOfNextRiyadhMonth(nextMonth) : nextMonth;
+  }
+
+  /** This month and next: the furthest a weekly schedule is drafted, by the sweep or by hand. Drafts beyond it date from the old year-ahead rule. */
+  private draftWindow(now = new Date()) {
+    return { start: startOfRiyadhMonth(now), end: startOfNextRiyadhMonth(startOfNextRiyadhMonth(now)) };
+  }
+
+  /**
+   * Drafts the series' next departures, one transaction each, up to the monthly horizon, and never past a temporary
+   * schedule's last day. The office publishes the drafts. Returns how many were made.
    */
   async extendSeries(seriesId: string, announce = false) {
+    const [horizon, schedule] = await Promise.all([this.weeklyHorizon(), this.appSettings.monthlySchedule()]);
     let made = 0;
     for (;;) {
       const draft = await this.prisma.$transaction(async (tx) => {
         // Two runs over one series, from a create and from the sweep, take turns so neither drafts a date twice.
         await tx.$queryRaw`SELECT 1 AS locked FROM pg_advisory_xact_lock(hashtext(${seriesId}))`;
-        const next = await this.draftNextInSeries(tx, seriesId);
+        const next = await this.draftNextInSeries(tx, seriesId, horizon, schedule);
         if (next && announce && made === 0) await this.notifications.toStaff(tx, 'STAFF_FIXED_TRIP_DRAFTED', ['trips.manage'], {}, { tripId: next.id });
         return next;
       }, TRIP_TX_OPTIONS);
@@ -447,53 +467,61 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  /** The series follows the trip that started it, or its latest trip once that one is gone. */
-  private async draftNextInSeries(tx: Prisma.TransactionClient, seriesId: string) {
-    const latest = await tx.trip.findFirst({ where: { seriesId }, orderBy: { departureTime: 'desc' }, select: { id: true, departureTime: true } });
-    if (!latest) return null;
-    const template = await this.seriesTemplate(tx, seriesId, latest.id);
+  /** The day after the series' last trip that falls on its weekdays, copied from its latest trip. */
+  private async draftNextInSeries(tx: Prisma.TransactionClient, seriesId: string, horizon: Date, schedule: MonthlySchedule) {
+    const latest = await tx.trip.findFirst({ where: { seriesId }, orderBy: { departureTime: 'desc' }, select: { departureTime: true } });
+    // Drafts made under the old year-ahead rule already cover the window, so nothing is added after them.
+    if (!latest || latest.departureTime >= horizon) return null;
+    const template = await this.seriesTemplate(tx, seriesId, horizon);
     if (!template?.repeatWeekdays.length) return null;
     const now = new Date();
-    const horizon = template.scheduleType === 'FIXED' ? new Date(now.getTime() + WEEKLY_HORIZON_DAYS * DAY_MS) : template.repeatUntil;
-    if (!horizon) return null;
     const departure = nextWeeklyDate(latest.departureTime, template.repeatWeekdays, template.departureTime, now);
-    if (!departure || departure > horizon) return null;
+    if (!departure || departure >= horizon || !this.withinSchedule(template, departure)) return null;
     return this.cloneTrip(tx, template.id, departure, {
       schedule: { scheduleType: template.scheduleType, recurrenceCalendar: null, repeatWeekdays: template.repeatWeekdays, repeatUntil: template.repeatUntil },
       seriesId,
       keepBusAndCrew: true,
+      bookingOpensAt: bookingOpensAtFor(departure, schedule, now),
     });
   }
 
-  /** The trip a series' copies are made from: the one that started it, or its latest trip once that one is gone. */
-  private seriesTemplate(db: Prisma.TransactionClient, seriesId: string, latestId: string) {
-    return db.trip.findFirst({
-      where: { id: { in: [seriesId, latestId] } },
-      orderBy: { departureTime: 'asc' },
-      select: { id: true, departureTime: true, scheduleType: true, repeatWeekdays: true, repeatUntil: true, origin: true, destination: true },
-    });
+  /** A fixed schedule runs on; a temporary one stops at its last day. */
+  private withinSchedule(template: { scheduleType: TripScheduleType; repeatUntil: Date | null }, departure: Date) {
+    return template.scheduleType === 'FIXED' || (!!template.repeatUntil && departure <= template.repeatUntil);
+  }
+
+  /**
+   * The trip a series' copies are made from: its latest trip before `before` that is not cancelled, so an edit to this
+   * month's trip carries into next month, weekdays and departure time included. With only cancelled ones, the latest of them.
+   */
+  private async seriesTemplate(db: Prisma.TransactionClient, seriesId: string, before: Date) {
+    const select = { id: true, departureTime: true, scheduleType: true, repeatWeekdays: true, repeatUntil: true, origin: true, destination: true } as const;
+    const where = { seriesId, departureTime: { lt: before } };
+    return (
+      (await db.trip.findFirst({ where: { ...where, tripStatus: { not: 'CANCELLED' } }, orderBy: { departureTime: 'desc' }, select })) ??
+      (await db.trip.findFirst({ where, orderBy: { departureTime: 'desc' }, select }))
+    );
   }
 
   /**
    * The series' weekdays in a Riyadh month (YYYY-MM), at its departure time: each day already holding a trip of the series,
-   * in any state, is taken; a day before the series began, already past, or beyond its horizon is out of range.
+   * in any state, is taken; a day before the series began, already past, beyond next month or past a temporary schedule's
+   * last day is out of range.
    */
   private async seriesMonthPlan(db: Prisma.TransactionClient, seriesId: string, month: string) {
-    const [first, latest] = await Promise.all([
-      db.trip.findFirst({ where: { seriesId }, orderBy: { departureTime: 'asc' }, select: { departureTime: true } }),
-      db.trip.findFirst({ where: { seriesId }, orderBy: { departureTime: 'desc' }, select: { id: true } }),
-    ]);
-    if (!first || !latest) return null;
-    const template = await this.seriesTemplate(db, seriesId, latest.id);
-    if (!template?.repeatWeekdays.length) return null;
     const range = riyadhMonthRange(month);
+    const [first, template] = await Promise.all([
+      db.trip.findFirst({ where: { seriesId }, orderBy: { departureTime: 'asc' }, select: { departureTime: true } }),
+      this.seriesTemplate(db, seriesId, range.lt),
+    ]);
+    if (!first || !template?.repeatWeekdays.length) return null;
     const taken = new Set(
       (await db.trip.findMany({ where: { seriesId, departureTime: { gte: range.gte, lt: range.lt } }, select: { departureTime: true } })).map((trip) =>
         riyadhDate(trip.departureTime),
       ),
     );
     const now = new Date();
-    const horizon = template.scheduleType === 'FIXED' ? new Date(now.getTime() + WEEKLY_HORIZON_DAYS * DAY_MS) : template.repeatUntil;
+    const windowEnd = this.draftWindow(now).end;
     const timeOfDay = (((template.departureTime.getTime() + RIYADH_OFFSET_MS) % DAY_MS) + DAY_MS) % DAY_MS;
     const days: { departure: Date; state: 'missing' | 'taken' | 'outOfRange' }[] = [];
     for (let dayStart = range.gte.getTime(); dayStart < range.lt.getTime(); dayStart += DAY_MS) {
@@ -501,7 +529,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
       if (!template.repeatWeekdays.includes(riyadhWeekday(departure))) continue;
       const state = taken.has(riyadhDate(departure))
         ? 'taken'
-        : departure <= now || departure < first.departureTime || !horizon || departure > horizon
+        : departure <= now || departure < first.departureTime || departure >= windowEnd || !this.withinSchedule(template, departure)
           ? 'outOfRange'
           : 'missing';
       days.push({ departure, state });
@@ -510,11 +538,19 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Makes sure every running weekly schedule has its drafts on all its weekdays of the month. Each series is first drafted
-   * up to its horizon as the sweep would, then any day still without a trip of the series, such as one whose draft was
-   * deleted, is drafted. A day that has one is skipped, so running it twice adds nothing. With dryRun nothing is written.
+   * Makes sure every running weekly schedule has its drafts on all its weekdays of this month or next, at once, whatever
+   * generateDaysBefore says. Each series is first drafted to the monthly horizon as the sweep would, then any day still
+   * without a trip of the series, such as one whose draft was deleted, is drafted. A day that has one is skipped, so running
+   * it twice adds nothing. With dryRun nothing is written.
    */
   async generateSeriesMonth(month: string, actor: CrewActor & { permissions: string[] }, dryRun = false) {
+    const now = new Date();
+    const current = riyadhMonth(now);
+    const next = riyadhMonth(startOfNextRiyadhMonth(now));
+    if (month !== current && month !== next) {
+      throw new BadRequestException(`يُولَّد جدول الشهر الحالي (${current}) أو الشهر القادم (${next}) فقط، والأشهر التالية تُولَّد في وقتها`);
+    }
+    const schedule = await this.appSettings.monthlySchedule();
     // A branch employee works with the schedules of their city's trips, as in the trips list.
     const city = await servedCity(this.prisma, { userId: actor.userId, permissions: actor.permissions });
     const rows = await this.prisma.trip.findMany({
@@ -542,8 +578,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
               await tx.$queryRaw`SELECT 1 AS locked FROM pg_advisory_xact_lock(hashtext(${seriesId}))`;
               const { start, end } = riyadhDayRange(riyadhDate(day.departure))!;
               if (await tx.trip.count({ where: { seriesId, departureTime: { gte: start, lt: end } } })) return;
-              const latest = await tx.trip.findFirst({ where: { seriesId }, orderBy: { departureTime: 'desc' }, select: { id: true } });
-              const template = latest && (await this.seriesTemplate(tx, seriesId, latest.id));
+              const template = await this.seriesTemplate(tx, seriesId, day.departure);
               if (!template?.repeatWeekdays.length) throw new ConflictException('توقف الجدول أثناء التوليد');
               await this.cloneTrip(tx, template.id, day.departure, {
                 schedule: { scheduleType: template.scheduleType, recurrenceCalendar: null, repeatWeekdays: template.repeatWeekdays, repeatUntil: template.repeatUntil },
@@ -551,6 +586,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
                 keepBusAndCrew: true,
                 actor,
                 crewReason: 'توليد جدول الشهر',
+                bookingOpensAt: bookingOpensAtFor(day.departure, schedule),
               });
             }, TRIP_TX_OPTIONS);
           } catch (err) {
@@ -569,7 +605,52 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
       });
     }
     const total = (key: 'created' | 'skipped' | 'outOfRange') => series.reduce((sum, entry) => sum + entry[key], 0);
-    return { month, dryRun, series: series.length, created: total('created'), skipped: total('skipped'), outOfRange: total('outOfRange'), failed, bySeries: series };
+    return {
+      month,
+      dryRun,
+      series: series.length,
+      created: total('created'),
+      skipped: total('skipped'),
+      outOfRange: total('outOfRange'),
+      failed,
+      bySeries: series,
+      // What the modal explains: the two months it can draft, and from when the sweep drafts next month by itself.
+      months: [current, next],
+      generateDaysBefore: schedule.generateDaysBefore,
+      autoGeneratesFrom: addDays(startOfNextRiyadhMonth(now), -schedule.generateDaysBefore),
+      farFutureDrafts: await this.prisma.trip.count({ where: this.farFutureDraftsWhere(now, city) }),
+    };
+  }
+
+  /** Unpublished weekly copies beyond next month, left by the old year-ahead rule; publishing a series skips them. */
+  private farFutureDraftsWhere(now: Date, city?: string | null): Prisma.TripWhereInput {
+    return {
+      seriesId: { not: null },
+      tripStatus: 'DRAFT',
+      departureTime: { gte: this.draftWindow(now).end },
+      ...(city && cityTripWhere(city)),
+    };
+  }
+
+  /**
+   * Deletes the far-future weekly drafts nobody booked, on an admin's explicit request; nothing does this on its own.
+   * A draft with a booking or a reverse trip stays, and is counted as kept.
+   */
+  async deleteFarFutureDrafts() {
+    const drafts = await this.prisma.trip.findMany({
+      where: { ...this.farFutureDraftsWhere(new Date()), bookings: { none: {} }, reverseTrip: null },
+      select: { id: true },
+    });
+    let deleted = 0;
+    for (const draft of drafts) {
+      try {
+        await this.deleteTrip(draft.id);
+        deleted++;
+      } catch (err) {
+        if (!(err instanceof HttpException)) throw err;
+      }
+    }
+    return { deleted, kept: await this.prisma.trip.count({ where: this.farFutureDraftsWhere(new Date()) }) };
   }
 
   /**
@@ -656,7 +737,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
     tx: Prisma.TransactionClient,
     sourceId: string,
     departure: Date,
-    options: { schedule: Schedule; keepBusAndCrew: boolean; seriesId?: string; actor?: CrewActor; crewReason?: string },
+    options: { schedule: Schedule; keepBusAndCrew: boolean; seriesId?: string; actor?: CrewActor; crewReason?: string; bookingOpensAt?: Date | null },
   ) {
     const source = await tx.trip.findUniqueOrThrow({
       where: { id: sourceId },
@@ -735,6 +816,8 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
         reversePrice: source.reversePrice,
         channelApp: source.channelApp,
         channelBranch: source.channelBranch,
+        // Not the source's: its opening belongs to its own month. A weekly copy gets one from the monthly schedule setting.
+        bookingOpensAt: options.bookingOpensAt ?? null,
         seats: { createMany: { data: seatNumbers.map((seatNumber) => ({ seatNumber })) } },
         images: { create: source.images.map(({ url }) => ({ url })) },
         // Clock times keep their distance from the departure, so a copy at another hour gathers at the matching hour.
@@ -782,7 +865,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * One-off, temporary weekly until a last day, fixed yearly on a calendar, or fixed weekly kept a year ahead.
+   * One-off, temporary weekly until a last day, fixed yearly on a calendar, or fixed weekly drafted a month at a time.
    * Only the weekly kinds keep weekdays, and only the temporary weekly one a last day.
    */
   private resolveSchedule(input: { scheduleType: TripScheduleType; calendar?: TripCalendar | null; weekdays?: number[]; until?: Date | null; departure: Date }): Schedule {
@@ -799,6 +882,14 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
       throw new BadRequestException('الرحلة المؤقتة تتكرر سنة على الأكثر، وللأطول اجعلها ثابتة');
     }
     return { scheduleType: 'TEMPORARY', recurrenceCalendar: null, repeatWeekdays: weekdays, repeatUntil: input.until };
+  }
+
+  /** Booking can only open before the trip leaves; empty opens it on publish. */
+  private resolveBookingOpensAt(value: string | null | undefined, departure: Date) {
+    if (!value) return null;
+    const opens = new Date(value);
+    if (opens >= departure) throw new BadRequestException('موعد فتح الحجز يجب أن يكون قبل موعد انطلاق الرحلة');
+    return opens;
   }
 
   async searchTrips(filters: TripSearchFilters) {
@@ -883,7 +974,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
         availableSeats: { gt: 0 },
         ...(filters.origin && { origin: { contains: filters.origin, mode: 'insensitive' as const } }),
         ...(filters.destination && { destination: { contains: filters.destination, mode: 'insensitive' as const } }),
-        ...(filters.bookingType && { AND: [bookingTypeWhere(filters.bookingType)] }),
+        AND: [bookingOpenedWhere(now), ...(filters.bookingType ? [bookingTypeWhere(filters.bookingType)] : [])],
       },
       orderBy: { departureTime: 'asc' },
       select: { departureTime: true },
@@ -891,11 +982,16 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
     return { departureTime: trip?.departureTime ?? null };
   }
 
-  async getAllAdminTrips(actor: RentActor) {
+  /** With from=currentMonth, only trips leaving from the 1st of this Riyadh month: the trips page's working view. Every other caller still gets past months. */
+  async getAllAdminTrips(actor: RentActor, from?: 'currentMonth') {
     // An employee of a city's branch works with that city's trips.
     const city = actor.userId ? await servedCity(this.prisma, { userId: actor.userId, permissions: actor.permissions }) : null;
+    const where: Prisma.TripWhereInput = {
+      ...(city && cityTripWhere(city)),
+      ...(from === 'currentMonth' && { departureTime: { gte: startOfRiyadhMonth() } }),
+    };
     const trips = await this.prisma.trip.findMany({
-      ...(city && { where: cityTripWhere(city) }),
+      where,
       orderBy: { departureTime: 'desc' },
       include: ADMIN_TRIP_INCLUDE,
     });
@@ -1103,6 +1199,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
       until: dto.repeatUntil ? new Date(dto.repeatUntil) : null,
       departure,
     });
+    const bookingOpensAt = this.resolveBookingOpensAt(dto.bookingOpensAt, departure);
     // The first trip of a weekly schedule names the series, so it can be found from any of its copies.
     const id = randomUUID();
     const seriesId = schedule.repeatWeekdays.length ? id : null;
@@ -1175,6 +1272,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
           reversePrice: dto.reverseEnabled ? dto.reversePrice ?? dto.price : dto.reversePrice ?? null,
           channelApp: dto.channelApp ?? true,
           channelBranch: dto.channelBranch ?? true,
+          bookingOpensAt,
           seats: {
             createMany: { data: seatNumbers.map((seatNumber) => ({ seatNumber })) },
           },
@@ -1372,6 +1470,10 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
         throw new BadRequestException('لا يمكن نشر رحلة موعدها في الماضي');
       }
       if (existing.reverseOf && departureMoved) this.assertReverseAfterOutbound(departure, existing.reverseOf);
+      const bookingOpensAt =
+        dto.bookingOpensAt !== undefined || departureMoved
+          ? this.resolveBookingOpensAt(dto.bookingOpensAt === undefined ? existing.bookingOpensAt?.toISOString() : dto.bookingOpensAt, departure)
+          : undefined;
       const crewWindowSettings = {
         crewOpensBeforeMinutes: dto.crewOpensBeforeMinutes ?? existing.crewOpensBeforeMinutes,
         boardingOpensBeforeMinutes: dto.boardingOpensBeforeMinutes ?? existing.boardingOpensBeforeMinutes,
@@ -1474,6 +1576,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
           reversePrice: dto.reversePrice,
           channelApp: dto.channelApp,
           channelBranch: dto.channelBranch,
+          bookingOpensAt,
         },
       });
 
@@ -2037,14 +2140,18 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
     );
   }
 
-  /** Publishes the series' drafts that are still ahead. One that cannot go out yet is listed with why, and the rest still go. */
+  /**
+   * Publishes the series' drafts still ahead within this month and next. Drafts further out, left by the old year-ahead rule,
+   * stay drafts so they are not put on sale by accident. One that cannot go out yet is listed with why, and the rest still go.
+   */
   async publishSeries(seriesId: string, actor?: CrewActor) {
+    const now = new Date();
     const drafts = await this.prisma.trip.findMany({
-      where: { seriesId, tripStatus: 'DRAFT', departureTime: { gt: new Date() } },
+      where: { seriesId, tripStatus: 'DRAFT', departureTime: { gt: now, lt: this.draftWindow(now).end } },
       orderBy: { departureTime: 'asc' },
       select: { id: true, tripCode: true },
     });
-    if (drafts.length === 0) throw new NotFoundException('لا توجد مسودات قادمة في هذا الجدول');
+    if (drafts.length === 0) throw new NotFoundException('لا توجد مسودات قادمة في هذا الجدول خلال الشهر الحالي والقادم');
     let published = 0;
     const failed: { tripCode: string; reason: string }[] = [];
     for (const draft of drafts) {

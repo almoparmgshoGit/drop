@@ -12,12 +12,30 @@ import { hotelBookingCost } from '../../common/utils/payment.util';
 import { SERVICE_SELECT, withHotelServices } from '../../common/utils/services.util';
 import { GALLERY_SELECT, galleryRows } from '../../common/utils/gallery.util';
 import { suggestServiceIcon } from '../../common/service-icons';
-import { AssignBookingRoomDto, AssignRoomDto, CrewAssignRoomDto, CreateHotelBookingDto, UpdateHotelBookingDto, CreateHotelComplaintDto, CreateHotelDto, CreateRoomBlockDto, CreateTravelerComplaintDto, UpdateHotelDto } from './hotels.dto';
+import { NATIONALITIES } from '../../common/profile-options';
+import { PROFILE_ACCOUNT_SELECT, PROFILE_PASSENGER_SELECT, passengerProfiles } from '../../common/utils/passenger-profile.util';
+import {
+  AssignBookingRoomDto,
+  AssignRoomDto,
+  BulkAssignRoomsDto,
+  CrewAssignRoomDto,
+  CreateHotelBookingDto,
+  UpdateHotelBookingDto,
+  CreateHotelComplaintDto,
+  CreateHotelDto,
+  CreateRoomBlockDto,
+  CreateTravelerComplaintDto,
+  UpdateHotelDto,
+  UpdateRoomingProfileDto,
+} from './hotels.dto';
 
 /** What the hotel shows customers, its services and photos, which every staff view of a hotel carries for its edit form. */
 const HOTEL_PROFILE = { services: SERVICE_SELECT, images: GALLERY_SELECT } as const;
 
 const TX_OPTIONS = { maxWait: 10_000, timeout: 30_000 };
+// A whole trip's plan places each room in turn, with its checks and notifications, inside one transaction.
+const BULK_TX_OPTIONS = { maxWait: 10_000, timeout: 120_000 };
+const MAX_PLANNED_PASSENGERS = 300;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const RIYADH_OFFSET_MS = 3 * 60 * 60 * 1000;
 const DEFAULT_ROOM_CAPACITY = 4;
@@ -598,6 +616,7 @@ export class HotelsService {
         arrivalTime: true,
         bookingType: true,
         tripStatus: true,
+        sharedRoomCapacity: true,
         accommodations: { select: { name: true, nights: true } },
         hotelBookings: {
           orderBy: { number: 'asc' },
@@ -618,13 +637,14 @@ export class HotelsService {
             stayCheckIn: true,
             stayCheckOut: true,
             stayHotel: { select: { id: true, name: true } },
-            user: { select: { name: true, phone: true } },
+            user: { select: { name: true, phone: true, ...PROFILE_ACCOUNT_SELECT } },
             passengers: {
+              // The booking's owner first, so the account phone below lands on them.
+              orderBy: { position: 'asc' },
               select: {
-                id: true,
+                ...PROFILE_PASSENGER_SELECT,
                 fullName: true,
                 phone: true,
-                seatNumber: true,
                 roomNote: true,
                 hotelRoom: { select: { id: true, number: true, type: true, hotelBookingId: true } },
               },
@@ -637,11 +657,13 @@ export class HotelsService {
 
     const canSeeRates = actor.permissions.includes('hotels.rates');
     const passengers = trip.bookings
-      .flatMap((booking) =>
-        booking.passengers.map((p, idx) => ({
+      .flatMap((booking) => {
+        const profiles = passengerProfiles(booking.passengers, booking.user);
+        return booking.passengers.map((p, idx) => ({
           passengerId: p.id,
           bookingId: booking.id,
           bookingReference: booking.bookingReference,
+          bookingSize: booking.passengers.length,
           roomChoice: booking.roomChoice,
           bookingKind: booking.kind ? BOOKING_KIND_LABELS[booking.kind] : null,
           stayHotel: booking.stayHotel,
@@ -651,10 +673,11 @@ export class HotelsService {
           fullName: p.fullName,
           phone: p.phone ?? (idx === 0 ? booking.user.phone : null),
           seatNumber: p.seatNumber,
+          ...profiles.get(p.id)!,
           roomNote: p.roomNote,
           room: p.hotelRoom,
-        })),
-      )
+        }));
+      })
       .sort((a, b) => Number(a.seatNumber) - Number(b.seatNumber));
 
     return {
@@ -670,6 +693,7 @@ export class HotelsService {
         hasHousing: includesHousing(trip.bookingType) || trip.bookings.some((booking) => booking.stayHotel),
         suggestedHotel: trip.accommodations[0]?.name ?? trip.bookings.find((booking) => booking.stayHotel)?.stayHotel?.name ?? null,
         suggestedNights: trip.accommodations[0]?.nights ?? 1,
+        sharedRoomCapacity: trip.sharedRoomCapacity,
       },
       hotelBookings: trip.hotelBookings.map((b) => {
         return {
@@ -802,7 +826,16 @@ export class HotelsService {
     tx: Prisma.TransactionClient,
     actorId: string,
     hotelBookingId: string,
-    dto: { passengerIds: string[]; roomNumber: string; roomType: RoomType; capacity?: number; newRoomCapacity?: number; keepRoomType?: boolean; roomNote?: string },
+    dto: {
+      passengerIds: string[];
+      roomNumber: string;
+      roomType: RoomType;
+      capacity?: number;
+      newRoomCapacity?: number;
+      keepRoomType?: boolean;
+      roomNote?: string;
+      allowMixedGender?: boolean;
+    },
     ip?: string,
   ) {
     // One writer per hotel booking at a time, so two employees cannot both take a room's last bed.
@@ -877,6 +910,9 @@ export class HotelsService {
     if (staying + passengerIds.length > room.capacity) {
       throw new ConflictException(`الغرفة ${number} تتسع لـ ${room.capacity} وبها ${staying} بالفعل`);
     }
+    if (dto.roomType === 'SHARED' && !dto.allowMixedGender) {
+      await this.assertOneGender(tx, number, [...stayingOccupants.map((o) => o.id), ...passengerIds]);
+    }
 
     for (const passenger of passengers) {
       await tx.bookingPassenger.update({
@@ -927,6 +963,27 @@ export class HotelsService {
     await this.notifications.toBookingOwnersEach(tx, 'ROOMMATES_UPDATED', extras);
   }
 
+  /**
+   * A shared room joins strangers, so it holds men or women, not both. A family is one booking and may share a room
+   * whatever its members are; only people from different bookings are checked, and only where their gender is known.
+   */
+  private async assertOneGender(tx: Prisma.TransactionClient, roomNumber: string, passengerIds: string[]) {
+    const bookings = await tx.booking.findMany({
+      where: { passengers: { some: { id: { in: passengerIds } } } },
+      select: { id: true, user: { select: PROFILE_ACCOUNT_SELECT }, passengers: { select: PROFILE_PASSENGER_SELECT } },
+    });
+    if (bookings.length < 2) return;
+    const inRoom = new Set(passengerIds);
+    const genders = new Set<string>();
+    for (const booking of bookings) {
+      const profiles = passengerProfiles(booking.passengers, booking.user);
+      for (const [id, profile] of profiles) if (inRoom.has(id) && profile.gender) genders.add(profile.gender);
+    }
+    if (genders.size > 1) {
+      throw new ConflictException(`الغرفة ${roomNumber} مشتركة، ولا تجمع رجالًا ونساءً من حجوزات مختلفة`);
+    }
+  }
+
   private removeEmptyRooms(tx: Prisma.TransactionClient, roomIds: string[]) {
     return this.rooms.tidyEmptyRooms(tx, roomIds);
   }
@@ -934,6 +991,60 @@ export class HotelsService {
   async assignRoom(actor: HotelActor, hotelBookingId: string, dto: AssignRoomDto, ip?: string) {
     await this.prisma.$transaction((tx) => this.assignInTx(tx, actor.userId, hotelBookingId, dto, ip), TX_OPTIONS);
     return { success: true };
+  }
+
+  /**
+   * Saves a distribution plan room by room in one transaction, so a refused room (out of service, taken by another
+   * trip, a mixed shared room) leaves every passenger where they were, and the employee fixes the plan and saves again.
+   */
+  async assignRooms(actor: HotelActor, hotelBookingId: string, dto: BulkAssignRoomsDto, ip?: string) {
+    const numbers = dto.rooms.map((room) => room.roomNumber);
+    const repeated = numbers.find((number, idx) => numbers.indexOf(number) !== idx);
+    if (repeated) throw new BadRequestException(`الغرفة ${repeated} مكررة في الخطة`);
+    const everyone = dto.rooms.flatMap((room) => room.passengerIds);
+    if (new Set(everyone).size !== everyone.length) throw new BadRequestException('أحد المسافرين في أكثر من غرفة في الخطة');
+    if (everyone.length > MAX_PLANNED_PASSENGERS) throw new BadRequestException(`الحد الأقصى ${MAX_PLANNED_PASSENGERS} مسافرًا في المرة الواحدة`);
+
+    await this.prisma.$transaction(async (tx) => {
+      for (const room of dto.rooms) {
+        await this.assignInTx(tx, actor.userId, hotelBookingId, { ...room, roomNote: dto.roomNote }, ip);
+      }
+    }, BULK_TX_OPTIONS);
+    return { rooms: dto.rooms.length, passengers: everyone.length };
+  }
+
+  /** Housing staff fill in what the booking left blank, so the passenger can be filtered and placed with the right people. */
+  async updateRoomingProfile(actor: HotelActor, passengerId: string, dto: UpdateRoomingProfileDto, ip?: string) {
+    const nationality = dto.nationality === undefined ? undefined : dto.nationality?.trim() || null;
+    if (nationality && !NATIONALITIES.includes(nationality)) throw new BadRequestException('اختر الجنسية من القائمة');
+    if (dto.gender === undefined && nationality === undefined) throw new BadRequestException('لا يوجد تغيير للحفظ');
+
+    return this.prisma.$transaction(async (tx) => {
+      const found = await tx.bookingPassenger.findUnique({ where: { id: passengerId }, select: { bookingId: true } });
+      if (!found) throw new NotFoundException('المسافر غير موجود');
+      await this.events.lock(tx, found.bookingId);
+      const passenger = await tx.bookingPassenger.findUniqueOrThrow({
+        where: { id: passengerId },
+        select: { fullName: true, gender: true, nationality: true, booking: { select: { status: true } } },
+      });
+      if (!HOUSED_STATUSES.includes(passenger.booking.status)) throw new ConflictException('هذا الحجز ملغى');
+
+      const gender = dto.gender === undefined ? passenger.gender : dto.gender;
+      const next = nationality === undefined ? passenger.nationality : nationality;
+      if (gender === passenger.gender && next === passenger.nationality) return { gender, nationality: next };
+
+      await tx.bookingPassenger.update({ where: { id: passengerId }, data: { gender, nationality: next } });
+      await tx.booking.update({ where: { id: found.bookingId }, data: { updatedAt: new Date() } });
+      await this.events.record(tx, {
+        bookingId: found.bookingId,
+        action: 'PASSENGER_UPDATED',
+        actorId: actor.userId,
+        before: { fullName: passenger.fullName, gender: passenger.gender, nationality: passenger.nationality },
+        after: { fullName: passenger.fullName, gender, nationality: next },
+        ip,
+      });
+      return { gender, nationality: next };
+    }, TX_OPTIONS);
   }
 
   /** The supervisor only gives a room number: the room's type comes from what the customer booked, and the shared capacity from the trip. */

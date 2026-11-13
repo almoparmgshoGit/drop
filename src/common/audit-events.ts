@@ -60,6 +60,7 @@ export const AUDIT_EVENTS: Record<string, Event> = {
   'POST /trips/:id/open-reverse': on('trips', 'فتح رحلة عكسية'),
   'POST /trips/:id/duplicate': on('trips', 'نسخ رحلة إلى موعد جديد'),
   'POST /trips/series/generate-month': on('trips', 'توليد جدول الشهر من الجداول الأسبوعية'),
+  'POST /trips/series/far-drafts/delete': on('trips', 'حذف مسودات الجداول الأسبوعية البعيدة'),
   'POST /trips/series/:seriesId/publish': on('trips', 'نشر مسودات جدول أسبوعي'),
   'POST /trips/series/:seriesId/stop': on('trips', 'إيقاف جدول أسبوعي'),
   'POST /trips/:id/cancel': on('trips', 'إلغاء رحلة'),
@@ -103,6 +104,8 @@ export const AUDIT_EVENTS: Record<string, Event> = {
   'PATCH /hotels/:id': on('hotels', 'تعديل فندق'),
   'POST /hotels/bookings': on('hotels', 'حجز فندق لرحلة'),
   'POST /hotels/bookings/:id/rooms': on('hotels', 'تسكين ركاب في غرفة'),
+  'POST /hotels/bookings/:id/rooms/bulk': on('hotels', 'توزيع ركاب على الغرف تلقائيًا'),
+  'PATCH /hotels/passengers/:passengerId/profile': on('hotels', 'تحديد جنس وجنسية راكب للتسكين'),
   'POST /hotels/bookings/:id/inventory': on('hotels', 'إضافة غرف متاحة للحجز'),
   'POST /hotels/bookings/:id/cancel': on('hotels', 'إلغاء حجز فندق'),
   'POST /hotels/assign-booking': on('hotels', 'حجز غرفة من حجز عميل'),
@@ -342,6 +345,9 @@ const SETTING_LABELS: Record<string, string> = {
   loginMaxFailures: 'محاولات دخول الموظفين',
   loginLockMinutes: 'مدة إيقاف الدخول',
   customerLookupDailyLimit: 'حد البحث اليومي عن العملاء',
+  scheduleGenerateDaysBefore: 'توليد جدول الشهر قبل بدايته',
+  scheduleBookingOpens: 'موعد فتح الحجز للرحلات الثابتة',
+  scheduleOpenDaysBefore: 'فتح الحجز قبل الشهر بأيام',
   ...Object.fromEntries(INTEGRATION_FIELDS.map((field) => [field.key, field.label])),
 };
 

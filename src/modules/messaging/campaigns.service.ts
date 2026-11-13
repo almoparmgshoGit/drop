@@ -2,7 +2,7 @@ import { BadRequestException, ConflictException, ForbiddenException, Injectable,
 import { Prisma } from '@prisma/client';
 import { NOTIFICATION_CATALOG } from '../../common/notification-catalog';
 import { permissionsOf } from '../../common/permissions';
-import { NATIONALITIES } from '../../common/profile-options';
+import { CUSTOMER_CITIES, NATIONALITIES } from '../../common/profile-options';
 import { AppSettingsService } from '../../common/services/app-settings.service';
 import { approvedWhatsAppTemplates, CatalogView, templateWording, whatsappDelivery } from '../../common/services/notifications.service';
 import { LanguageWordings, normalizeLanguages, readWordings, typedWordings, Wording } from '../../common/message-languages';
@@ -10,7 +10,7 @@ import { PrismaService } from '../../common/services/prisma.service';
 import { PushService } from '../../common/services/push.service';
 import { RealtimeService } from '../../common/services/realtime.service';
 import { randomUUID } from 'crypto';
-import { assertAudienceFilters, AudienceFilters, audienceWhere, isMarketingCampaign } from './audience.util';
+import { aggregateAudience, assertAudienceFilters, AudienceFilters, audienceWhere, isMarketingCampaign } from './audience.util';
 import { CampaignDto, SendCampaignDto } from './campaigns.dto';
 
 const CAMPAIGN_EVENT = 'CUSTOMER_CAMPAIGN';
@@ -41,6 +41,24 @@ const TARGETING_GROUPS: (keyof AudienceFilters)[][] = [
   ['inactiveDays'],
   ['hasWallet'],
   ['languages'],
+  ['cities'],
+  ['ageMin', 'ageMax'],
+  ['idTypes'],
+  ['birthdayThisMonth'],
+  ['registeredWithinDays'],
+  ['minTrips', 'maxTrips'],
+  ['minSpent', 'maxSpent'],
+  ['minLoyaltyPoints'],
+  ['hasReferrals'],
+  ['bookingSources'],
+  ['branchIds'],
+  ['categories'],
+  ['usedCoupon'],
+  ['hasCancelled'],
+  ['activeWithinDays'],
+  ['notActiveDays'],
+  ['hasAppDevice'],
+  ['excludeOpenComplaints'],
 ];
 /** Each value of a many-choice filter gets its own count, up to this many, so a long list does not flood the database. */
 const MAX_TARGET_VALUES = 15;
@@ -82,9 +100,14 @@ export class CampaignsService {
     return { event, template, forLanguage: (language: string) => approved.get(language) ?? approved.get('ar') ?? null };
   }
 
+  /** The whole audience rule, with the per-customer counts and sums looked up first. */
+  private async where(filters: AudienceFilters, isMarketing: boolean, now = new Date()) {
+    return audienceWhere(filters, isMarketing, now, await aggregateAudience(this.prisma, filters, now));
+  }
+
   async options() {
     const now = new Date();
-    const [trips, places, nationalities, coupons, plain, offer] = await Promise.all([
+    const [trips, places, nationalities, coupons, plain, offer, branches] = await Promise.all([
       this.prisma.trip.findMany({
         where: { tripStatus: { in: ['PUBLISHED', 'COMPLETED'] }, departureTime: { gte: new Date(now.getTime() - 30 * DAY_MS) } },
         orderBy: { departureTime: 'asc' },
@@ -96,6 +119,7 @@ export class CampaignsService {
       this.prisma.coupon.findMany({ where: this.usableCoupon(now), orderBy: { createdAt: 'desc' }, take: 100, select: { id: true, code: true, type: true, value: true, validUntil: true } }),
       this.campaignWhatsApp(null),
       this.campaignWhatsApp('offer'),
+      this.prisma.branch.findMany({ orderBy: { name: 'asc' }, select: { id: true, name: true } }),
     ]);
     const upcoming = trips.filter((trip) => trip.departureTime >= now);
     return {
@@ -106,6 +130,8 @@ export class CampaignsService {
       origins: [...new Set(places.map((row) => row.origin))].sort(),
       nationalities: [...new Set([...NATIONALITIES, ...nationalities.flatMap((row) => (row.nationality ? [row.nationality] : []))])],
       coupons,
+      cities: CUSTOMER_CITIES,
+      branches,
       whatsappReady: { plain: !!plain.template, offer: !!offer.template },
     };
   }
@@ -113,10 +139,12 @@ export class CampaignsService {
   async audience(filters: AudienceFilters, couponId?: string | null) {
     assertAudienceFilters(filters);
     const isMarketing = isMarketingCampaign(filters, couponId);
-    const where = audienceWhere(filters, isMarketing);
+    const now = new Date();
+    const aggregates = await aggregateAudience(this.prisma, filters, now);
+    const where = audienceWhere(filters, isMarketing, now, aggregates);
     const [count, withoutOptOut, nationalities, genders, languages] = await Promise.all([
       this.prisma.user.count({ where }),
-      this.prisma.user.count({ where: audienceWhere(filters, false) }),
+      this.prisma.user.count({ where: audienceWhere(filters, false, now, aggregates) }),
       this.prisma.user.groupBy({ by: ['nationality'], where, _count: { _all: true } }),
       this.prisma.user.groupBy({ by: ['gender'], where, _count: { _all: true } }),
       this.prisma.user.groupBy({ by: ['messageLanguage'], where, _count: { _all: true } }),
@@ -171,7 +199,7 @@ export class CampaignsService {
   async report(id: string) {
     const campaign = await this.get(id);
     const filters = (campaign.filters ?? {}) as unknown as AudienceFilters;
-    const count = (subset: AudienceFilters) => this.prisma.user.count({ where: audienceWhere(subset, campaign.isMarketing) });
+    const count = async (subset: AudienceFilters) => this.prisma.user.count({ where: await this.where(subset, campaign.isMarketing) });
     const chosen = (keys: (keyof AudienceFilters)[]) => {
       const subset = Object.fromEntries(
         keys.flatMap((key) => {
@@ -279,7 +307,7 @@ export class CampaignsService {
 
     await this.assertCoupon(campaign.couponId);
     const filters = campaign.filters as unknown as AudienceFilters;
-    const count = await this.prisma.user.count({ where: audienceWhere(filters, campaign.isMarketing) });
+    const count = await this.prisma.user.count({ where: await this.where(filters, campaign.isMarketing) });
     if (count === 0) throw new ConflictException('لا يوجد عملاء يطابقون هذه الفلاتر');
     if (count !== dto.confirmCount) throw new ConflictException(`تغير عدد الجمهور إلى ${count}، راجعه ثم أرسل من جديد`);
     if (!actor.permissions.includes('notifications.campaigns_unlimited')) {
@@ -329,7 +357,8 @@ export class CampaignsService {
     if (claimed.count === 0) return;
     const campaign = await this.get(id);
     const filters = campaign.filters as unknown as AudienceFilters;
-    const where = audienceWhere(filters, campaign.isMarketing);
+    // Counts and sums are fixed once here, so every chunk of this run walks the same audience.
+    const where = await this.where(filters, campaign.isMarketing);
 
     // Hours can pass after scheduling, and what held then may not hold now.
     if (!campaign.startedAt) {

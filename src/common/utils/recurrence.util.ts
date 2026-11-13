@@ -39,7 +39,7 @@ export function nextYearlyDate(from: Date, calendar: TripCalendar) {
   return calendar === 'HIJRI' ? nextHijri(from) : nextGregorian(from);
 }
 
-/** How far ahead a fixed weekly trip is kept drafted, and the longest a temporary weekly one may run. */
+/** The longest a temporary weekly trip may run. A fixed weekly one is drafted a month at a time instead (see TripsService.weeklyHorizon). */
 export const WEEKLY_HORIZON_DAYS = 365;
 
 const riyadhMsOfDay = (date: Date) => (((date.getTime() + RIYADH_OFFSET_MS) % DAY_MS) + DAY_MS) % DAY_MS;

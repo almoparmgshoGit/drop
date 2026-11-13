@@ -1045,7 +1045,7 @@ export const NOTIFICATION_CATALOG = {
     audience: 'STAFF',
     group: 'المكتب',
     label: 'مسودة رحلة ثابتة',
-    trigger: 'عند إنشاء نسخة السنة القادمة من رحلة ثابتة (لمن يملك إدارة الرحلات)',
+    trigger: 'عند إنشاء نسخة السنة القادمة من رحلة سنوية، أو مسودات الشهر القادم من رحلة أسبوعية (لمن يملك إدارة الرحلات)',
     title: 'مسودة رحلة ثابتة {{tripCode}}',
     body: 'أُنشئت رحلة {{tripCode}} من {{origin}} إلى {{destination}} يوم {{departureDate}} كمسودة. راجعها وأسند الباص والطاقم ثم انشرها.',
     variables: TRIP,

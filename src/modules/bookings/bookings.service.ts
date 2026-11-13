@@ -34,6 +34,7 @@ import { PACKAGE_MAX_PERSONS, PACKAGE_PRICE_SELECT, packageGroupTotal, packagePr
 import { BookingLegDto, CreateBookingDto, HoldSeatsDto, QuoteDto, ReviewCancellationDto } from './bookings.dto';
 import { PublicService, SERVICE_SELECT, withHotelServices } from '../../common/utils/services.util';
 import { customPackageStay, loadCustomPackage } from '../../common/utils/custom-package.util';
+import { assertBookingOpened } from '../../common/utils/booking-opens.util';
 
 const DEFAULT_VAT_RATE = 15;
 const CANCELLATION_TX_OPTIONS = { maxWait: 10_000, timeout: 30_000 };
@@ -185,13 +186,14 @@ export class BookingsService {
   ) {}
 
   private assertBookable(
-    trip: { tripStatus: string; departureTime: Date; channelApp: boolean; packageId: string | null; package?: { status: string } | null } | null,
+    trip: { tripStatus: string; departureTime: Date; channelApp: boolean; bookingOpensAt: Date | null; packageId: string | null; package?: { status: string } | null } | null,
   ) {
     if (!trip) throw new NotFoundException('الرحلة غير موجودة');
     if (trip.tripStatus !== 'PUBLISHED' || !trip.channelApp) throw new BadRequestException('هذه الرحلة غير متاحة للحجز');
     // A package's trips go on sale with it: a draft or archived package keeps them off the app.
     if (trip.packageId && trip.package?.status !== 'PUBLISHED') throw new BadRequestException('هذه الرحلة غير متاحة للحجز');
     if (trip.departureTime <= new Date()) throw new BadRequestException('انتهى موعد الحجز لهذه الرحلة');
+    assertBookingOpened(trip);
   }
 
   /** The same seat rules everywhere; the branch screen and the customer's app differ only in who may buy. */

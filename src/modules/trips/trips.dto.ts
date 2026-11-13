@@ -233,6 +233,11 @@ export class CreateTripDto {
   @IsDateString()
   repeatUntil?: string | null;
 
+  /** No booking is taken before this moment, even once published. Null or left out opens booking on publish. */
+  @IsOptional()
+  @IsDateString()
+  bookingOpensAt?: string | null;
+
   @IsOptional()
   @IsEnum(TripDirection)
   direction?: TripDirection;
@@ -459,6 +464,13 @@ export class DuplicateTripDto {
   /** When the copy leaves; every other date in the trip moves with it. */
   @IsDateString()
   departureTime: string;
+}
+
+export class AdminTripsQuery {
+  /** currentMonth: only trips leaving from the 1st of this Riyadh month. Left out, every trip, as reports and pickers need. */
+  @IsOptional()
+  @IsIn(['currentMonth'])
+  from?: 'currentMonth';
 }
 
 export class SeriesMonthDto {

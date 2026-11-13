@@ -17,7 +17,7 @@ export class AudienceFiltersDto implements AudienceFilters {
   @IsOptional() @IsInt() @Min(1) @Max(3650) lastTripMinDays?: number;
   @IsOptional() @IsInt() @Min(1) @Max(3650) lastTripMaxDays?: number;
   @IsOptional() @IsBoolean() noUpcomingTrip?: boolean;
-  @IsOptional() @IsIn(['NEW', 'RETURNING']) customerType?: 'NEW' | 'RETURNING';
+  @IsOptional() @IsIn(['NEW', 'RETURNING', 'NEVER_BOOKED']) customerType?: 'NEW' | 'RETURNING' | 'NEVER_BOOKED';
   @IsOptional() @IsIn(['OWING', 'PAID']) payment?: 'OWING' | 'PAID';
   @IsOptional() @IsIn(['SHARED', 'PRIVATE']) housing?: 'SHARED' | 'PRIVATE';
   @IsOptional() @IsBoolean() packagesOnly?: boolean;
@@ -25,6 +25,28 @@ export class AudienceFiltersDto implements AudienceFilters {
   @IsOptional() @IsInt() @Min(1) @Max(3650) inactiveDays?: number;
   @IsOptional() @IsBoolean() hasWallet?: boolean;
   @IsOptional() @IsArray() @ArrayMaxSize(3) @IsIn(MESSAGE_LANGUAGES, { each: true }) languages?: ('ar' | 'en' | 'ur')[];
+
+  @IsOptional() @IsArray() @ArrayMaxSize(MAX_CHOICES) @IsString({ each: true }) @MaxLength(60, { each: true }) cities?: string[];
+  @IsOptional() @IsInt() @Min(0) @Max(120) ageMin?: number;
+  @IsOptional() @IsInt() @Min(0) @Max(120) ageMax?: number;
+  @IsOptional() @IsArray() @ArrayMaxSize(3) @IsIn(['NATIONAL_ID', 'IQAMA', 'PASSPORT'], { each: true }) idTypes?: ('NATIONAL_ID' | 'IQAMA' | 'PASSPORT')[];
+  @IsOptional() @IsBoolean() birthdayThisMonth?: boolean;
+  @IsOptional() @IsInt() @Min(1) @Max(3650) registeredWithinDays?: number;
+  @IsOptional() @IsInt() @Min(0) @Max(1000) minTrips?: number;
+  @IsOptional() @IsInt() @Min(0) @Max(1000) maxTrips?: number;
+  @IsOptional() @IsInt() @Min(0) @Max(10_000_000) minSpent?: number;
+  @IsOptional() @IsInt() @Min(0) @Max(10_000_000) maxSpent?: number;
+  @IsOptional() @IsInt() @Min(1) @Max(10_000_000) minLoyaltyPoints?: number;
+  @IsOptional() @IsBoolean() hasReferrals?: boolean;
+  @IsOptional() @IsArray() @ArrayMaxSize(2) @IsIn(['APP', 'BRANCH'], { each: true }) bookingSources?: ('APP' | 'BRANCH')[];
+  @IsOptional() @IsArray() @ArrayMaxSize(MAX_CHOICES) @IsString({ each: true }) @MaxLength(60, { each: true }) branchIds?: string[];
+  @IsOptional() @IsArray() @ArrayMaxSize(2) @IsIn(['FAMILY', 'SINGLES'], { each: true }) categories?: ('FAMILY' | 'SINGLES')[];
+  @IsOptional() @IsBoolean() usedCoupon?: boolean;
+  @IsOptional() @IsBoolean() hasCancelled?: boolean;
+  @IsOptional() @IsInt() @Min(1) @Max(3650) activeWithinDays?: number;
+  @IsOptional() @IsInt() @Min(1) @Max(3650) notActiveDays?: number;
+  @IsOptional() @IsBoolean() hasAppDevice?: boolean;
+  @IsOptional() @IsBoolean() excludeOpenComplaints?: boolean;
 }
 
 export class AudienceQueryDto {
