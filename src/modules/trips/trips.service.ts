@@ -24,9 +24,9 @@ import { seatLayoutFor, seatNumbersOf, storedSeatLayout, tripSeatLayout } from '
 import { assertSinglesFitRange } from '../../common/utils/singles-seats.util';
 import { applySeatLayout } from '../../common/utils/trip-seats.util';
 import { bookedOnTrips, goOnlyBookings, lockTripsWithLinked, returningBookingIds } from '../../common/utils/linked-seats.util';
-import { addDays, formatRiyadhDate, formatRiyadhTime, riyadhDate, riyadhDayRange, toHijriLabel } from '../../common/utils/time.util';
+import { RIYADH_OFFSET_MS, addDays, formatRiyadhDate, formatRiyadhTime, riyadhDate, riyadhDayRange, riyadhMonthRange, toHijriLabel } from '../../common/utils/time.util';
 import { applyBusServices, busServiceRows } from '../../common/utils/bus-services.util';
-import { WEEKLY_HORIZON_DAYS, nextWeeklyDate, nextYearlyDate } from '../../common/utils/recurrence.util';
+import { WEEKLY_HORIZON_DAYS, nextWeeklyDate, nextYearlyDate, riyadhWeekday } from '../../common/utils/recurrence.util';
 import { AppSettingsService } from '../../common/services/app-settings.service';
 import { imageTypeOf } from '../../common/utils/image-type.util';
 import { GALLERY_SELECT } from '../../common/utils/gallery.util';
@@ -451,11 +451,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
   private async draftNextInSeries(tx: Prisma.TransactionClient, seriesId: string) {
     const latest = await tx.trip.findFirst({ where: { seriesId }, orderBy: { departureTime: 'desc' }, select: { id: true, departureTime: true } });
     if (!latest) return null;
-    const template = await tx.trip.findFirst({
-      where: { id: { in: [seriesId, latest.id] } },
-      orderBy: { departureTime: 'asc' },
-      select: { id: true, departureTime: true, scheduleType: true, repeatWeekdays: true, repeatUntil: true },
-    });
+    const template = await this.seriesTemplate(tx, seriesId, latest.id);
     if (!template?.repeatWeekdays.length) return null;
     const now = new Date();
     const horizon = template.scheduleType === 'FIXED' ? new Date(now.getTime() + WEEKLY_HORIZON_DAYS * DAY_MS) : template.repeatUntil;
@@ -467,6 +463,137 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
       seriesId,
       keepBusAndCrew: true,
     });
+  }
+
+  /** The trip a series' copies are made from: the one that started it, or its latest trip once that one is gone. */
+  private seriesTemplate(db: Prisma.TransactionClient, seriesId: string, latestId: string) {
+    return db.trip.findFirst({
+      where: { id: { in: [seriesId, latestId] } },
+      orderBy: { departureTime: 'asc' },
+      select: { id: true, departureTime: true, scheduleType: true, repeatWeekdays: true, repeatUntil: true, origin: true, destination: true },
+    });
+  }
+
+  /**
+   * The series' weekdays in a Riyadh month (YYYY-MM), at its departure time: each day already holding a trip of the series,
+   * in any state, is taken; a day before the series began, already past, or beyond its horizon is out of range.
+   */
+  private async seriesMonthPlan(db: Prisma.TransactionClient, seriesId: string, month: string) {
+    const [first, latest] = await Promise.all([
+      db.trip.findFirst({ where: { seriesId }, orderBy: { departureTime: 'asc' }, select: { departureTime: true } }),
+      db.trip.findFirst({ where: { seriesId }, orderBy: { departureTime: 'desc' }, select: { id: true } }),
+    ]);
+    if (!first || !latest) return null;
+    const template = await this.seriesTemplate(db, seriesId, latest.id);
+    if (!template?.repeatWeekdays.length) return null;
+    const range = riyadhMonthRange(month);
+    const taken = new Set(
+      (await db.trip.findMany({ where: { seriesId, departureTime: { gte: range.gte, lt: range.lt } }, select: { departureTime: true } })).map((trip) =>
+        riyadhDate(trip.departureTime),
+      ),
+    );
+    const now = new Date();
+    const horizon = template.scheduleType === 'FIXED' ? new Date(now.getTime() + WEEKLY_HORIZON_DAYS * DAY_MS) : template.repeatUntil;
+    const timeOfDay = (((template.departureTime.getTime() + RIYADH_OFFSET_MS) % DAY_MS) + DAY_MS) % DAY_MS;
+    const days: { departure: Date; state: 'missing' | 'taken' | 'outOfRange' }[] = [];
+    for (let dayStart = range.gte.getTime(); dayStart < range.lt.getTime(); dayStart += DAY_MS) {
+      const departure = new Date(dayStart + timeOfDay);
+      if (!template.repeatWeekdays.includes(riyadhWeekday(departure))) continue;
+      const state = taken.has(riyadhDate(departure))
+        ? 'taken'
+        : departure <= now || departure < first.departureTime || !horizon || departure > horizon
+          ? 'outOfRange'
+          : 'missing';
+      days.push({ departure, state });
+    }
+    return { template, route: `${template.origin} ← ${template.destination}`, days };
+  }
+
+  /**
+   * Makes sure every running weekly schedule has its drafts on all its weekdays of the month. Each series is first drafted
+   * up to its horizon as the sweep would, then any day still without a trip of the series, such as one whose draft was
+   * deleted, is drafted. A day that has one is skipped, so running it twice adds nothing. With dryRun nothing is written.
+   */
+  async generateSeriesMonth(month: string, actor: CrewActor & { permissions: string[] }, dryRun = false) {
+    // A branch employee works with the schedules of their city's trips, as in the trips list.
+    const city = await servedCity(this.prisma, { userId: actor.userId, permissions: actor.permissions });
+    const rows = await this.prisma.trip.findMany({
+      where: { seriesId: { not: null }, repeatWeekdays: { isEmpty: false }, ...(city && cityTripWhere(city)) },
+      distinct: ['seriesId'],
+      select: { seriesId: true },
+    });
+    const series: { seriesId: string; route: string; created: number; skipped: number; outOfRange: number }[] = [];
+    const failed: { route: string; date: string; reason: string }[] = [];
+    for (const { seriesId } of rows) {
+      const plan = await this.seriesMonthPlan(this.prisma, seriesId, month);
+      if (!plan) continue;
+      const missing = plan.days.filter((day) => day.state === 'missing');
+      let created = missing.length;
+      if (!dryRun && missing.length) {
+        try {
+          await this.extendSeries(seriesId);
+        } catch (err) {
+          console.error(`Could not extend weekly trips ${seriesId}:`, err.message);
+        }
+        for (const day of missing) {
+          try {
+            await this.prisma.$transaction(async (tx) => {
+              // Takes turns with the sweep on this series, then checks again: the day may have been drafted meanwhile.
+              await tx.$queryRaw`SELECT 1 AS locked FROM pg_advisory_xact_lock(hashtext(${seriesId}))`;
+              const { start, end } = riyadhDayRange(riyadhDate(day.departure))!;
+              if (await tx.trip.count({ where: { seriesId, departureTime: { gte: start, lt: end } } })) return;
+              const latest = await tx.trip.findFirst({ where: { seriesId }, orderBy: { departureTime: 'desc' }, select: { id: true } });
+              const template = latest && (await this.seriesTemplate(tx, seriesId, latest.id));
+              if (!template?.repeatWeekdays.length) throw new ConflictException('توقف الجدول أثناء التوليد');
+              await this.cloneTrip(tx, template.id, day.departure, {
+                schedule: { scheduleType: template.scheduleType, recurrenceCalendar: null, repeatWeekdays: template.repeatWeekdays, repeatUntil: template.repeatUntil },
+                seriesId,
+                keepBusAndCrew: true,
+                actor,
+                crewReason: 'توليد جدول الشهر',
+              });
+            }, TRIP_TX_OPTIONS);
+          } catch (err) {
+            created--;
+            if (!(err instanceof HttpException)) console.error(`Could not draft ${riyadhDate(day.departure)} of weekly trips ${seriesId}:`, err.message);
+            failed.push({ route: plan.route, date: riyadhDate(day.departure), reason: err instanceof HttpException ? err.message : 'تعذر إنشاء الرحلة' });
+          }
+        }
+      }
+      series.push({
+        seriesId,
+        route: plan.route,
+        created,
+        skipped: plan.days.filter((day) => day.state === 'taken').length,
+        outOfRange: plan.days.filter((day) => day.state === 'outOfRange').length,
+      });
+    }
+    const total = (key: 'created' | 'skipped' | 'outOfRange') => series.reduce((sum, entry) => sum + entry[key], 0);
+    return { month, dryRun, series: series.length, created: total('created'), skipped: total('skipped'), outOfRange: total('outOfRange'), failed, bySeries: series };
+  }
+
+  /**
+   * Copies a trip to a new departure as a one-off draft: its route, stops, gathering points, services, prices, stay and
+   * visits, under the new month's next number and with no bookings. The bus and crew come along only when they are free
+   * and allowed then, as for a weekly copy; otherwise the office assigns them before publishing.
+   */
+  async duplicateTrip(id: string, departureTime: string, actor?: CrewActor) {
+    const departure = new Date(departureTime);
+    if (Number.isNaN(departure.getTime())) throw new BadRequestException('موعد الرحلة غير صالح');
+    if (departure <= new Date()) throw new BadRequestException('اختر موعدًا قادمًا للرحلة الجديدة');
+    const source = await this.prisma.trip.findUnique({ where: { id }, select: { reverseOfTripId: true, packageId: true } });
+    if (!source) throw new NotFoundException('Trip not found');
+    if (source.reverseOfTripId) throw new BadRequestException('الرحلة العكسية تُفتح من رحلة الذهاب ولا تُنسخ');
+    const draft = await this.prisma.$transaction(async (tx) => {
+      if (source.packageId) await assertTripFitsPackage(tx, source.packageId, departure);
+      return this.cloneTrip(tx, id, departure, {
+        schedule: { scheduleType: 'TEMPORARY', recurrenceCalendar: null, repeatWeekdays: [], repeatUntil: null },
+        keepBusAndCrew: true,
+        actor,
+        crewReason: 'نسخة من رحلة',
+      });
+    }, TRIP_TX_OPTIONS);
+    return { id: draft.id, tripCode: draft.tripCode, tripStatus: draft.tripStatus, departureTime: draft.departureTime, busId: draft.busId };
   }
 
   /** Whether the bus and crew are free and allowed at that time; a copy that cannot keep them waits for the office to assign. */
@@ -529,7 +656,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
     tx: Prisma.TransactionClient,
     sourceId: string,
     departure: Date,
-    options: { schedule: Schedule; keepBusAndCrew: boolean; seriesId?: string },
+    options: { schedule: Schedule; keepBusAndCrew: boolean; seriesId?: string; actor?: CrewActor; crewReason?: string },
   ) {
     const source = await tx.trip.findUniqueOrThrow({
       where: { id: sourceId },
@@ -610,8 +737,11 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
         channelBranch: source.channelBranch,
         seats: { createMany: { data: seatNumbers.map((seatNumber) => ({ seatNumber })) } },
         images: { create: source.images.map(({ url }) => ({ url })) },
-        boardingPoints: { create: source.boardingPoints.map(({ name, time, address, lat, lng }) => ({ name, time, address, lat, lng })) },
-        itineraryStops: { create: source.itineraryStops.map(({ title, time, desc, kind, sortOrder }) => ({ title, time, desc, kind, sortOrder })) },
+        // Clock times keep their distance from the departure, so a copy at another hour gathers at the matching hour.
+        boardingPoints: { create: source.boardingPoints.map(({ name, time, address, lat, lng }) => ({ name, time: shiftClock(time, source.departureTime, departure), address, lat, lng })) },
+        itineraryStops: {
+          create: source.itineraryStops.map(({ title, time, desc, kind, sortOrder }) => ({ title, time: shiftClock(time, source.departureTime, departure), desc, kind, sortOrder })),
+        },
         services: {
           create: [
             ...source.services.map(({ serviceId }) => ({ serviceId })),
@@ -639,7 +769,14 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
       await this.rooms.openForTrip(tx, draft, stay.hotelId, nights);
     }
     if (crew.driverIds.length || crew.supervisorIds.length) {
-      await this.logCrew(tx, draft.id, { drivers: [], supervisors: [] }, { drivers: crew.driverIds, supervisors: crew.supervisorIds }, undefined, 'نسخة من جدول الرحلة الأسبوعي');
+      await this.logCrew(
+        tx,
+        draft.id,
+        { drivers: [], supervisors: [] },
+        { drivers: crew.driverIds, supervisors: crew.supervisorIds },
+        options.actor,
+        options.crewReason ?? 'نسخة من جدول الرحلة الأسبوعي',
+      );
     }
     return draft;
   }

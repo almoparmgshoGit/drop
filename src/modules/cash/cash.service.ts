@@ -484,6 +484,29 @@ export class CashService {
     return tx.cashMovement.create({ data: { sessionId, type, amount, ...link, createdById: actor.userId, createdByName: actor.name ?? null } });
   }
 
+  /**
+   * The expected balance, in riyals, of each open drawer among these branches that the caller could read on the cash
+   * page (cash.view, and the branch is theirs unless they hold cash.all_branches). Branches left out are closed or not
+   * the caller's to see.
+   */
+  async openDrawerBalances(actor: CashActor, branchIds: string[]) {
+    const balances = new Map<string, number>();
+    if (!actor.permissions.includes('cash.view') || branchIds.length === 0) return balances;
+    let visible = branchIds;
+    if (!actor.permissions.includes('cash.all_branches')) {
+      const me = await this.prisma.user.findUnique({ where: { id: actor.userId }, select: { branchId: true } });
+      visible = branchIds.filter((id) => id === me?.branchId);
+    }
+    if (visible.length === 0) return balances;
+    const sessions = await this.prisma.cashSession.findMany({ where: { branchId: { in: visible }, status: 'OPEN' }, select: { id: true, branchId: true, openingBalance: true } });
+    await Promise.all(
+      sessions.map(async (session) => {
+        balances.set(session.branchId, toSar((await this.balanceOf(this.prisma, session)).expected));
+      }),
+    );
+    return balances;
+  }
+
   /** The balance is always summed from the ledger and never stored while the drawer is open, so it cannot drift from it. */
   private async balanceOf(db: Db, session: Pick<CashSession, 'id' | 'openingBalance'>) {
     const groups = await db.cashMovement.groupBy({ by: ['type'], where: { sessionId: session.id }, _sum: { amount: true } });

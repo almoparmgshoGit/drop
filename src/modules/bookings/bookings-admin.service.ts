@@ -7,6 +7,7 @@ import { lockBookingWithTrip } from '../../common/services/booking-cancellation.
 import { NotificationsService } from '../../common/services/notifications.service';
 import { AppSettingsService, withinHours } from '../../common/services/app-settings.service';
 import { csvCell } from '../../common/utils/csv.util';
+import { invoiceNumber } from '../../common/utils/invoice.util';
 import { tripSeatLayout } from '../../common/utils/bus-layout.util';
 import { goOnlyBookings, lockTripsWithLinked, releaseLinkedSeats, returnRideOf, reverseSeatsSummary, takeLinkedSeats } from '../../common/utils/linked-seats.util';
 import { passengerWeights } from '../../common/utils/housing-price.util';
@@ -213,7 +214,7 @@ export class BookingsAdminService {
     };
     const take = restricted ? LOOKUP_RESULT_LIMIT : SEARCH_LIMIT;
     const [bookings, total] = await Promise.all([
-      this.prisma.booking.findMany({ where, include: LIST_INCLUDE, orderBy: { createdAt: 'desc' }, take }),
+      this.prisma.booking.findMany({ where, include: { ...LIST_INCLUDE, invoice: { select: { number: true, tripCode: true } } }, orderBy: { createdAt: 'desc' }, take }),
       this.prisma.booking.count({ where }),
     ]);
     await scoped?.done(bookings.length);
@@ -229,6 +230,7 @@ export class BookingsAdminService {
         passengerId: passenger.id,
         bookingId: booking.id,
         bookingReference: booking.bookingReference,
+        invoiceNumber: booking.invoice ? invoiceNumber(booking.invoice.tripCode, booking.invoice.number) : null,
         fullName: passenger.fullName,
         phone: passenger.phone ?? booking.user.phone,
         nationalId: passenger.nationalId,

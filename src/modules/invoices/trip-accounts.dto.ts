@@ -1,6 +1,6 @@
-import { AccountCategoryGroup } from '@prisma/client';
+import { AccountCategoryGroup, AccountParty, EntrySettlement } from '@prisma/client';
 import { Transform, Type } from 'class-transformer';
-import { ArrayMaxSize, IsArray, IsBoolean, IsIn, IsNumber, IsOptional, IsString, Length, Matches, Max, MaxLength, Min, ValidateNested } from 'class-validator';
+import { ArrayMaxSize, IsArray, IsBoolean, IsEnum, IsIn, IsNumber, IsOptional, IsString, Length, Matches, Max, MaxLength, Min, ValidateNested } from 'class-validator';
 
 const trimmed = () => Transform(({ value }) => (typeof value === 'string' ? value.trim() : value));
 // A form with files sends every field as text.
@@ -63,6 +63,16 @@ export class CreateEntryDto {
   @IsString()
   @MaxLength(300)
   notes?: string;
+
+  /** Whose account the line goes on; the office's own cost when left out. */
+  @IsOptional()
+  @IsEnum(AccountParty, { message: 'الجهة غير صحيحة' })
+  chargedTo?: AccountParty;
+
+  /** Paid now, due at the month's end, or paid ahead to be offset. Paid when left out. */
+  @IsOptional()
+  @IsEnum(EntrySettlement, { message: 'حالة السداد غير صحيحة' })
+  settlement?: EntrySettlement;
 
   /** Generated when the form opens, so a repeated submit cannot record the expense twice. */
   @IsString()

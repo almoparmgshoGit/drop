@@ -14,6 +14,7 @@ import {
   Length,
   Max,
   MaxLength,
+  Matches,
   Min,
   ValidateNested,
 } from 'class-validator';
@@ -452,4 +453,16 @@ export class ReverseTripsQuery {
   /** Without a range, every upcoming trip: a reverse can be opened as soon as its outbound is published. */
   @IsIn(['week', 'month', 'all'])
   range?: 'week' | 'month' | 'all';
+}
+
+export class DuplicateTripDto {
+  /** When the copy leaves; every other date in the trip moves with it. */
+  @IsDateString()
+  departureTime: string;
+}
+
+export class SeriesMonthDto {
+  /** A calendar month in Riyadh, as YYYY-MM. */
+  @Matches(/^\d{4}-(0[1-9]|1[0-2])$/, { message: 'اختر الشهر بصيغة YYYY-MM' })
+  month: string;
 }

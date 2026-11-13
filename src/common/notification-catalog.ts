@@ -63,6 +63,7 @@ const VARIABLES = {
   returnedAmount: { label: 'المبلغ المرتجع', example: '50 ر.س' },
   voidReason: { label: 'سبب الإلغاء', example: 'الفاتورة غير واضحة' },
   branchName: { label: 'اسم الفرع', example: 'فرع الحدائق' },
+  assignedBy: { label: 'اسم الموظف المحوِّل', example: 'سارة أحمد' },
   businessDate: { label: 'تاريخ الصندوق', example: '2026-10-24' },
   differenceAmount: { label: 'فرق الإقفال بالإشارة', example: '-20 ر.س' },
   carriedAmount: { label: 'رصيد آخر إقفال', example: '1810 ر.س' },
@@ -1103,6 +1104,19 @@ export const NOTIFICATION_CATALOG = {
     translations: {
       en: { title: 'You have been assigned to a branch', body: 'You now work at {{branchName}}. From now on, your bookings and cash box belong to this branch.' },
       ur: { title: 'آپ کو ایک برانچ میں مقرر کیا گیا', body: 'اب آپ {{branchName}} میں کام کریں گے۔ اب سے آپ کی بکنگز اور کیش باکس اسی برانچ کے تحت ہوں گے۔' },
+    },
+  },
+  CHAT_ASSIGNED: {
+    audience: 'STAFF',
+    group: 'المحادثات',
+    label: 'تحويل محادثة إليك',
+    trigger: 'عند تحويل محادثة عميل إلى موظف',
+    title: 'حُوّلت إليك محادثة',
+    body: 'حوّل {{assignedBy}} إليك محادثة العميل {{customerName}}. تجدها في المحادثات.',
+    variables: ['userName', 'assignedBy', 'customerName'],
+    translations: {
+      en: { title: 'A chat was transferred to you', body: '{{assignedBy}} transferred the chat with {{customerName}} to you. You will find it in Conversations.' },
+      ur: { title: 'ایک چیٹ آپ کو منتقل کی گئی', body: '{{assignedBy}} نے کسٹمر {{customerName}} کی چیٹ آپ کو منتقل کی ہے۔ یہ آپ کو گفتگو میں ملے گی۔' },
     },
   },
   CUSTODY_ISSUED: {

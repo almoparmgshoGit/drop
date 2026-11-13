@@ -131,8 +131,15 @@ export class BranchesService {
       include: { manager: { select: { id: true, name: true } }, _count: { select: { users: true } } },
     });
     if (branches.length === 0) return [];
-    const figures = await this.figures(branches.map((branch) => branch.id));
-    return branches.map(({ _count, ...branch }) => ({ ...branch, employeeCount: _count.users, figures: figures.get(branch.id) }));
+    const ids = branches.map((branch) => branch.id);
+    // The open drawer's balance is added only where the caller could read it on the cash page.
+    const [figures, balances] = await Promise.all([this.figures(ids), this.cash.openDrawerBalances(actor, ids)]);
+    return branches.map(({ _count, ...branch }) => {
+      const branchFigures = figures.get(branch.id);
+      const balance = balances.get(branch.id);
+      const drawer = branchFigures?.drawer && (branchFigures.drawer.isOpen && balance !== undefined ? { ...branchFigures.drawer, balance } : branchFigures.drawer);
+      return { ...branch, employeeCount: _count.users, figures: branchFigures && { ...branchFigures, drawer } };
+    });
   }
 
   async detail(actor: CashActor, id: string) {

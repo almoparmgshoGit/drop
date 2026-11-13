@@ -3,7 +3,7 @@ import { FilesInterceptor } from '@nestjs/platform-express';
 import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
 import { IsBoolean, IsOptional, IsString, MaxLength } from 'class-validator';
 import { MAX_PUBLIC_IMAGE_BYTES, MAX_PUBLIC_IMAGES_PER_UPLOAD, TripsService, UploadedImage } from './trips.service';
-import { CreateTripDto, OpenReverseTripDto, ReverseTripsQuery, StopSeriesDto, UpdateTripDto } from './trips.dto';
+import { CreateTripDto, DuplicateTripDto, OpenReverseTripDto, ReverseTripsQuery, SeriesMonthDto, StopSeriesDto, UpdateTripDto } from './trips.dto';
 import { Public, RequirePermission } from '../../common/decorators/auth.decorators';
 
 class TripSearchQuery {
@@ -73,6 +73,22 @@ export class TripsController {
     return this.tripsService.getReverseTrips(query.range);
   }
 
+  @Get('series/month-plan')
+  @RequirePermission('trips.manage')
+  @ApiBearerAuth()
+  @ApiOperation({ summary: "How many drafts generating a month's weekly schedules would make, without making them" })
+  async previewSeriesMonth(@Req() req, @Query() query: SeriesMonthDto) {
+    return this.tripsService.generateSeriesMonth(query.month, req.user, true);
+  }
+
+  @Post('series/generate-month')
+  @RequirePermission('trips.manage')
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Draft every running weekly schedule on all its weekdays of a month, skipping days it already has' })
+  async generateSeriesMonth(@Req() req, @Body() dto: SeriesMonthDto) {
+    return this.tripsService.generateSeriesMonth(dto.month, req.user);
+  }
+
   @Post('series/:seriesId/publish')
   @RequirePermission('trips.manage')
   @ApiBearerAuth()
@@ -138,6 +154,14 @@ export class TripsController {
   @ApiOperation({ summary: 'Update trip' })
   async updateTrip(@Req() req, @Param('id') id: string, @Body() dto: UpdateTripDto) {
     return this.tripsService.updateTrip(id, dto, req.user);
+  }
+
+  @Post(':id/duplicate')
+  @RequirePermission('trips.manage')
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Copy a trip to a new departure as a draft without bookings' })
+  async duplicateTrip(@Req() req, @Param('id') id: string, @Body() dto: DuplicateTripDto) {
+    return this.tripsService.duplicateTrip(id, dto.departureTime, req.user);
   }
 
   @Post(':id/open-reverse')

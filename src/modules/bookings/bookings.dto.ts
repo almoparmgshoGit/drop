@@ -156,6 +156,11 @@ export class AdminCancelDto {
   @Min(0)
   refundAmount?: number;
 
+  /** WALLET (the default) credits the wallet now; ORIGINAL splits it the way an approved cancellation request does. */
+  @IsOptional()
+  @IsEnum(RefundDestination, { message: 'طريقة الاسترداد غير صحيحة' })
+  refundMethod?: RefundDestination;
+
   @trimmed()
   @IsString()
   @Length(3, 300, { message: 'سبب الإلغاء إلزامي' })

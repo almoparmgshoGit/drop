@@ -119,6 +119,7 @@ const USER_SELECT = {
 const CUSTOMER_ROW_SELECT = {
   ...USER_SELECT,
   blockedAt: true,
+  lastLoginAt: true,
   _count: { select: { bookings: true } },
   bookings: { orderBy: { createdAt: 'desc' }, take: 1, select: { createdAt: true } },
   conversation: { select: { id: true } },
@@ -589,6 +590,7 @@ export class UsersService implements OnModuleInit, OnModuleDestroy {
         passwordHash: true,
         blockedAt: true,
         blockedReason: true,
+        lastLoginAt: true,
         conversation: { select: { id: true } },
         bookings: {
           // Field by field: a ticket's signed token boards whoever holds it, and costs are not a support employee's concern.

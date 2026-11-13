@@ -34,6 +34,9 @@ const ACCOUNT_WIDE_FAILURES_FACTOR = 10;
 const GOOGLE_LINK_TTL_SECONDS = 15 * 60;
 const googleLinkKey = (linkToken: string) => `google_link:${linkToken}`;
 
+/** A refreshed session moves the last-login time only when it is older than this, so frequent refreshes do not each write to the account. */
+const LAST_LOGIN_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
+
 /** What a verified Google ID token says about its owner. The email is kept only when Google verified it. */
 interface GoogleIdentity {
   googleId: string;
@@ -341,7 +344,7 @@ export class AuthService {
       throw new ForbiddenException('Refresh token reuse detected. All sessions revoked.');
     }
 
-    return this.generateAuthTokens(storedToken.userId, storedToken.user.role, ip, userAgent);
+    return this.generateAuthTokens(storedToken.userId, storedToken.user.role, ip, userAgent, true);
   }
 
   /** accessTokenExp is the token's own expiry in seconds, so it stays refused for exactly as long as it could still be used. */
@@ -368,7 +371,8 @@ export class AuthService {
     return { ...user, rank: rank && { id: rank.id, name: rank.name }, permissions: permissionsOf({ role: user.role, rank, extraPermissions, revokedPermissions }) };
   }
 
-  private async generateAuthTokens(userId: string, role: string, ip?: string, userAgent?: string) {
+  /** refreshed marks a session refresh rather than a sign-in: it moves the last-login time only when that is a few minutes old. */
+  private async generateAuthTokens(userId: string, role: string, ip?: string, userAgent?: string, refreshed = false) {
     const jti = crypto.randomUUID();
     const accessToken = this.jwtService.sign(
       { sub: userId, role, jti },
@@ -390,6 +394,12 @@ export class AuthService {
         userAgent,
         expiresAt,
       },
+    });
+
+    const now = new Date();
+    await this.prisma.user.updateMany({
+      where: { id: userId, ...(refreshed && { OR: [{ lastLoginAt: null }, { lastLoginAt: { lt: new Date(now.getTime() - LAST_LOGIN_REFRESH_INTERVAL_MS) } }] }) },
+      data: { lastLoginAt: now },
     });
 
     const user = await this.getMe(userId);

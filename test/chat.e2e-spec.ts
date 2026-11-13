@@ -138,6 +138,33 @@ describe('Chat, presence, blocking and promotional credit', () => {
       await http().get(`${API}/chat/conversations/${row.id}`).set(session.auth).expect(200);
       await http().post(`${API}/chat/conversations/${row.id}/messages`).set(session.auth).send({ body: 'x' }).expect(403);
     });
+
+    it('transfers a thread to an employee who can answer, and filters the list by assignee', async () => {
+      const job = await prisma.jobType.findFirstOrThrow();
+      const reader = await createStaff(prisma, 'STAFF', nextPhone(), RANK_ID);
+      await prisma.rank.upsert({ where: { id: `${RANK_ID}-reply` }, update: {}, create: { id: `${RANK_ID}-reply`, name: 'موظف محادثات', role: 'STAFF', jobId: job.id, permissions: ['chat.view', 'chat.reply'] } });
+      const agent = await createStaff(prisma, 'STAFF', nextPhone(), `${RANK_ID}-reply`);
+      const customer = await loginPassenger(app);
+      const { list } = await startThread(customer);
+      const row = list.items.find((item: any) => item.customer.phone === customer.phone);
+
+      const staff = await http().get(`${API}/chat/staff`).set(admin.auth).expect(200);
+      expect(staff.body.some((user: any) => user.id === agent.id)).toBe(true);
+      expect(staff.body.some((user: any) => user.id === reader.id)).toBe(false);
+
+      const unassigned = await http().get(`${API}/chat/conversations?filter=all&assignee=none`).set(admin.auth).expect(200);
+      expect(unassigned.body.items.some((item: any) => item.id === row.id)).toBe(true);
+
+      await http().post(`${API}/chat/conversations/${row.id}/assign`).set(admin.auth).send({ assigneeId: reader.id }).expect(400);
+      const moved = await http().post(`${API}/chat/conversations/${row.id}/assign`).set(admin.auth).send({ assigneeId: agent.id }).expect(201);
+      expect(moved.body.assignedToId).toBe(agent.id);
+      await http().post(`${API}/chat/conversations/${row.id}/assign`).set(admin.auth).send({ assigneeId: agent.id }).expect(409);
+
+      const theirs = await http().get(`${API}/chat/conversations?filter=all&assignee=${agent.id}`).set(admin.auth).expect(200);
+      expect(theirs.body.items.map((item: any) => item.id)).toEqual([row.id]);
+      const stillUnassigned = await http().get(`${API}/chat/conversations?filter=all&assignee=none`).set(admin.auth).expect(200);
+      expect(stillUnassigned.body.items.some((item: any) => item.id === row.id)).toBe(false);
+    });
   });
 
   describe('presence', () => {

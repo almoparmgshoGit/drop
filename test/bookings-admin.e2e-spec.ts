@@ -276,6 +276,26 @@ describe('Booking administration (e2e)', () => {
       expect(events[0].reason).toBe('قرار إداري');
     });
 
+    it('refunds to the original payment method as a pending refund, once', async () => {
+      const { user, booking } = await bookOne();
+      const url = `${API}/bookings/${booking.id}/admin-cancel`;
+      await request(http()).post(url).set(admin.auth).send({ note: 'قرار إداري', refundMethod: 'CARD' }).expect(400);
+
+      const results = await Promise.all(
+        Array.from({ length: 3 }, () => request(http()).post(url).set(admin.auth).send({ note: 'قرار إداري', refundMethod: 'ORIGINAL' })),
+      );
+      const done = results.filter((r) => r.status === 201);
+      expect(done).toHaveLength(1);
+      expect(Number(done[0].body.refundAmount)).toBe(0);
+
+      const profile = await request(http()).get(`${API}/users/profile`).set(user.auth).expect(200);
+      expect(Number(profile.body.walletBalance)).toBe(0);
+      const refunds = await prisma.paymentTransaction.findMany({ where: { bookingId: booking.id, type: 'REFUND' } });
+      expect(refunds).toHaveLength(1);
+      expect(refunds[0]).toMatchObject({ status: 'PENDING', destination: 'ORIGINAL', method: 'mada' });
+      expect(Number(refunds[0].amount)).toBe(180);
+    });
+
     it('refuses to cancel a booking with some passengers already boarded', async () => {
       const { trip, booking } = await bookOne({}, ['5', '6']);
       await prisma.trip.update({ where: { id: trip.id }, data: { departureTime: new Date(Date.now() + 3_600_000) } });

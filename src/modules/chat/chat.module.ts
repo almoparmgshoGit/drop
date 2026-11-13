@@ -6,6 +6,7 @@ import { Transform, Type } from 'class-transformer';
 import { IsBoolean, IsDateString, IsIn, IsInt, IsOptional, IsString, Length, Matches, Max, MaxLength, Min } from 'class-validator';
 import { RequirePermission, SkipAudit } from '../../common/decorators/auth.decorators';
 import { NotificationsService } from '../../common/services/notifications.service';
+import { permissionsOf } from '../../common/permissions';
 import { PrismaService } from '../../common/services/prisma.service';
 import { RealtimeService } from '../../common/services/realtime.service';
 import { paymentFigures } from '../../common/utils/payment.util';
@@ -80,11 +81,17 @@ class ConversationsQuery {
   @IsOptional() @IsIn(['all', 'unread', 'mine', 'closed']) filter?: 'all' | 'unread' | 'mine' | 'closed';
   @IsOptional() @trimmed() @IsString() @MaxLength(60) search?: string;
   @IsOptional() @Type(() => Number) @IsInt() @Min(1) @Max(100) limit?: number;
+  /** An employee's id, or "none" for threads nobody has taken. Narrows whichever filter is chosen. */
+  @IsOptional() @IsString() @MaxLength(64) assignee?: string;
 }
 
 class UpdateConversationDto {
   @IsOptional() @IsIn(['OPEN', 'CLOSED']) status?: 'OPEN' | 'CLOSED';
   @IsOptional() @IsBoolean() assignToMe?: boolean;
+}
+
+class AssignConversationDto {
+  @IsString() @MaxLength(64) assigneeId: string;
 }
 
 class StartConversationDto {
@@ -289,11 +296,13 @@ export class ChatService {
           ],
         }
       : {};
+    // The assignee narrows every tab and its count alike, so the numbers match the list beneath them.
+    const assignee: Prisma.ConversationWhereInput = query.assignee ? { AND: [{ assignedToId: query.assignee === 'none' ? null : query.assignee }] } : {};
     const FILTERS: Record<string, Prisma.ConversationWhereInput> = {
-      all: { status: 'OPEN' },
-      unread: { status: 'OPEN', staffUnread: { gt: 0 } },
-      mine: { status: 'OPEN', assignedToId: staff.userId },
-      closed: { status: 'CLOSED' },
+      all: { status: 'OPEN', ...assignee },
+      unread: { status: 'OPEN', staffUnread: { gt: 0 }, ...assignee },
+      mine: { status: 'OPEN', assignedToId: staff.userId, ...assignee },
+      closed: { status: 'CLOSED', ...assignee },
     };
     const [items, all, unread, mine, closed, online] = await Promise.all([
       this.prisma.conversation.findMany({
@@ -490,6 +499,47 @@ export class ChatService {
       select: { id: true, status: true, assignedToId: true, assignedToName: true },
     });
     this.realtime.chatUpdated(id);
+    return updated;
+  }
+
+  /** Employees who may answer customers, for the assignee filter and the transfer picker. */
+  async chatStaff() {
+    const staff = await this.prisma.user.findMany({
+      where: {
+        role: { not: 'PASSENGER' },
+        blockedAt: null,
+        NOT: { driverProfile: { is: { isActive: false } } },
+        OR: [{ role: 'ADMIN' }, { rank: { permissions: { has: 'chat.reply' } } }, { extraPermissions: { has: 'chat.reply' } }],
+      },
+      orderBy: { name: 'asc' },
+      select: { id: true, name: true, phone: true, role: true, extraPermissions: true, revokedPermissions: true, rank: { select: { name: true, permissions: true } } },
+    });
+    return staff
+      .filter((user) => permissionsOf(user).includes('chat.reply'))
+      .map((user) => ({ id: user.id, name: user.name || user.phone, rankName: user.rank?.name ?? null }));
+  }
+
+  async assign(staff: Staff, id: string, dto: AssignConversationDto) {
+    const conversation = await this.prisma.conversation.findUnique({ where: { id }, select: { assignedToId: true, customer: { select: { name: true, phone: true } } } });
+    if (!conversation) throw new NotFoundException('المحادثة غير موجودة');
+    const assignee = (await this.chatStaff()).find((user) => user.id === dto.assigneeId);
+    if (!assignee) throw new BadRequestException('هذا الموظف لا يملك صلاحية الرد على العملاء');
+    if (conversation.assignedToId === assignee.id) throw new ConflictException('المحادثة مسندة إلى هذا الموظف بالفعل');
+    const updated = await this.prisma.conversation.update({
+      where: { id },
+      data: { assignedToId: assignee.id, assignedToName: assignee.name },
+      select: { id: true, status: true, assignedToId: true, assignedToName: true },
+    });
+    this.realtime.chatUpdated(id);
+    // Taking a thread yourself needs no notice; a colleague's transfer does, or the customer waits unseen.
+    if (assignee.id !== staff.userId) {
+      await this.notifications
+        .toUser(this.prisma, 'CHAT_ASSIGNED', assignee.id, {
+          assignedBy: staff.name ?? 'زميلك',
+          customerName: conversation.customer?.name || conversation.customer?.phone || 'عميل',
+        })
+        .catch(() => {});
+    }
     return updated;
   }
 
@@ -712,6 +762,13 @@ class ChatController {
     return this.chat.sendableCoupons();
   }
 
+  @Get('staff')
+  @RequirePermission('chat.view')
+  @ApiOperation({ summary: 'Employees who can answer customers, for filtering and transferring threads' })
+  staff() {
+    return this.chat.chatStaff();
+  }
+
   @Get('live')
   @RequirePermission('chat.view')
   @ApiOperation({ summary: 'Signed-in customers with the app open right now' })
@@ -747,6 +804,13 @@ class ChatController {
   @ApiOperation({ summary: 'An employee opened the thread' })
   markRead(@Param('id') id: string) {
     return this.chat.markRead(id);
+  }
+
+  @Post('conversations/:id/assign')
+  @RequirePermission('chat.reply')
+  @ApiOperation({ summary: 'Transfer a thread to another employee' })
+  assign(@Req() req, @Param('id') id: string, @Body() dto: AssignConversationDto) {
+    return this.chat.assign(req.user, id, dto);
   }
 
   @Put('conversations/:id')

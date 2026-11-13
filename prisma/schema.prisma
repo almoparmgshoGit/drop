@@ -369,6 +369,8 @@ model User {
   /// Set while a customer is blocked: they cannot sign in, book or write to support.
   blockedAt           DateTime?
   blockedReason       String?
+  /// The last sign-in or session refresh; a refresh moves it at most every few minutes. Shown to admins as "last login".
+  lastLoginAt         DateTime?
   conversation        Conversation?        @relation("CustomerConversation")
   tripChatThreads     TripChatThread[]     @relation("TripChatCustomer")
   appPresence         AppPresence?
@@ -1802,10 +1804,30 @@ model TripAccountEntry {
   voidedAt       DateTime?
   voidedByName   String?
   voidReason     String?
+  /// Whose account the line is posted to. BUS_COMPANY lines come out of what the bus company is owed, so they sit inside the rent.
+  chargedTo      AccountParty            @default(OFFICE)
+  /// PREPAID was paid before the trip and is offset against that party's bill.
+  settlement     EntrySettlement         @default(PAID)
+  /// When the line was paid; empty while it waits for the month's end.
+  settledAt      DateTime?
+  settledByName  String?
   attachments    TripAccountAttachment[]
 
   @@index([tripId])
   @@index([spentOn])
+  @@index([settlement])
+}
+
+enum AccountParty {
+  BUS_COMPANY
+  HOTEL
+  OFFICE
+}
+
+enum EntrySettlement {
+  PAID
+  DUE_MONTH_END
+  PREPAID
 }
 
 /// Invoices live in the database so they are only reachable through the API's permission checks, never as public files.

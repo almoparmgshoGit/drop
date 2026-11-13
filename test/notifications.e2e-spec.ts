@@ -267,6 +267,35 @@ describe('Notifications (e2e)', () => {
       const staff = await loginStaff(app, (await createStaff(prisma, 'STAFF')).phone);
       await request(http()).get(`${API}/notifications/templates`).set(passenger.auth).expect(403);
       await request(http()).put(url('BOOKING_CONFIRMED')).set(staff.auth).send({ title: 'ع', body: 'ن', isActive: true }).expect(403);
+      await request(http()).post(`${url('BOOKING_CONFIRMED')}/test`).set(staff.auth).send({}).expect(403);
+    });
+
+    it('sends a labelled test of the unsaved wording to the sender, with made-up values and no delivery row', async () => {
+      await prisma.notification.deleteMany({ where: { userId: adminUser.id } });
+      const res = await request(http())
+        .post(`${url('BOOKING_CONFIRMED')}/test`)
+        .set(admin.auth)
+        .send({ language: 'en', title: 'Hi {{userName}}', body: 'Booking {{bookingReference}}' })
+        .expect(200);
+      expect(res.body).toMatchObject({ language: 'en', title: '[تجريبي] Hi عميل تجريبي', body: 'Booking TEST-0000' });
+      expect(res.body.results.find((row: any) => row.channel === 'IN_APP').status).toBe('SENT');
+      // WhatsApp is off for this template, so it is reported as skipped, never queued.
+      expect(res.body.results.find((row: any) => row.channel === 'WHATSAPP').status).toBe('SKIPPED');
+      expect(await prisma.messageDelivery.count({ where: { event: 'BOOKING_CONFIRMED' } })).toBe(0);
+
+      const [item] = await received(admin, 'TEMPLATE_TEST');
+      expect(item.title).toBe('[تجريبي] Hi عميل تجريبي');
+      // Nothing was saved by the test.
+      expect(await prisma.notificationTemplate.count({ where: { event: 'BOOKING_CONFIRMED' } })).toBe(0);
+    });
+
+    it('tests the saved wording to a number without an account, and refuses broken text', async () => {
+      const res = await request(http()).post(`${url('BOOKING_CONFIRMED')}/test`).set(admin.auth).send({ recipient: 'PHONE', phone: '0599999990' }).expect(200);
+      expect(res.body.title).toBe('[تجريبي] تم تأكيد حجزك');
+      expect(res.body.results.find((row: any) => row.channel === 'IN_APP').status).toBe('SKIPPED');
+      await request(http()).post(`${url('BOOKING_CONFIRMED')}/test`).set(admin.auth).send({ title: 'ع', body: 'الهوية {{nationalId}}' }).expect(400);
+      await request(http()).post(`${url('BOOKING_CONFIRMED')}/test`).set(admin.auth).send({ recipient: 'PHONE', phone: '123' }).expect(400);
+      await request(http()).post(`${url('NOT_AN_EVENT')}/test`).set(admin.auth).send({}).expect(404);
     });
   });
 

@@ -1,5 +1,5 @@
 import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
-import { AccountCategoryGroup, Prisma, TripStatus } from '@prisma/client';
+import { AccountCategoryGroup, AccountParty, EntrySettlement, Prisma, TripStatus } from '@prisma/client';
 import { InvoiceLedgerService } from '../../common/services/invoice-ledger.service';
 import { PrismaService } from '../../common/services/prisma.service';
 import { vatInside } from '../../common/utils/invoice.util';
@@ -49,7 +49,7 @@ const ACCOUNT_SELECT = {
       rooms: { select: { _count: { select: { occupants: true } } } },
     },
   },
-  accountEntries: { where: { voidedAt: null }, select: { amount: true, category: { select: { group: true } } } },
+  accountEntries: { where: { voidedAt: null }, select: { amount: true, chargedTo: true, settlement: true, category: { select: { group: true } } } },
   custodies: {
     where: { status: 'SETTLED' as const },
     select: {
@@ -64,6 +64,54 @@ const ACCOUNT_SELECT = {
 } satisfies Prisma.TripSelect;
 
 type AccountTrip = Prisma.TripGetPayload<{ select: typeof ACCOUNT_SELECT }>;
+
+type PostedLine = { chargedTo: AccountParty; settlement: EntrySettlement };
+
+/**
+ * A line that sits inside a bill the account already counts, so adding it would count it twice: anything posted to the bus
+ * company comes out of its rent, and a hotel prepayment is offset against the hotel's bill. A cancelled trip owes no hotel
+ * bill, so its hotel prepayment is a cost of its own.
+ */
+const insideBill = (line: PostedLine, live: boolean) => line.chargedTo === 'BUS_COMPANY' || (live && line.chargedTo === 'HOTEL' && line.settlement === 'PREPAID');
+
+/** Each party's side of one trip's lines, in halalas. */
+function partyTotals(lines: (PostedLine & { amount: Prisma.Decimal; group: AccountCategoryGroup })[], rent: number, hotelBills: number) {
+  const parties = {
+    BUS_COMPANY: { amount: 0, dueMonthEnd: 0, prepaid: 0 },
+    HOTEL: { amount: 0, dueMonthEnd: 0, prepaid: 0 },
+    OFFICE: { amount: 0, dueMonthEnd: 0, prepaid: 0 },
+  };
+  for (const line of lines) {
+    if (line.group === 'INCOME') continue;
+    const amount = halalas(line.amount);
+    const party = parties[line.chargedTo];
+    party.amount += amount;
+    if (line.settlement === 'DUE_MONTH_END') party.dueMonthEnd += amount;
+    if (line.settlement === 'PREPAID') party.prepaid += amount;
+  }
+  const hotelExtras = parties.HOTEL.amount - parties.HOTEL.prepaid;
+  return {
+    busCompany: {
+      rent: sar(rent),
+      /** Paid by the office on the company's behalf or ahead of the rent; it comes out of what the company is owed. */
+      deducted: sar(parties.BUS_COMPANY.amount),
+      balance: sar(rent - parties.BUS_COMPANY.amount),
+      dueMonthEnd: sar(parties.BUS_COMPANY.dueMonthEnd),
+      prepaid: sar(parties.BUS_COMPANY.prepaid),
+    },
+    hotel: {
+      bills: sar(hotelBills),
+      /** Fines and extras beyond the room bills. */
+      extras: sar(hotelExtras),
+      prepaid: sar(parties.HOTEL.prepaid),
+      balance: sar(hotelBills + hotelExtras - parties.HOTEL.prepaid),
+      dueMonthEnd: sar(parties.HOTEL.dueMonthEnd),
+    },
+    office: { amount: sar(parties.OFFICE.amount), dueMonthEnd: sar(parties.OFFICE.dueMonthEnd), prepaid: sar(parties.OFFICE.prepaid) },
+    dueMonthEnd: sar(parties.BUS_COMPANY.dueMonthEnd + parties.HOTEL.dueMonthEnd + parties.OFFICE.dueMonthEnd),
+    prepaid: sar(parties.BUS_COMPANY.prepaid + parties.HOTEL.prepaid + parties.OFFICE.prepaid),
+  };
+}
 
 /** A DR journey: the way there with its way back, whose money is one account. */
 const JOURNEY_SELECT = {
@@ -97,12 +145,15 @@ function accountFigures(trip: AccountTrip) {
       passengers += booking._count.passengers;
     }
   }
+  const counted = trip.accountEntries.filter((entry) => !insideBill(entry, live));
+  // A line posted to a hotel (a fine, an extra) is part of the hotels' cost; the office's own lines keep their columns.
   const entered = (group: AccountCategoryGroup) =>
-    trip.accountEntries.filter((entry) => entry.category.group === group).reduce((sum, entry) => sum + halalas(entry.amount), 0);
+    counted.filter((entry) => entry.chargedTo === 'OFFICE' && entry.category.group === group).reduce((sum, entry) => sum + halalas(entry.amount), 0);
+  const hotelExtras = counted.filter((entry) => entry.chargedTo === 'HOTEL' && entry.category.group !== 'INCOME').reduce((sum, entry) => sum + halalas(entry.amount), 0);
 
   // A cancelled trip does not run, so the bus and the hotels are not owed for it.
   const bus = live ? halalas(trip.busRentalPrice ?? 0) : 0;
-  const hotels = live ? trip.hotelBookings.reduce((sum, booking) => sum + hotelBookingCost(booking), 0) : 0;
+  const hotels = (live ? trip.hotelBookings.reduce((sum, booking) => sum + hotelBookingCost(booking), 0) : 0) + hotelExtras;
   // A settled custody spreads over the columns of its expenses; whatever was settled without a line stays under other.
   const fromCustody = { DRIVER: 0, ADMIN: 0, OTHER: 0 };
   for (const row of trip.custodies) {
@@ -327,6 +378,8 @@ export class TripAccountsService {
     ]);
     const figures = accountFigures(trip);
     const live = trip.tripStatus !== 'CANCELLED';
+    const hotelBills = live ? trip.hotelBookings.reduce((sum, booking) => sum + hotelBookingCost(booking), 0) : 0;
+    const standing = entries.filter((entry) => !entry.voidedAt).map((entry) => ({ ...entry, group: entry.category.group }));
 
     return {
       trip: {
@@ -355,6 +408,7 @@ export class TripAccountsService {
       hotels: live
         ? trip.hotelBookings.map((booking) => ({ id: booking.id, name: booking.hotel.name, amount: sar(hotelBookingCost(booking)), hasTaxInvoice: booking.hasTaxInvoice }))
         : [],
+      parties: partyTotals(standing, figures.bus, hotelBills),
       custodies: trip.custodies.map((row) => ({ number: row.number, purpose: row.purpose, recipientName: row.recipientName, settledAt: row.settledAt, spent: Number(row.spentAmount ?? 0) })),
       entries: entries.map((entry) => ({
         id: entry.id,
@@ -371,6 +425,12 @@ export class TripAccountsService {
         voidedAt: entry.voidedAt,
         voidedByName: entry.voidedByName,
         voidReason: entry.voidReason,
+        chargedTo: entry.chargedTo,
+        settlement: entry.settlement,
+        settledAt: entry.settledAt,
+        settledByName: entry.settledByName,
+        /** Already inside the rent or a hotel bill, so not added to the expenses again. */
+        insideBill: insideBill(entry, live),
       })),
     };
   }
@@ -389,13 +449,16 @@ export class TripAccountsService {
     if (trip.tripStatus === 'DRAFT') throw new ConflictException('هذه الرحلة ما زالت مسودة');
     if (!category || !category.isActive) throw new BadRequestException('هذا البند غير متاح');
     if (AUTOMATIC_GROUPS.includes(category.group)) throw new BadRequestException('هذا البند يُحسب تلقائيًا من بيانات الرحلة، فلا يُسجّل يدويًا');
+    const chargedTo = dto.chargedTo ?? 'OFFICE';
+    const settlement = dto.settlement ?? 'PAID';
+    if (category.group === 'INCOME' && (chargedTo !== 'OFFICE' || settlement !== 'PAID')) throw new BadRequestException('الإيراد يُسجّل للمكتب ومقبوضًا');
 
     const day = riyadhDayRange(dto.spentOn);
     if (!day) throw new BadRequestException('التاريخ غير صحيح');
     if (day.start > new Date()) throw new BadRequestException('لا يمكن تسجيل مصروف بتاريخ لاحق');
 
-    // Only an expense with a tax invoice behind it reduces the VAT owed.
-    const taxInvoice = dto.hasTaxInvoice && category.group !== 'INCOME';
+    // Only an expense with a tax invoice behind it reduces the VAT owed. A line inside the rent or a hotel bill is covered by that bill's own invoice.
+    const taxInvoice = dto.hasTaxInvoice && category.group !== 'INCOME' && !insideBill({ chargedTo, settlement }, true);
     // Reclaiming VAT needs a document the authority can ask for.
     if (taxInvoice && files.length === 0) throw new BadRequestException('ارفع الفاتورة الضريبية');
     const invoices = readInvoiceFiles(files, actor.userId);
@@ -411,6 +474,10 @@ export class TripAccountsService {
           hasTaxInvoice: taxInvoice,
           supplierName: dto.supplierName || null,
           notes: dto.notes || null,
+          chargedTo,
+          settlement,
+          settledAt: settlement === 'DUE_MONTH_END' ? null : new Date(),
+          ...(settlement !== 'DUE_MONTH_END' && { settledByName: actor.name ?? null }),
           spentOn: new Date(`${dto.spentOn}T00:00:00Z`),
           idempotencyKey,
           createdById: actor.userId,
@@ -443,6 +510,21 @@ export class TripAccountsService {
       const exists = await this.prisma.tripAccountEntry.count({ where: { id } });
       if (!exists) throw new NotFoundException('هذا القيد غير موجود');
       throw new ConflictException('هذا القيد ملغى مسبقًا');
+    }
+    return { success: true };
+  }
+
+  /** A line left for the month's end has now been paid. */
+  async settleEntry(actor: { name?: string | null }, id: string) {
+    const settled = await this.prisma.tripAccountEntry.updateMany({
+      where: { id, voidedAt: null, settlement: 'DUE_MONTH_END' },
+      data: { settlement: 'PAID', settledAt: new Date(), settledByName: actor.name ?? null },
+    });
+    if (settled.count === 0) {
+      const entry = await this.prisma.tripAccountEntry.findUnique({ where: { id }, select: { voidedAt: true } });
+      if (!entry) throw new NotFoundException('هذا القيد غير موجود');
+      if (entry.voidedAt) throw new ConflictException('هذا القيد ملغى');
+      throw new ConflictException('هذا القيد ليس مستحقًا آخر الشهر');
     }
     return { success: true };
   }

@@ -55,6 +55,13 @@ export class TripAccountsController {
     return this.accounts.voidEntry(req.user, id, dto.reason);
   }
 
+  @Post('entries/:id/settle')
+  @RequirePermission('trip_accounts.manage')
+  @ApiOperation({ summary: "Mark a line that was due at the month's end as paid" })
+  settleEntry(@Req() req, @Param('id') id: string) {
+    return this.accounts.settleEntry(req.user, id);
+  }
+
   @Get('attachments/:id')
   @RequirePermission('trip_accounts.view')
   @ApiOperation({ summary: 'Download an invoice attached to an entry' })

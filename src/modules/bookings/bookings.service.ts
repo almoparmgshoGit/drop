@@ -7,7 +7,7 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { BookingCategory, Prisma, RoomType } from '@prisma/client';
+import { BookingCategory, Prisma, RefundDestination, RoomType } from '@prisma/client';
 import * as crypto from 'crypto';
 import { PrismaService } from '../../common/services/prisma.service';
 import { WalletService } from '../../common/services/wallet.service';
@@ -930,12 +930,14 @@ export class BookingsService {
     }, CANCELLATION_TX_OPTIONS);
   }
 
-  async adminCancel(actor: { userId: string; permissions: string[] }, bookingId: string, dto: { refundAmount?: number; note: string }, ip?: string) {
+  async adminCancel(actor: { userId: string; permissions: string[] }, bookingId: string, dto: { refundAmount?: number; refundMethod?: RefundDestination; note: string }, ip?: string) {
     return this.prisma.$transaction(async (tx) => {
       // Trip first, then booking: the order trip-wide actions use, so the two cannot deadlock.
       await lockBookingWithTrip(tx, bookingId);
       const refundAmount = await this.decideRefund(tx, actor, bookingId, dto.refundAmount);
-      return this.cancellation.cancel(tx, bookingId, { refundAmount, reviewedById: actor.userId, note: dto.note, ip });
+      // ORIGINAL takes the path of an approved cancellation request: what came from the wallet goes back to it now,
+      // and the card and branch-cash parts wait as pending refunds for staff with refunds.execute to carry out.
+      return this.cancellation.cancel(tx, bookingId, { refundAmount, refundDestination: dto.refundMethod ?? 'WALLET', reviewedById: actor.userId, note: dto.note, ip });
     }, CANCELLATION_TX_OPTIONS);
   }
 

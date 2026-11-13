@@ -107,6 +107,7 @@ describe('Invoices, tax report and trip accounts', () => {
       ['post', '/trip-accounts/any/entries'],
       ['post', '/trip-accounts/categories'],
       ['post', '/trip-accounts/entries/any/void'],
+      ['post', '/trip-accounts/entries/any/settle'],
       ['patch', '/trip-accounts/any/tax-flags'],
       ['patch', '/trip-accounts/categories/any'],
     ];
@@ -612,6 +613,41 @@ describe('Invoices, tax report and trip accounts', () => {
       expect(body.entries[0]).toMatchObject({ voidReason: 'خطأ في المبلغ' });
       await new Promise((resolve) => setTimeout(resolve, 200));
       expect(await prisma.auditLog.count({ where: { entity: 'TripAccounts' } })).toBeGreaterThanOrEqual(2);
+    });
+
+    it('posts lines to a party, counts nothing twice, and settles what is due at the month end', async () => {
+      await prisma.trip.update({ where: { id: tripId }, data: { busRentalPrice: 1800 } });
+      const hotel = await prisma.hotel.create({ data: { name: 'فندق الدين', city: 'مكة', nightlyRate: 100 } });
+      await prisma.hotelBooking.create({ data: { tripId, hotelId: hotel.id, checkIn: new Date('2026-10-01'), checkOut: new Date('2026-10-02'), nightlyRate: 100, extraCost: 400 } });
+      const before = (await account()).figures;
+
+      // Paid on the bus company's behalf: comes out of its rent, so the expenses stay as they were.
+      await entry(tripId, { categoryId: 'acct-driver', amount: 200, chargedTo: 'BUS_COMPANY', settlement: 'DUE_MONTH_END' }).expect(201);
+      // A hotel prepayment is offset against the hotel bill; a fine is a cost of its own.
+      await entry(tripId, { amount: 150, chargedTo: 'HOTEL', settlement: 'PREPAID' }).expect(201);
+      const fine = await entry(tripId, { amount: 80, chargedTo: 'HOTEL', settlement: 'DUE_MONTH_END' }).expect(201);
+      await entry(tripId, { amount: 50 }).expect(201);
+      await entry(tripId, { categoryId: 'acct-income', amount: 10, chargedTo: 'HOTEL' }).expect(400);
+      await entry(tripId, { amount: 10, settlement: 'LATER' }).expect(400);
+
+      const body = await account();
+      expect(body.figures.expenses).toBe(before.expenses + 80 + 50);
+      expect(body.figures.hotels).toBe(before.hotels + 80);
+      expect(body.parties).toMatchObject({
+        busCompany: { rent: 1800, deducted: 200, balance: 1600, dueMonthEnd: 200 },
+        hotel: { extras: 80, prepaid: 150, dueMonthEnd: 80 },
+        office: { amount: 50, dueMonthEnd: 0 },
+        dueMonthEnd: 280,
+        prepaid: 150,
+      });
+      expect(body.entries.find((row: { id: string }) => row.id === fine.body.id)).toMatchObject({ settlement: 'DUE_MONTH_END', settledAt: null });
+
+      await post(`/trip-accounts/entries/${fine.body.id}/settle`, {}).expect(201);
+      await post(`/trip-accounts/entries/${fine.body.id}/settle`, {}).expect(409);
+      await post('/trip-accounts/entries/missing/settle', {}).expect(404);
+      const after = await account();
+      expect(after.parties.dueMonthEnd).toBe(200);
+      expect(after.figures.expenses).toBe(body.figures.expenses);
     });
 
     it('refuses a hotel booking of another trip in the tax flags', async () => {

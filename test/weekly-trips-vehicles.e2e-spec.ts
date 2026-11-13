@@ -128,6 +128,53 @@ describe('Vehicles and weekly trips (e2e)', () => {
     expect(await trips.extendSeries(first.id)).toBe(0);
   });
 
+  it("fills a month's missing weekly drafts once, and skips days that already have one", async () => {
+    const departure = new Date(Date.now() + 2 * DAY);
+    const first = await createTrip({
+      departureTime: departure.toISOString(),
+      arrivalTime: new Date(departure.getTime() + 5 * 3_600_000).toISOString(),
+      scheduleType: 'FIXED',
+      repeatWeekdays: [riyadhWeekday(departure)],
+    });
+    await trips.extendSeries(first.id);
+    // Two months ahead is wholly inside the year the series is kept drafted for.
+    const ahead = new Date(Date.now() + 3 * 3_600_000);
+    const month = new Date(Date.UTC(ahead.getUTCFullYear(), ahead.getUTCMonth() + 2, 1)).toISOString().slice(0, 7);
+    const inMonth = await prisma.trip.findMany({ where: { seriesId: first.id, codePeriod: month }, orderBy: { departureTime: 'asc' } });
+    expect(inMonth.length).toBeGreaterThanOrEqual(4);
+    await request(http()).delete(`${API}/trips/${inMonth[1].id}`).set(admin.auth).expect(200);
+
+    const ofSeries = (body: any) => body.bySeries.find((entry: any) => entry.seriesId === first.id);
+    const preview = (await request(http()).get(`${API}/trips/series/month-plan?month=${month}`).set(admin.auth).expect(200)).body;
+    expect(ofSeries(preview)).toMatchObject({ created: 1, skipped: inMonth.length - 1 });
+    expect(await prisma.trip.count({ where: { seriesId: first.id, codePeriod: month } })).toBe(inMonth.length - 1);
+
+    const made = (await request(http()).post(`${API}/trips/series/generate-month`).set(admin.auth).send({ month }).expect(201)).body;
+    expect(ofSeries(made)).toMatchObject({ created: 1, skipped: inMonth.length - 1 });
+    const refilled = await prisma.trip.findFirstOrThrow({ where: { seriesId: first.id, departureTime: inMonth[1].departureTime } });
+    expect(refilled).toMatchObject({ tripStatus: 'DRAFT', repeatWeekdays: [riyadhWeekday(departure)] });
+
+    const again = (await request(http()).post(`${API}/trips/series/generate-month`).set(admin.auth).send({ month }).expect(201)).body;
+    expect(ofSeries(again)).toMatchObject({ created: 0, skipped: inMonth.length });
+    await request(http()).post(`${API}/trips/series/generate-month`).set(admin.auth).send({ month: '2026-13' }).expect(400);
+  });
+
+  it('copies a trip to a new date as a one-off draft with a new number and no bookings', async () => {
+    const source = await createTrip({ tripStatus: 'PUBLISHED' });
+    const departure = new Date(new Date(source.departureTime).getTime() + 10 * DAY + 2 * 3_600_000);
+    const copy = (await request(http()).post(`${API}/trips/${source.id}/duplicate`).set(admin.auth).send({ departureTime: departure.toISOString() }).expect(201)).body;
+    expect(copy.id).not.toBe(source.id);
+    expect(copy.tripCode).not.toBe(source.tripCode);
+    const saved = await prisma.trip.findUniqueOrThrow({ where: { id: copy.id }, include: { boardingPoints: true, _count: { select: { bookings: true } } } });
+    expect(saved).toMatchObject({ tripStatus: 'DRAFT', origin: source.origin, destination: source.destination, seriesId: null, repeatWeekdays: [] });
+    expect(saved.departureTime.toISOString()).toBe(departure.toISOString());
+    expect(saved.boardingPoints).toHaveLength(source.boardingPoints.length);
+    expect(saved._count.bookings).toBe(0);
+
+    await request(http()).post(`${API}/trips/${source.id}/duplicate`).set(admin.auth).send({ departureTime: new Date(Date.now() - DAY).toISOString() }).expect(400);
+    await request(http()).post(`${API}/trips/${source.id}/duplicate`).set(admin.auth).send({}).expect(400);
+  });
+
   it('refuses a temporary weekly trip without a last day', async () => {
     await request(http()).post(`${API}/trips`).set(admin.auth).send(tripPayload({ repeatWeekdays: [1] })).expect(400);
   });
