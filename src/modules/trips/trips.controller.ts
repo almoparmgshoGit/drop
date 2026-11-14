@@ -69,8 +69,16 @@ export class TripsController {
   @RequirePermission('trips.view', 'trips.manage')
   @ApiBearerAuth()
   @ApiOperation({ summary: 'Upcoming trips with a reverse trip on their remaining seats' })
-  async getReverseTrips(@Query() query: ReverseTripsQuery) {
-    return this.tripsService.getReverseTrips(query.range);
+  async getReverseTrips(@Req() req, @Query() query: ReverseTripsQuery) {
+    return this.tripsService.getReverseTrips(query.range, req.user);
+  }
+
+  @Get('admin/branch-filter')
+  @RequirePermission('trips.view', 'trips.manage')
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Branches the trips pages filter by: a branch shows the trips leaving from its city' })
+  async getTripBranchFilter(@Req() req) {
+    return this.tripsService.getTripBranchFilter(req.user);
   }
 
   @Get('series/month-plan')
@@ -180,6 +188,22 @@ export class TripsController {
   @ApiOperation({ summary: 'Open the reverse trip on the remaining seats' })
   async openReverseTrip(@Req() req, @Param('id') id: string, @Body() dto: OpenReverseTripDto) {
     return this.tripsService.openReverseTrip(id, dto, req.user);
+  }
+
+  @Post(':id/boarding/open')
+  @RequirePermission('trips.manage')
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Open boarding now, ahead of its usual time' })
+  async openBoardingNow(@Param('id') id: string) {
+    return this.tripsService.setManualBoarding(id, true);
+  }
+
+  @Post(':id/boarding/reset')
+  @RequirePermission('trips.manage')
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Return boarding to its usual time' })
+  async resetBoarding(@Param('id') id: string) {
+    return this.tripsService.setManualBoarding(id, false);
   }
 
   @Post(':id/cancel')

@@ -141,6 +141,19 @@ export class InvoicesService {
 
   async printable(actor: CashActor, bookingId: string) {
     await this.collections.assertBookingVisible(actor, bookingId);
+    return this.buildPrintable(bookingId);
+  }
+
+  /** The customer's own copy, for the invoice screen in the app. Anyone else's booking reads as not found. */
+  async printableForCustomer(userId: string, bookingId: string) {
+    const booking = await this.prisma.booking.findUnique({ where: { id: bookingId }, select: { userId: true } });
+    if (!booking || booking.userId !== userId) throw new NotFoundException('لا توجد فاتورة لهذا الحجز');
+    // The paper boarding code and the branch are for the counter's printout, not the customer's copy.
+    const { boardingCode: _code, branchName: _branch, ...invoice } = await this.buildPrintable(bookingId);
+    return invoice;
+  }
+
+  private async buildPrintable(bookingId: string) {
     const invoice = await this.prisma.invoice.findUnique({
       where: { bookingId },
       include: {

@@ -50,19 +50,19 @@ describe('Housing prices chosen by the admin', () => {
     expect(body.subtotal).toBe(600);
   });
 
-  it('prices a private room once per booking, however many companions share it', async () => {
+  it('prices a private room once per booking by the night, however many companions share it', async () => {
     const trip = await createTrip(await createHotel(), ADDED);
-    expect((await quote(trip, ['1', '2'], 'PRIVATE')).legs[0].housingAmount).toBe(300);
+    expect((await quote(trip, ['1', '2'], 'PRIVATE')).legs[0].housingAmount).toBe(900);
     const five = await quote(trip, FIVE, 'PRIVATE');
-    expect(five.legs[0].housingAmount).toBe(300);
-    expect(five.subtotal).toBe(1300);
+    expect(five.legs[0].housingAmount).toBe(900);
+    expect(five.subtotal).toBe(1900);
   });
 
   it('ignores an old per-person or per-room setting', async () => {
     const perPerson = await createTrip(await createHotel(), { ...ADDED, privateRoomPriceBasis: 'PER_PERSON' });
-    expect((await quote(perPerson, FIVE, 'PRIVATE')).legs[0].housingAmount).toBe(300);
+    expect((await quote(perPerson, FIVE, 'PRIVATE')).legs[0].housingAmount).toBe(900);
     const perRoom = await createTrip(await createHotel(), { ...ADDED, privateRoomPriceBasis: 'PER_ROOM', privateRoomCapacity: 2 });
-    expect((await quote(perRoom, FIVE, 'PRIVATE')).legs[0].housingAmount).toBe(300);
+    expect((await quote(perRoom, FIVE, 'PRIVATE')).legs[0].housingAmount).toBe(900);
   });
 
   it('multiplies by the trip nights when priced per night', async () => {
@@ -77,8 +77,8 @@ describe('Housing prices chosen by the admin', () => {
     expect(shared.legs[0].housingAmount).toBe(0);
     expect(shared.subtotal).toBe(400);
     const privately = await quote(trip, ['1', '2'], 'PRIVATE');
-    expect(privately.legs[0].housingAmount).toBe(150);
-    expect(privately.subtotal).toBe(550);
+    expect(privately.legs[0].housingAmount).toBe(450);
+    expect(privately.subtotal).toBe(850);
   });
 
   it('keeps charging existing trips the seat price alone', async () => {
@@ -90,7 +90,7 @@ describe('Housing prices chosen by the admin', () => {
     const trip = await createTrip(await createHotel(), ADDED);
     const body = await quote(trip, FIVE);
     expect(body.legs[0].housing.choice).toBeNull();
-    expect(body.legs[0].housing.optionAmounts).toEqual({ SHARED: 500, PRIVATE: 600 });
+    expect(body.legs[0].housing.optionAmounts).toEqual({ SHARED: 500, PRIVATE: 900 });
     expect(body.subtotal).toBe(1000);
   });
 
@@ -164,7 +164,7 @@ describe('Housing prices chosen by the admin', () => {
       const body = (await send('/quote', { legs: [{ tripId: trip.id, seats: ['1', '2'], withoutHousing: true }] }).expect(201)).body;
       expect(body.legs[0].housingAmount).toBe(0);
       expect(body.subtotal).toBe(400);
-      expect(body.legs[0].housing).toMatchObject({ canSkip: true, withoutHousing: true, choice: null, optionAmounts: { SHARED: 200, PRIVATE: 300 } });
+      expect(body.legs[0].housing).toMatchObject({ canSkip: true, withoutHousing: true, choice: null, optionAmounts: { SHARED: 200, PRIVATE: 900 } });
       expect((await quote(trip, ['1', '2'])).legs[0].housing).toMatchObject({ canSkip: true, withoutHousing: false });
     });
 

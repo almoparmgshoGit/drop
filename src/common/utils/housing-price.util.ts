@@ -25,8 +25,9 @@ export function housingCharge(terms: HousingTerms, room: RoomType, seats: number
   const units = stayUnits(terms, nights);
   if (room === 'SHARED') return terms.housingPriceMode === 'ADDED_TO_BASE' ? toHalalas(terms.housingPrice) * seats * units : 0;
 
-  // A private room is the booking owner's: one price per booking, however many companions share it.
-  return toHalalas(terms.privateRoomPrice) * units;
+  // A private room is the booking owner's: one nightly price for the whole booking, however many companions share it,
+  // so a family pays for its one room times the nights, never a room per person nor one price for the whole stay.
+  return toHalalas(terms.privateRoomPrice) * Math.max(1, nights);
 }
 
 /**

@@ -578,7 +578,8 @@ export class BookingsAdminService {
       if (booking.status !== 'CONFIRMED') throw new ConflictException('يمكن تسجيل الصعود للحجوزات المؤكدة فقط');
       if (await tx.ticketCompensation.count({ where: { bookingId } })) throw new ConflictException('تم تعويض هذا الحجز، فلا يُسجَّل صعوده');
       // A boarded booking can no longer be cancelled, so early boarding could be used to lock a refund.
-      if (booking.trip.departureTime.getTime() - Date.now() > opensBeforeHours * 60 * 60 * 1000) {
+      // Boarding opened by hand on the trip lifts this limit for it.
+      if (!booking.trip.boardingOpenedManuallyAt && booking.trip.departureTime.getTime() - Date.now() > opensBeforeHours * 60 * 60 * 1000) {
         throw new ConflictException(`يُفتح تسجيل الصعود قبل موعد الرحلة ${withinHours(opensBeforeHours)}`);
       }
       const passenger = this.findPassenger(booking, passengerId);

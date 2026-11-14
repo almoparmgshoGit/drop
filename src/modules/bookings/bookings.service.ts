@@ -59,6 +59,8 @@ const BOOKING_INCLUDE = {
       tripStatus: true,
       liveStatus: true,
       visits: { orderBy: { sortOrder: 'asc' }, select: { id: true, title: true, desc: true, expectedTime: true } },
+      // A fixed package's name, nights and hotel, so the confirmation shows the whole package as one ticket.
+      package: { select: { id: true, name: true, nights: true, hotel: { select: { name: true, city: true } } } },
     },
   },
   // Selected field by field: national id and staff notes must never reach the customer.
@@ -551,7 +553,9 @@ export class BookingsService {
       include: BOOKING_INCLUDE,
       orderBy: { createdAt: 'asc' },
     });
-    return { groupReference, bookings: bookings.map(toCustomerBooking) };
+    // A round trip's return rides on the same booking, so the confirmation can list it beside the outbound.
+    const withReturn = await Promise.all(bookings.map(async (booking) => ({ ...toCustomerBooking(booking), returnRide: await returnRideOf(this.prisma, booking) })));
+    return { groupReference, bookings: withReturn };
   }
 
   private normalizePassengerPhone(phone?: string) {
@@ -846,7 +850,11 @@ export class BookingsService {
     const tripDayOpen = this.isTripDayOpen(booking, await this.appSettings.number('trackingClosesAfterHours'));
     const returnRide = await returnRideOf(this.prisma, booking);
     const boarding = (await boardingOfBookings(this.prisma, [booking])).get(booking.id) ?? null;
-    if (booking.userId === userId) return { ...toCustomerBooking(booking), passengers: withBoarding, updates, cancellationEstimate, tripDayOpen, returnRide, boarding };
+    // Where the boarding point is, so the ticket can open directions to it. The point may have been removed since.
+    const boardingPlace = booking.boardingPointId
+      ? await this.prisma.boardingPoint.findUnique({ where: { id: booking.boardingPointId }, select: { address: true, lat: true, lng: true } })
+      : null;
+    if (booking.userId === userId) return { ...toCustomerBooking(booking), passengers: withBoarding, updates, cancellationEstimate, tripDayOpen, returnRide, boarding, boardingPlace };
     // Staff read bookings but do not need the token a passenger scans to board.
     return {
       ...booking,

@@ -513,6 +513,8 @@ model Trip {
   crewOpensBeforeMinutes     Int                   @default(1440)
   boardingOpensBeforeMinutes Int                   @default(120)
   boardingClosesAfterMinutes Int                   @default(60)
+  /// Set when staff open boarding by hand before its usual time; boarding then runs from this moment.
+  boardingOpenedManuallyAt   DateTime?
   /// What the crew does with a passenger who still owes money: the trip's creator decides.
   unpaidBoarding             UnpaidBoardingPolicy  @default(BLOCK)
   crewOpenAnnouncedAt        DateTime?

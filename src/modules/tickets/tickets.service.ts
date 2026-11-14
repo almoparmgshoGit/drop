@@ -261,10 +261,12 @@ export class TicketsService {
         tripStatus: true,
         ...CREW_WINDOW_SELECT,
         bus: { select: { plateNumber: true, model: true, color: true } },
-        boardingPoints: { select: { id: true, name: true, time: true, address: true } },
+        boardingPoints: { select: { id: true, name: true, time: true, address: true, lat: true, lng: true } },
         liveStatus: true,
         liveStatusAt: true,
         currentBoardingPointId: true,
+        // The crew's map shows the last position any of them sent, even from another member's phone.
+        location: { select: { lat: true, lng: true, recordedAt: true } },
         drivers: crewMember,
         supervisors: crewMember,
         manifestSentAt: true,
@@ -281,6 +283,7 @@ export class TicketsService {
     return {
       ...trip,
       boardingPoints: [...trip.boardingPoints].sort((a, b) => a.time.localeCompare(b.time)),
+      location: trip.location && trip.liveStatus !== 'ARRIVED' ? { ...trip.location, isLive: Date.now() - trip.location.recordedAt.getTime() <= 2 * 60 * 1000 } : null,
       drivers: trip.drivers.map(toMember),
       supervisors: trip.supervisors.map(toMember),
       access: crewWindow(trip),

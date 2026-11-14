@@ -124,6 +124,7 @@ const INTERNAL_TRIP_FIELDS = [
   'crewOpenAnnouncedAt',
   'boardingOpenAnnouncedAt',
   'boardingCloseAnnouncedAt',
+  'boardingOpenedManuallyAt',
   'scheduleType',
   'recurrenceCalendar',
   'recurrenceDoneAt',
@@ -998,6 +999,29 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
     return trips.map((trip) => withoutRentFor(actor, withSeatPrice(trip)));
   }
 
+  /**
+   * The branches the trips pages filter by, each by its city: a branch shows the trips leaving from its city.
+   * An employee limited to their own branch gets only it, locked; whoever works across branches picks any or none.
+   */
+  async getTripBranchFilter(actor: RentActor) {
+    const all = actor.permissions.includes('bookings.all_branches');
+    const me = actor.userId
+      ? await this.prisma.user.findUnique({ where: { id: actor.userId }, select: { branch: { select: { id: true, name: true, city: true } } } })
+      : null;
+    const own = me?.branch?.city?.trim() ? { id: me.branch.id, name: me.branch.name, city: me.branch.city.trim() } : null;
+    if (!all && own) return { branches: [own], ownBranchId: own.id, locked: true };
+    const branches = await this.prisma.branch.findMany({
+      where: { isActive: true, city: { not: null } },
+      orderBy: { name: 'asc' },
+      select: { id: true, name: true, city: true },
+    });
+    return {
+      branches: branches.filter((b) => b.city?.trim()).map((b) => ({ id: b.id, name: b.name, city: b.city!.trim() })),
+      ownBranchId: own?.id ?? null,
+      locked: false,
+    };
+  }
+
   async getAdminTripById(actor: RentActor, id: string) {
     const trip = await this.prisma.trip.findUnique({ where: { id }, include: ADMIN_TRIP_INCLUDE });
     if (!trip) throw new NotFoundException('Trip not found');
@@ -1808,11 +1832,14 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
     await this.notifications.toTripCrew(tx, 'CREW_TRIP_TIME_CHANGED', before.id, { userIds: crewAfter.filter((userId) => !added.includes(userId)), extra: previous });
   }
 
-  async getReverseTrips(range: 'week' | 'month' | 'all' = 'all') {
+  async getReverseTrips(range: 'week' | 'month' | 'all' = 'all', actor?: RentActor) {
     const now = new Date();
+    // An employee of a city's branch works with that city's trips, as on the trips page.
+    const city = actor?.userId ? await servedCity(this.prisma, { userId: actor.userId, permissions: actor.permissions }) : null;
     const trips = await this.prisma.trip.findMany({
       where: {
         reverseEnabled: true,
+        ...(city && { AND: [cityTripWhere(city)] }),
         OR: [
           { tripStatus: 'PUBLISHED', departureTime: { gt: now, ...(range !== 'all' && { lt: addDays(now, range === 'week' ? 7 : 30) }) } },
           // The outbound has left, but its way back is still ahead: selling, or still waiting to be opened.
@@ -1865,6 +1892,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
         journeyCode: journeyCodeOf(trip),
         origin: trip.origin,
         destination: trip.destination,
+        bookingType: trip.bookingType,
         departureTime: trip.departureTime,
         totalSeats: trip.totalSeats,
         bookedSeats,
@@ -2082,6 +2110,37 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
     });
     await this.notifications.toTripCrew(tx, 'CREW_TRIP_ASSIGNED', reverse.id);
     return withSeatPrice(reverse);
+  }
+
+  /**
+   * Opens boarding on one trip now, whatever its usual window says, or returns it to that window.
+   * Closing time stays as set on the trip. The crew hears of it on the spot.
+   */
+  async setManualBoarding(id: string, open: boolean) {
+    const trip = await this.prisma.trip.findUnique({ where: { id }, select: { id: true, tripStatus: true, boardingOpenedManuallyAt: true, ...CREW_WINDOW_SELECT } });
+    if (!trip) throw new NotFoundException('Trip not found');
+    if (open) {
+      if (trip.tripStatus !== 'PUBLISHED') throw new ConflictException('يُفتح الصعود للرحلات المنشورة فقط');
+      const window = crewWindow(trip);
+      if (Date.now() > window.boardingClosesAt.getTime()) throw new ConflictException('انتهى وقت الصعود لهذه الرحلة. لتمديده عدّل «إغلاق الصعود بعد الانطلاق»');
+      if (window.isBoardingOpen) throw new ConflictException('الصعود مفتوح بالفعل لهذه الرحلة');
+      await this.prisma.trip.update({ where: { id }, data: { boardingOpenedManuallyAt: new Date(), boardingOpenAnnouncedAt: null } });
+    } else {
+      if (!trip.boardingOpenedManuallyAt) throw new ConflictException('الصعود لم يُفتح يدويًا لهذه الرحلة');
+      // Announced again when its usual time comes, unless that time has already passed.
+      const usual = crewWindow({ ...trip, boardingOpenedManuallyAt: null });
+      await this.prisma.trip.update({
+        where: { id },
+        data: { boardingOpenedManuallyAt: null, ...(!usual.isBoardingOpen && { boardingOpenAnnouncedAt: null }) },
+      });
+    }
+    await this.announceCrewWindows().catch((err) => console.error('Crew window sweep failed:', err.message));
+    return this.getAdminTripWindow(id);
+  }
+
+  private async getAdminTripWindow(id: string) {
+    const trip = await this.prisma.trip.findUniqueOrThrow({ where: { id }, select: { id: true, ...CREW_WINDOW_SELECT } });
+    return { id: trip.id, boardingOpenedManuallyAt: trip.boardingOpenedManuallyAt, ...crewWindow(trip) };
   }
 
   async cancelTrip(id: string, adminId: string, reason?: string, acknowledgeReturning = false) {

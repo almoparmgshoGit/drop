@@ -174,13 +174,17 @@ export class BranchBookingsService {
           package: { select: PACKAGE_PRICE_SELECT },
           boardingPoints: { select: { id: true, name: true, time: true } },
           hotelBookings: { where: { status: 'CONFIRMED' }, select: { hotelId: true } },
+          reverseOfTripId: true,
+          reverseTrip: { select: { id: true } },
         },
       }),
       this.prisma.trip.findMany({ where: open, distinct: ['origin', 'destination'], select: { origin: true, destination: true } }),
     ]);
     return {
-      items: items.map(({ package: pack, price, hotelBookings, ...trip }) => ({
+      items: items.map(({ package: pack, price, hotelBookings, reverseOfTripId, reverseTrip, ...trip }) => ({
         ...trip,
+        // The trip it is linked to in the other direction, either way round, so a round trip books the pair together.
+        linkedTripId: reverseTrip?.id ?? reverseOfTripId ?? null,
         // The counter starts the stay at the trip's own hotel, whose price the trip already set.
         hotelIds: [...new Set(hotelBookings.map((row) => row.hotelId))],
         price: Number(pack?.price ?? price),
@@ -453,7 +457,7 @@ export class BranchBookingsService {
         tickets: priced.reduce((sum, row) => sum + row.seats.length, 0),
         legs: priced.map((row) => ({ leg: row.leg.leg, tripId: row.trip.id, tripCode: row.trip.tripCode, seats: row.seats, pricePerSeat: toSar(row.unitPrice), amount: toSar(row.transport) })),
         transport: toSar(transport),
-        stay: stay && { hotelName: stay.hotelName, roomType: stay.roomType, nights: stay.nights, amount: toSar(stay.amount), perPerson: toSar(stay.amount / persons) },
+        stay: stay && { hotelName: stay.hotelName, roomType: stay.roomType, nights: stay.nights, period: stay.period, amount: toSar(stay.amount), perPerson: toSar(stay.amount / persons) },
         listTotal: toSar(listTotal),
         total: toSar(total),
         discount: toSar(Math.max(0, listTotal - total)),
@@ -485,14 +489,19 @@ export class BranchBookingsService {
     // and that hotel is not part of its base price, so it is charged on top.
     const tripWithHotel = trips.find((trip) => trip.hotelBookings.some((booking) => booking.hotelId === hotel.id));
     const tripWithHousingPrice = trips.find((trip) => trip.housingPrice !== null || trip.privateRoomPrice !== null);
-    const terms: HousingTerms = tripWithHotel ?? tripWithHousingPrice ?? {
-      housingPrice: hotel.bedPrice,
-      privateRoomPrice: hotel.privateRoomPrice,
-      privateRoomCapacity: hotel.privateRoomCapacity,
-      housingPriceMode: 'ADDED_TO_BASE',
-      privateRoomPriceBasis: hotel.privateRoomPriceBasis,
-      housingPricePeriod: hotel.housingPricePeriod,
-    };
+    const tripTerms = tripWithHotel ?? tripWithHousingPrice;
+    // The counter picks the stay's dates itself, so whether the price is per night or for the whole stay is the hotel's
+    // setting: a trip's "whole stay" price was set for the trip's own nights, not for the ones chosen here.
+    const terms: HousingTerms = tripTerms
+      ? { ...tripTerms, housingPricePeriod: hotel.housingPricePeriod }
+      : {
+          housingPrice: hotel.bedPrice,
+          privateRoomPrice: hotel.privateRoomPrice,
+          privateRoomCapacity: hotel.privateRoomCapacity,
+          housingPriceMode: 'ADDED_TO_BASE',
+          privateRoomPriceBasis: hotel.privateRoomPriceBasis,
+          housingPricePeriod: hotel.housingPricePeriod,
+        };
     // A package's price is all-inclusive, the same rule as the app.
     const charges = !trips.some((trip) => trip.package);
     if (charges && !isRoomSellable(terms, stay.roomType)) throw new BadRequestException(`لا يوجد سعر لهذا النوع من السكن في ${hotel.name}، أضفه من صفحة الفنادق`);
@@ -503,6 +512,8 @@ export class BranchBookingsService {
       checkIn,
       checkOut,
       nights,
+      // A private room is always priced by the night, whatever the bed's period.
+      period: stay.roomType === 'PRIVATE' ? ('PER_NIGHT' as const) : terms.housingPricePeriod,
       amount: charges ? housingCharge(terms, stay.roomType, persons, nights) : 0,
     };
   }

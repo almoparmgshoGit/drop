@@ -59,6 +59,8 @@ export const AUDIT_EVENTS: Record<string, Event> = {
   'PUT /trips/:id': on('trips', 'تعديل رحلة'),
   'POST /trips/:id/open-reverse': on('trips', 'فتح رحلة عكسية'),
   'POST /trips/:id/duplicate': on('trips', 'نسخ رحلة إلى موعد جديد'),
+  'POST /trips/:id/boarding/open': on('trips', 'فتح الصعود يدويًا'),
+  'POST /trips/:id/boarding/reset': on('trips', 'إرجاع الصعود لموعده'),
   'POST /trips/series/generate-month': on('trips', 'توليد جدول الشهر من الجداول الأسبوعية'),
   'POST /trips/series/far-drafts/delete': on('trips', 'حذف مسودات الجداول الأسبوعية البعيدة'),
   'POST /trips/series/:seriesId/publish': on('trips', 'نشر مسودات جدول أسبوعي'),

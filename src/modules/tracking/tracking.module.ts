@@ -1,11 +1,12 @@
 import { Body, Controller, ForbiddenException, ConflictException, Get, Injectable, Module, NotFoundException, Param, Post, Req } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
-import { IsNumber, IsOptional, Max, Min } from 'class-validator';
+import { Type } from 'class-transformer';
+import { ArrayMaxSize, ArrayMinSize, IsArray, IsNumber, IsOptional, Max, Min, ValidateNested } from 'class-validator';
 import { RequirePermission, SkipAudit } from '../../common/decorators/auth.decorators';
 import { AppSettingsService, withinHours } from '../../common/services/app-settings.service';
 import { PrismaService } from '../../common/services/prisma.service';
 import { RealtimeService } from '../../common/services/realtime.service';
-import { RoutingService } from '../../common/services/routing.service';
+import { MAX_ROAD_POINTS, RoutingService } from '../../common/services/routing.service';
 import { CREW_WINDOW_SELECT, crewWindow } from '../../common/utils/crew-window.util';
 import { distanceInMeters } from '../../common/utils/geo.util';
 import { bookedOnTrips } from '../../common/utils/linked-seats.util';
@@ -70,6 +71,27 @@ class ReportLocationDto {
   speed?: number;
 }
 
+class RoadPointDto {
+  @IsNumber()
+  @Min(-90)
+  @Max(90)
+  lat: number;
+
+  @IsNumber()
+  @Min(-180)
+  @Max(180)
+  lng: number;
+}
+
+class RoadDto {
+  @IsArray()
+  @ArrayMinSize(2)
+  @ArrayMaxSize(MAX_ROAD_POINTS)
+  @ValidateNested({ each: true })
+  @Type(() => RoadPointDto)
+  points: RoadPointDto[];
+}
+
 @Injectable()
 class TrackingService {
   constructor(
@@ -128,6 +150,12 @@ class TrackingService {
       .filter((point) => point.meters <= limits.arrivalRadiusMeters)
       .sort((a, b) => a.meters - b.meters)[0];
     return { success: true, recordedAt: data.recordedAt, nearPoint: nearPoint ? { id: nearPoint.id, name: nearPoint.name, meters: Math.round(nearPoint.meters) } : null };
+  }
+
+  /** The road the bus should take through the crew's places, drawn on their map. Null means straight lines. */
+  async road(actor: { userId: string; role: string }, tripId: string, dto: RoadDto) {
+    await this.assertAssigned(actor, tripId);
+    return { road: await this.routing.roadThrough(dto.points.map(({ lat, lng }) => ({ lat, lng }))) };
   }
 
   async stop(actor: { userId: string; role: string }, tripId: string) {
@@ -462,6 +490,14 @@ class TrackingController {
   @ApiOperation({ summary: 'Crew reports the current bus position' })
   report(@Req() req, @Param('tripId') tripId: string, @Body() dto: ReportLocationDto) {
     return this.tracking.report(req.user, tripId, dto);
+  }
+
+  @Post('trips/:tripId/road')
+  @SkipAudit()
+  @RequirePermission('crew.trips')
+  @ApiOperation({ summary: 'The road through the trip places, for the crew map' })
+  road(@Req() req, @Param('tripId') tripId: string, @Body() dto: RoadDto) {
+    return this.tracking.road(req.user, tripId, dto);
   }
 
   @Post('trips/:tripId/stop')
