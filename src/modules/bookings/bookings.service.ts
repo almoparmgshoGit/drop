@@ -368,7 +368,7 @@ export class BookingsService {
     };
     const customStay = skipsCustomStay ? null : builtStay;
 
-    const legs = seated.map(({ leg, trip, seats }, index) => {
+    const listedLegs = seated.map(({ leg, trip, seats }, index) => {
       // A package charges its total for the group's size; an ordinary trip charges each seat.
       // One seat price for the quote and the booking alike; without flexible pricing it is the listed price.
       const pricing = seatPricing(trip);
@@ -382,8 +382,25 @@ export class BookingsService {
       }
       const stay = customStayLeg ? (index === 0 ? customStayLeg : null) : dto.transportOnly ? null : this.priceStay(trip, leg, seats.length);
       const housingAmount = stay?.amount ?? 0;
-      return { leg, trip, seats, unitPrice, pricing, stay, seatsSubtotal, housingAmount, subtotal: seatsSubtotal + housingAmount };
+      return { leg, trip, seats, unitPrice, pricing, stay, seatsSubtotal, housingAmount, subtotal: seatsSubtotal + housingAmount, roundShare: false };
     });
+    // A round journey on ordinary trips costs the outbound's seat price once, which already covers coming back: the two
+    // tickets share that price instead of adding the return's on top. Packages keep a price for each of their trips.
+    const roundJourney =
+      !customPackage &&
+      listedLegs.length === 2 &&
+      listedLegs.every((leg) => !leg.trip.package) &&
+      listedLegs[0].trip.origin === listedLegs[1].trip.destination &&
+      listedLegs[0].trip.destination === listedLegs[1].trip.origin;
+    const outboundIndex = roundJourney && listedLegs[1].trip.departureTime < listedLegs[0].trip.departureTime ? 1 : 0;
+    const roundShares = roundJourney ? allocate(listedLegs[outboundIndex].seatsSubtotal, listedLegs.map((leg) => leg.seatsSubtotal)) : null;
+    const legs = roundShares
+      ? listedLegs.map((leg, idx) => {
+          const seatsSubtotal = roundShares[idx];
+          const unitPrice = leg.seats.length ? Math.round(seatsSubtotal / leg.seats.length) : leg.unitPrice;
+          return { ...leg, seatsSubtotal, unitPrice, subtotal: seatsSubtotal + leg.housingAmount, roundShare: true };
+        })
+      : listedLegs;
 
     const subtotal = legs.reduce((sum, leg) => sum + leg.subtotal, 0);
     const seatCount = legs.reduce((sum, leg) => sum + leg.seats.length, 0);
@@ -496,7 +513,9 @@ export class BookingsService {
           seats: leg.seats,
           pricePerSeat: toSar(leg.unitPrice),
           // The listed seat price before flexible pricing, so the app can show what moved it; equal to pricePerSeat when it is off.
-          basePricePerSeat: leg.trip.package ? toSar(leg.unitPrice) : toSar(leg.pricing.base),
+          // A share of a round journey's price is not a flexible-pricing change, so it shows no listed price beside it.
+          basePricePerSeat: leg.trip.package || leg.roundShare ? toSar(leg.unitPrice) : toSar(leg.pricing.base),
+          roundJourney: leg.roundShare,
           // A package's seatsSubtotal is its total for the group's size, so the app shows it as such, not seats × price.
           isPackage: !!leg.trip.package,
           seatsSubtotal: toSar(leg.seatsSubtotal),
@@ -741,7 +760,11 @@ export class BookingsService {
                 vatAmount: toSar(leg.vat),
                 totalPrice: toSar(leg.total),
                 // The seat price as charged now, so a later change of rules or occupancy never rewrites what was sold.
-                ...(!leg.trip.package && { seatPrice: toSar(leg.pricing.price), seatBasePrice: toSar(leg.pricing.base) }),
+                // A round journey's leg sold its share of the one price, so that share is its seat price.
+                ...(!leg.trip.package &&
+                  (leg.roundShare
+                    ? { seatPrice: toSar(leg.unitPrice), seatBasePrice: toSar(leg.unitPrice) }
+                    : { seatPrice: toSar(leg.pricing.price), seatBasePrice: toSar(leg.pricing.base) })),
                 couponId: quote.coupon?.id,
                 boardingPointId: boardingPoint?.id,
                 boardingPointName: boardingPoint?.name,

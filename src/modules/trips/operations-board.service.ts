@@ -29,7 +29,7 @@ const BOARD_TRIP_SELECT = {
   departureTime: true,
   arrivalTime: true,
   tripStatus: true,
-  executionStatus: true,
+  liveStatus: true,
   reverseOfTripId: true,
   reverseTrip: { select: { id: true } },
   busId: true,

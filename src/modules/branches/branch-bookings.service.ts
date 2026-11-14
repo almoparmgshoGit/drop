@@ -442,7 +442,7 @@ export class BranchBookingsService {
     const persons = dto.legs[0].seats.length;
 
     const trips = await db.trip.findMany({ where: { id: { in: dto.legs.map((leg) => leg.tripId) } }, select: JOURNEY_TRIP });
-    const priced = dto.legs.map((leg) => {
+    const listed = dto.legs.map((leg) => {
       const trip = trips.find((row) => row.id === leg.tripId);
       this.assertSellable(trip);
       const seats = normalizeSeats(leg.seats);
@@ -453,6 +453,16 @@ export class BranchBookingsService {
       const unitPrice = seats.length ? Math.round(transport / seats.length) : seatPrice;
       return { leg, trip, seats, unitPrice, transport };
     });
+    // Round-trip transport costs the outbound's seat price once, which already covers coming back, the same rule as the
+    // app: the two tickets share it instead of adding the return's price. Packages keep a price for each of their trips.
+    const outboundListed = listed.find((row) => row.leg.leg === 'OUTBOUND');
+    const roundShares =
+      dto.kind === 'TRANSPORT_ROUND' && outboundListed && listed.every((row) => !row.trip.package)
+        ? allocate(outboundListed.transport, listed.map((row) => row.transport))
+        : null;
+    const priced = roundShares
+      ? listed.map((row, index) => ({ ...row, transport: roundShares[index], unitPrice: row.seats.length ? Math.round(roundShares[index] / row.seats.length) : row.unitPrice }))
+      : listed;
     const outboundTrip = priced.find((row) => row.leg.leg === 'OUTBOUND')?.trip;
     const returnTrip = priced.find((row) => row.leg.leg === 'RETURN')?.trip;
     if (outboundTrip && returnTrip && returnTrip.departureTime <= outboundTrip.departureTime) {

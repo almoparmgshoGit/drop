@@ -169,8 +169,9 @@ describe('Trips, bookings & tickets (e2e)', () => {
       }).expect(201);
       expect(res.body.bookings).toHaveLength(2);
       expect(res.body.bookings[0].groupReference).toBe(res.body.bookings[1].groupReference);
-      const totals = res.body.bookings.map((b: any) => Number(b.totalPrice)).sort();
-      expect(totals).toEqual([160, 200]);
+      // The outbound's price covers coming back: 2 × 100 for the journey, shared by the tickets in proportion to their prices.
+      const totals = res.body.bookings.map((b: any) => Number(b.totalPrice)).sort((a: number, b: number) => a - b);
+      expect(totals).toEqual([88.89, 111.11]);
     });
   });
 
