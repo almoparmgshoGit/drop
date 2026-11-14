@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Module, Param, ParseUUIDPipe, Post, Req } from '@nestjs/common';
+import { Body, Controller, Get, Module, Param, Post, Req } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
 import { Public, RequirePermission, SkipAudit } from '../../common/decorators/auth.decorators';
@@ -16,7 +16,7 @@ class TripFollowupController {
   @SkipAudit()
   @Throttle({ default: { limit: 20, ttl: 60_000 } })
   @ApiOperation({ summary: 'The owner\'s public tracking link for the trip behind a booking, to share with family' })
-  shareLink(@Req() req, @Param('bookingId', ParseUUIDPipe) bookingId: string) {
+  shareLink(@Req() req, @Param('bookingId') bookingId: string) {
     return this.followup.shareLink(req.user.userId, bookingId);
   }
 
@@ -31,7 +31,7 @@ class TripFollowupController {
   @Get('trip-ratings/bookings/:bookingId')
   @ApiBearerAuth()
   @ApiOperation({ summary: 'Whether the customer can rate the trip of this booking, and their rating if given' })
-  ratingOf(@Req() req, @Param('bookingId', ParseUUIDPipe) bookingId: string) {
+  ratingOf(@Req() req, @Param('bookingId') bookingId: string) {
     return this.followup.ratingOf(req.user.userId, bookingId);
   }
 
@@ -39,7 +39,7 @@ class TripFollowupController {
   @ApiBearerAuth()
   @Throttle({ default: { limit: 10, ttl: 60_000 } })
   @ApiOperation({ summary: 'The customer rates a trip they rode, once per booking' })
-  rate(@Req() req, @Param('bookingId', ParseUUIDPipe) bookingId: string, @Body() dto: RateTripDto) {
+  rate(@Req() req, @Param('bookingId') bookingId: string, @Body() dto: RateTripDto) {
     return this.followup.rate(req.user.userId, bookingId, dto);
   }
 
@@ -47,7 +47,7 @@ class TripFollowupController {
   @ApiBearerAuth()
   @RequirePermission('trips.view', 'trips.manage')
   @ApiOperation({ summary: 'Customer ratings of one trip with their averages, for the panel' })
-  tripRatings(@Param('tripId', ParseUUIDPipe) tripId: string) {
+  tripRatings(@Param('tripId') tripId: string) {
     return this.followup.tripRatings(tripId);
   }
 }
