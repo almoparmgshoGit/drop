@@ -32,7 +32,7 @@ class CreateOfferDto {
   @IsOptional() @ValidateNested() @Type(() => OfferTranslationsDto) translations?: OfferTranslationsDto;
 
   /** A path from the image upload, or nothing. */
-  @IsOptional() @IsString() @Matches(/^\/trips\/images\/[0-9a-f-]{36}$/, { message: 'الصورة غير صالحة' }) imageUrl?: string | null;
+  @IsOptional() @IsString() @Matches(/^\/trips\/images\/[A-Za-z0-9_-]{8,64}$/, { message: 'الصورة غير صالحة' }) imageUrl?: string | null;
   @IsOptional() @IsUUID() couponId?: string | null;
   @IsEnum(PromoAction) action: PromoAction;
   @IsOptional() @IsString() @Matches(/^https:\/\/\S+$/, { message: 'الرابط يجب أن يبدأ بـ https://' }) @MaxLength(500) actionUrl?: string | null;
