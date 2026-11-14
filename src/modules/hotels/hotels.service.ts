@@ -1140,7 +1140,10 @@ export class HotelsService {
           },
         });
       }
-      await this.assignInTx(tx, actor.userId, hotelBooking.id, { ...dto, passengerIds }, ip);
+      // A private room is the whole booking's: unless the employee sets a size it fits everyone on the booking,
+      // so the rest of the family can join it later instead of each getting a room of their own.
+      const capacity = dto.roomType === 'PRIVATE' ? dto.capacity ?? owned.length : dto.capacity;
+      await this.assignInTx(tx, actor.userId, hotelBooking.id, { ...dto, capacity, passengerIds }, ip);
     }, TX_OPTIONS);
     return { success: true };
   }

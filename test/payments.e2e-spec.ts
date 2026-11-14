@@ -24,7 +24,7 @@ describe('Payments register, cancellation review and refunds', () => {
     const res = await request(http())
       .post(`${API}/bookings`)
       .set(user.auth)
-      .send({ legs: [{ tripId: trip.id, seats: ['1'] }], passengers: [{ fullName: 'عبدالله العتيبي' }], paymentMethod: 'mada', ...body })
+      .send({ category: 'SINGLES', legs: [{ tripId: trip.id, seats: ['30'] }], passengers: [{ fullName: 'عبدالله العتيبي' }], paymentMethod: 'mada', ...body })
       .expect(201);
     return res.body.bookings[0];
   };
@@ -231,7 +231,7 @@ describe('Payments register, cancellation review and refunds', () => {
       expect(await walletOf(customer.user.id)).toBe(0);
       expect(await credited(booking.id)).toBe(0);
 
-      const seat = await prisma.seat.findFirstOrThrow({ where: { tripId: trip.id, seatNumber: '1' } });
+      const seat = await prisma.seat.findFirstOrThrow({ where: { tripId: trip.id, seatNumber: '30' } });
       expect(seat.isBooked).toBe(false);
 
       expect((await tab('refunding')).items[0].id).toBe(booking.id);

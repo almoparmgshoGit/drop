@@ -94,7 +94,7 @@ describe('Trip scheduling and editing (e2e)', () => {
       expect(trip.busId).toBeNull();
       expect(trip.totalSeats).toBe(49);
       const customer = await loginPassenger(app);
-      await request(http()).post(`${API}/bookings`).set(customer.auth).send({ paymentMethod: 'mada', legs: [{ tripId: trip.id, seats: ['1'] }], passengers: [{ fullName: 'مسافر تجريبي' }] }).expect(201);
+      await request(http()).post(`${API}/bookings`).set(customer.auth).send({ paymentMethod: 'mada', category: 'SINGLES', legs: [{ tripId: trip.id, seats: ['26'] }], passengers: [{ fullName: 'مسافر تجريبي' }] }).expect(201);
     });
 
     it('assigns the bus later', async () => {
@@ -265,7 +265,7 @@ describe('Trip scheduling and editing (e2e)', () => {
       expect(reopened.map((s) => s.hotelId)).toEqual([first.id]);
 
       const customer = await loginPassenger(app);
-      const booked = await request(http()).post(`${API}/bookings`).set(customer.auth).send({ paymentMethod: 'mada', legs: [{ tripId: trip.id, seats: ['1'], roomChoice: 'SHARED' }], passengers: [{ fullName: 'مسافر تجريبي' }] }).expect(201);
+      const booked = await request(http()).post(`${API}/bookings`).set(customer.auth).send({ paymentMethod: 'mada', category: 'SINGLES', legs: [{ tripId: trip.id, seats: ['26'], roomChoice: 'SHARED' }], passengers: [{ fullName: 'مسافر تجريبي' }] }).expect(201);
       await request(http()).post(`${API}/hotels/bookings/${reopened[0].id}/rooms`).set(admin.auth).send({ passengerIds: [booked.body.bookings[0].passengers[0].id], roomNumber: '1', roomType: 'SHARED' }).expect(201);
       await edit(trip.id, { accommodation: { name: second.name, nights: 1, hotelId: second.id } }).expect(409);
       await edit(trip.id, { bookingType: 'TRANSPORT_ONLY' }).expect(409);

@@ -1,6 +1,7 @@
 import { Injectable, ServiceUnavailableException } from '@nestjs/common';
 import { PrismaService } from './prisma.service';
 import { SinglesRange } from '../utils/singles-seats.util';
+import { SoloTravelerPolicy } from '@prisma/client';
 
 /** Numbers the code used to hard-code; the panel can now change them, and these remain the values until it does. */
 export const NUMBER_SETTINGS = {
@@ -117,6 +118,12 @@ export class AppSettingsService {
   }
 
   /** A bus's own range, or the settings' while the trip has no bus yet. A bus can be assigned after the trip went on sale. */
+  /** The singles range and who may book alone in the family section; a trip without a bus follows the settings and keeps solos with the singles. */
+  async seatRules(busId: string | null | undefined): Promise<{ range: SinglesRange; soloPolicy: SoloTravelerPolicy }> {
+    const bus = busId ? await this.prisma.bus.findUnique({ where: { id: busId }, select: { soloTravelerPolicy: true } }) : null;
+    return { range: await this.singlesRange(busId), soloPolicy: bus?.soloTravelerPolicy ?? 'SINGLES_ONLY' };
+  }
+
   async singlesRange(busId: string | null | undefined): Promise<SinglesRange> {
     const bus = busId ? await this.prisma.bus.findUnique({ where: { id: busId }, select: { singlesFromSeat: true, singlesToSeat: true } }) : null;
     if (bus) return { from: bus.singlesFromSeat, to: bus.singlesToSeat };

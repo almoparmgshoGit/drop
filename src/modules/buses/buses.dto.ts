@@ -19,7 +19,7 @@ import {
   MinLength,
   ValidateNested,
 } from 'class-validator';
-import { BusStatus, VehicleKind } from '@prisma/client';
+import { BusStatus, SoloTravelerPolicy, VehicleKind } from '@prisma/client';
 import { toEnglishDigits } from '../../common/utils/phone.util';
 import { GalleryImages } from '../../common/utils/gallery.util';
 
@@ -82,6 +82,11 @@ export class CreateBusDto {
   @Min(1)
   @Max(MAX_BUS_SEATS)
   singlesToSeat?: number;
+
+  /** Whether a traveller booking alone may sit in the family section: never, or only a woman. */
+  @IsOptional()
+  @IsEnum(SoloTravelerPolicy)
+  soloTravelerPolicy?: SoloTravelerPolicy;
 
   /** Ignored once the bus belongs to an office: the company then follows the office's name. */
   @IsOptional()

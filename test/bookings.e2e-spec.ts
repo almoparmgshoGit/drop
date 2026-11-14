@@ -20,6 +20,8 @@ describe('Trips, bookings & tickets (e2e)', () => {
   };
   const legsFor = (trip: any, seats: string[]) => [{ tripId: trip.id, seats }];
   const people = (n: number) => Array.from({ length: n }, (_, i) => ({ fullName: `مسافر ${i + 1}` }));
+  // A traveller booking alone sits with the singles (seats 26–49 by default).
+  const SINGLES = { category: 'SINGLES' };
   const setWallet = (userId: string, balance: number) =>
     prisma.user.update({ where: { id: userId }, data: { walletBalance: balance } });
 
@@ -53,7 +55,7 @@ describe('Trips, bookings & tickets (e2e)', () => {
     it('numbers an app booking like a branch one and stores its source and type', async () => {
       const trip = await createTrip();
       const user = await loginPassenger(app);
-      const res = await book(user, { legs: legsFor(trip, ['20']), passengers: people(1) }).expect(201);
+      const res = await book(user, { ...SINGLES, legs: legsFor(trip, ['30']), passengers: people(1) }).expect(201);
       const [booking] = res.body.bookings;
       expect(booking.bookingReference).toMatch(/^DH-\d{4}-\d{4,}$/);
       expect(booking).toMatchObject({ source: 'APP', serviceType: 'TRANSPORT_ONLY' });
@@ -66,19 +68,19 @@ describe('Trips, bookings & tickets (e2e)', () => {
       const user = await loginPassenger(app);
       const map = await request(http()).get(`${API}/bookings/seat-map/${trip.id}`).set(user.auth).expect(200);
       expect(map.body.seats).toHaveLength(49);
-      await book(user, { legs: legsFor(trip, ['49']), passengers: people(1) }).expect(201);
+      await book(user, { ...SINGLES, legs: legsFor(trip, ['49']), passengers: people(1) }).expect(201);
     });
 
     it('rejects double booking of the same seat', async () => {
       const trip = await createTrip();
-      await book(await loginPassenger(app), { legs: legsFor(trip, ['5']), passengers: people(1) }).expect(201);
-      await book(await loginPassenger(app), { legs: legsFor(trip, ['5']), passengers: people(1) }).expect(409);
+      await book(await loginPassenger(app), { ...SINGLES, legs: legsFor(trip, ['35']), passengers: people(1) }).expect(201);
+      await book(await loginPassenger(app), { ...SINGLES, legs: legsFor(trip, ['35']), passengers: people(1) }).expect(409);
     });
 
     it('sells a contested seat exactly once under concurrency', async () => {
       const trip = await createTrip();
       const users = await Promise.all(Array.from({ length: 6 }, () => loginPassenger(app)));
-      const results = await Promise.all(users.map((u) => book(u, { legs: legsFor(trip, ['7']), passengers: people(1) })));
+      const results = await Promise.all(users.map((u) => book(u, { ...SINGLES, legs: legsFor(trip, ['37']), passengers: people(1) })));
       expect(results.filter((r) => r.status === 201)).toHaveLength(1);
       expect(results.filter((r) => r.status === 409)).toHaveLength(5);
       const count = await prisma.booking.count({ where: { tripId: trip.id } });
@@ -88,15 +90,15 @@ describe('Trips, bookings & tickets (e2e)', () => {
     it('rejects draft, past and cancelled trips', async () => {
       const user = await loginPassenger(app);
       const draft = await createTrip({ tripStatus: 'DRAFT' });
-      await book(user, { legs: legsFor(draft, ['1']), passengers: people(1) }).expect(400);
+      await book(user, { ...SINGLES, legs: legsFor(draft, ['27']), passengers: people(1) }).expect(400);
 
       const past = await createTrip();
       await prisma.trip.update({ where: { id: past.id }, data: { departureTime: new Date(Date.now() - 1000) } });
-      await book(user, { legs: legsFor(past, ['1']), passengers: people(1) }).expect(400);
+      await book(user, { ...SINGLES, legs: legsFor(past, ['27']), passengers: people(1) }).expect(400);
 
       const cancelled = await createTrip();
       await request(http()).post(`${API}/trips/${cancelled.id}/cancel`).set(admin.auth).send({}).expect(201);
-      await book(user, { legs: legsFor(cancelled, ['1']), passengers: people(1) }).expect(400);
+      await book(user, { ...SINGLES, legs: legsFor(cancelled, ['27']), passengers: people(1) }).expect(400);
     });
 
     it('enforces the per-booking seat limit, passenger count and seat existence', async () => {
@@ -105,15 +107,18 @@ describe('Trips, bookings & tickets (e2e)', () => {
       await book(user, { legs: legsFor(trip, ['1', '2', '3']), passengers: people(3) }).expect(400);
       await book(user, { legs: legsFor(trip, ['1', '2']), passengers: people(1) }).expect(400);
       await book(user, { legs: legsFor(trip, ['1', '1']), passengers: people(2) }).expect(400);
-      await book(user, { legs: legsFor(trip, ['500']), passengers: people(1) }).expect(409);
+      await book(user, { legs: legsFor(trip, ['1', '500']), passengers: people(2) }).expect(409);
     });
 
-    it('enforces the singles seating section on the server', async () => {
+    it('enforces the singles and family seating sections on the server', async () => {
       const trip = await createTrip();
       const user = await loginPassenger(app);
       await book(user, { legs: legsFor(trip, ['3']), passengers: people(1), category: 'SINGLES' }).expect(400);
       await book(user, { legs: legsFor(trip, ['26']), passengers: people(1), category: 'SINGLES' }).expect(201);
-      await book(user, { legs: legsFor(trip, ['3']), passengers: people(1), category: 'FAMILY' }).expect(201);
+      // A traveller alone is not a family, and a family never sits in the singles seats.
+      await book(user, { legs: legsFor(trip, ['3']), passengers: people(1), category: 'FAMILY' }).expect(400);
+      await book(user, { legs: legsFor(trip, ['27', '28']), passengers: people(2), category: 'FAMILY' }).expect(400);
+      await book(user, { legs: legsFor(trip, ['3', '4']), passengers: people(2), category: 'FAMILY' }).expect(201);
     });
 
     it('stores the chosen boarding point and rejects one from another trip', async () => {
@@ -122,14 +127,16 @@ describe('Trips, bookings & tickets (e2e)', () => {
       const user = await loginPassenger(app);
       const [point] = trip.boardingPoints;
       const res = await book(user, {
-        legs: [{ tripId: trip.id, seats: ['1'], boardingPointId: point.id }],
+        ...SINGLES,
+        legs: [{ tripId: trip.id, seats: ['31'], boardingPointId: point.id }],
         passengers: [{ fullName: 'مسافر', phone: '0551234567' }],
       }).expect(201);
       expect(res.body.bookings[0].boardingPointName).toBe(point.name);
       expect(res.body.bookings[0].passengers[0].phone).toBe('+966551234567');
 
       await book(user, {
-        legs: [{ tripId: other.id, seats: ['1'], boardingPointId: point.id }],
+        ...SINGLES,
+        legs: [{ tripId: other.id, seats: ['31'], boardingPointId: point.id }],
         passengers: people(1),
       }).expect(400);
     });
@@ -138,13 +145,13 @@ describe('Trips, bookings & tickets (e2e)', () => {
       const trip = await createTrip();
       const user = await loginPassenger(app);
       const other = await loginPassenger(app);
-      const body = { legs: legsFor(trip, ['1']), passengers: people(1) };
+      const body = { ...SINGLES, legs: legsFor(trip, ['31']), passengers: people(1) };
 
       const first = await book(user, body, 'retry-key').expect(201);
       const retry = await book(user, body, 'retry-key').expect(201);
       expect(retry.body.bookings[0].id).toBe(first.body.bookings[0].id);
 
-      const stranger = await book(other, { legs: legsFor(trip, ['2']), passengers: people(1) }, 'retry-key').expect(201);
+      const stranger = await book(other, { ...SINGLES, legs: legsFor(trip, ['32']), passengers: people(1) }, 'retry-key').expect(201);
       expect(stranger.body.bookings[0].id).not.toBe(first.body.bookings[0].id);
       expect(stranger.body.bookings[0].userId).toBe(other.user.id);
     });
@@ -173,33 +180,33 @@ describe('Trips, bookings & tickets (e2e)', () => {
       const holder = await loginPassenger(app);
       const other = await loginPassenger(app);
 
-      await request(http()).post(`${API}/bookings/holds`).set(holder.auth).send({ tripId: trip.id, seats: ['4'] }).expect(201);
-      await request(http()).post(`${API}/bookings/holds`).set(other.auth).send({ tripId: trip.id, seats: ['4'] }).expect(409);
-      await book(other, { legs: legsFor(trip, ['4']), passengers: people(1) }).expect(409);
+      await request(http()).post(`${API}/bookings/holds`).set(holder.auth).send({ tripId: trip.id, seats: ['34'], ...SINGLES }).expect(201);
+      await request(http()).post(`${API}/bookings/holds`).set(other.auth).send({ tripId: trip.id, seats: ['34'], ...SINGLES }).expect(409);
+      await book(other, { ...SINGLES, legs: legsFor(trip, ['34']), passengers: people(1) }).expect(409);
 
       const holderMap = await request(http()).get(`${API}/bookings/seat-map/${trip.id}`).set(holder.auth).expect(200);
       const otherMap = await request(http()).get(`${API}/bookings/seat-map/${trip.id}`).set(other.auth).expect(200);
-      expect(holderMap.body.seats.find((s: any) => s.seatNumber === '4').status).toBe('mine');
-      expect(otherMap.body.seats.find((s: any) => s.seatNumber === '4').status).toBe('held');
+      expect(holderMap.body.seats.find((s: any) => s.seatNumber === '34').status).toBe('mine');
+      expect(otherMap.body.seats.find((s: any) => s.seatNumber === '34').status).toBe('held');
 
-      await prisma.seat.updateMany({ where: { tripId: trip.id, seatNumber: '4' }, data: { heldUntil: new Date(Date.now() - 1000) } });
-      await book(other, { legs: legsFor(trip, ['4']), passengers: people(1) }).expect(201);
+      await prisma.seat.updateMany({ where: { tripId: trip.id, seatNumber: '34' }, data: { heldUntil: new Date(Date.now() - 1000) } });
+      await book(other, { ...SINGLES, legs: legsFor(trip, ['34']), passengers: people(1) }).expect(201);
     });
 
     it('lets the holder complete the booking and release on demand', async () => {
       const trip = await createTrip();
       const holder = await loginPassenger(app);
-      await request(http()).post(`${API}/bookings/holds`).set(holder.auth).send({ tripId: trip.id, seats: ['6'] }).expect(201);
+      await request(http()).post(`${API}/bookings/holds`).set(holder.auth).send({ tripId: trip.id, seats: ['36'], ...SINGLES }).expect(201);
       await request(http()).delete(`${API}/bookings/holds`).set(holder.auth).send({ tripId: trip.id }).expect(200);
       const map = await request(http()).get(`${API}/bookings/seat-map/${trip.id}`).set(holder.auth).expect(200);
-      expect(map.body.seats.find((s: any) => s.seatNumber === '6').status).toBe('available');
+      expect(map.body.seats.find((s: any) => s.seatNumber === '36').status).toBe('available');
     });
 
     it('rolls back every seat when one of a group is unavailable', async () => {
       const trip = await createTrip();
       const first = await loginPassenger(app);
       const second = await loginPassenger(app);
-      await request(http()).post(`${API}/bookings/holds`).set(first.auth).send({ tripId: trip.id, seats: ['2'] }).expect(201);
+      await request(http()).post(`${API}/bookings/holds`).set(first.auth).send({ tripId: trip.id, seats: ['2', '3'] }).expect(201);
       await request(http()).post(`${API}/bookings/holds`).set(second.auth).send({ tripId: trip.id, seats: ['1', '2'] }).expect(409);
       const map = await request(http()).get(`${API}/bookings/seat-map/${trip.id}`).set(first.auth).expect(200);
       expect(map.body.seats.find((s: any) => s.seatNumber === '1').status).toBe('available');
@@ -210,8 +217,8 @@ describe('Trips, bookings & tickets (e2e)', () => {
     it('ignores any price sent by the client', async () => {
       const trip = await createTrip({ price: 180 });
       const user = await loginPassenger(app);
-      await book(user, { legs: legsFor(trip, ['1']), passengers: people(1), totalPrice: 1 }).expect(400);
-      const res = await book(user, { legs: legsFor(trip, ['2']), passengers: people(1) }).expect(201);
+      await book(user, { ...SINGLES, legs: legsFor(trip, ['31']), passengers: people(1), totalPrice: 1 }).expect(400);
+      const res = await book(user, { ...SINGLES, legs: legsFor(trip, ['32']), passengers: people(1) }).expect(201);
       expect(Number(res.body.bookings[0].totalPrice)).toBe(180);
     });
 
@@ -230,11 +237,11 @@ describe('Trips, bookings & tickets (e2e)', () => {
       const user = await loginPassenger(app);
       await setWallet(user.user.id, 120);
 
-      const quote = await request(http()).post(`${API}/bookings/quote`).set(user.auth).send({ legs: legsFor(trip, ['1']), useWallet: true }).expect(201);
+      const quote = await request(http()).post(`${API}/bookings/quote`).set(user.auth).send({ ...SINGLES, legs: legsFor(trip, ['31']), useWallet: true }).expect(201);
       expect(quote.body).toMatchObject({ total: 180, walletUsed: 120, payable: 60 });
 
-      await book(user, { legs: legsFor(trip, ['1']), passengers: people(1), useWallet: true }).expect(201);
-      const second = await request(http()).post(`${API}/bookings/quote`).set(user.auth).send({ legs: legsFor(trip, ['2']), useWallet: true }).expect(201);
+      await book(user, { ...SINGLES, legs: legsFor(trip, ['31']), passengers: people(1), useWallet: true }).expect(201);
+      const second = await request(http()).post(`${API}/bookings/quote`).set(user.auth).send({ ...SINGLES, legs: legsFor(trip, ['32']), useWallet: true }).expect(201);
       expect(second.body).toMatchObject({ walletUsed: 0, payable: 180 });
 
       const history = await request(http()).get(`${API}/users/profile/wallet-transactions`).set(user.auth).expect(200);
@@ -249,8 +256,8 @@ describe('Trips, bookings & tickets (e2e)', () => {
       const user = await loginPassenger(app);
       await setWallet(user.user.id, 100);
       await Promise.all([
-        book(user, { legs: legsFor(tripA, ['1']), passengers: people(1), useWallet: true }),
-        book(user, { legs: legsFor(tripB, ['1']), passengers: people(1), useWallet: true }),
+        book(user, { ...SINGLES, legs: legsFor(tripA, ['31']), passengers: people(1), useWallet: true }),
+        book(user, { ...SINGLES, legs: legsFor(tripB, ['31']), passengers: people(1), useWallet: true }),
       ]);
       const fresh = await prisma.user.findUnique({ where: { id: user.user.id } });
       expect(Number(fresh.walletBalance)).toBe(0);
@@ -269,7 +276,7 @@ describe('Trips, bookings & tickets (e2e)', () => {
 
       const res = await book(user, { legs: legsFor(trip, ['1', '2']), passengers: people(2), couponCode: 'madinah10' }).expect(201);
       expect(Number(res.body.bookings[0].discountAmount)).toBe(20);
-      await book(user, { legs: legsFor(trip, ['3']), passengers: people(1), couponCode: 'MADINAH10' }).expect(400);
+      await book(user, { ...SINGLES, legs: legsFor(trip, ['33']), passengers: people(1), couponCode: 'MADINAH10' }).expect(400);
     });
 
     it('caps a coupon at the price and splits amounts across a round trip without losing a halala', async () => {
@@ -283,7 +290,8 @@ describe('Trips, bookings & tickets (e2e)', () => {
       expect(huge.body.total).toBe(0);
 
       const res = await book(user, {
-        legs: [{ tripId: a.id, seats: ['1'] }, { tripId: b.id, seats: ['1'] }],
+        ...SINGLES,
+        legs: [{ tripId: a.id, seats: ['31'] }, { tripId: b.id, seats: ['31'] }],
         passengers: people(1),
         couponCode: 'THIRD',
       }).expect(201);
@@ -309,7 +317,7 @@ describe('Trips, bookings & tickets (e2e)', () => {
     const bookOne = async (price = 180) => {
       const trip = await createTrip({ price });
       const user = await loginPassenger(app);
-      const res = await book(user, { legs: legsFor(trip, ['8']), passengers: people(1) }).expect(201);
+      const res = await book(user, { ...SINGLES, legs: legsFor(trip, ['38']), passengers: people(1) }).expect(201);
       return { trip, user, booking: res.body.bookings[0] };
     };
 
@@ -325,7 +333,7 @@ describe('Trips, bookings & tickets (e2e)', () => {
       const profile = await request(http()).get(`${API}/users/profile`).set(user.auth).expect(200);
       expect(Number(profile.body.walletBalance)).toBe(180);
       const map = await request(http()).get(`${API}/bookings/seat-map/${trip.id}`).set(user.auth).expect(200);
-      expect(map.body.seats.find((s: any) => s.seatNumber === '8').status).toBe('available');
+      expect(map.body.seats.find((s: any) => s.seatNumber === '38').status).toBe('available');
       expect(map.body.availableSeats).toBe(49);
 
       await request(http()).post(`${API}/bookings/${booking.id}/cancel`).set(user.auth).send({}).expect(400);
@@ -359,8 +367,8 @@ describe('Trips, bookings & tickets (e2e)', () => {
       const trip = await createTrip({ price: 90 });
       const a = await loginPassenger(app);
       const b = await loginPassenger(app);
-      await book(a, { legs: legsFor(trip, ['1']), passengers: people(1) }).expect(201);
-      await book(b, { legs: legsFor(trip, ['2']), passengers: people(1) }).expect(201);
+      await book(a, { ...SINGLES, legs: legsFor(trip, ['31']), passengers: people(1) }).expect(201);
+      await book(b, { ...SINGLES, legs: legsFor(trip, ['32']), passengers: people(1) }).expect(201);
 
       const res = await request(http()).post(`${API}/trips/${trip.id}/cancel`).set(admin.auth).send({}).expect(201);
       expect(res.body.cancelledBookings).toBe(2);
@@ -398,7 +406,7 @@ describe('Trips, bookings & tickets (e2e)', () => {
       const trip = await createTrip();
       const owner = await loginPassenger(app);
       const stranger = await loginPassenger(app);
-      const res = await book(owner, { legs: legsFor(trip, ['1']), passengers: people(1) }).expect(201);
+      const res = await book(owner, { ...SINGLES, legs: legsFor(trip, ['31']), passengers: people(1) }).expect(201);
       const id = res.body.bookings[0].id;
 
       await request(http()).get(`${API}/bookings/${id}`).set(stranger.auth).expect(403);
@@ -503,7 +511,7 @@ describe('Trips, bookings & tickets (e2e)', () => {
         arrivalTime: new Date(far + 3600000).toISOString(),
       });
       const user = await loginPassenger(app);
-      const res = await book(user, { legs: legsFor(trip, ['1']), passengers: people(1) }).expect(201);
+      const res = await book(user, { ...SINGLES, legs: legsFor(trip, ['31']), passengers: people(1) }).expect(201);
       const session = await loginStaff(app, crew.phone);
       await openBoarding(prisma, trip.id);
       const result = await verify(session, res.body.bookings[0].passengers[0].ticket.signedToken, trip.id).expect(201);

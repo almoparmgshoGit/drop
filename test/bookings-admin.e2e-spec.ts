@@ -13,7 +13,8 @@ describe('Booking administration (e2e)', () => {
   const createTrip = async (overrides = {}) =>
     (await request(http()).post(`${API}/trips`).set(admin.auth).send(tripPayload(overrides)).expect(201)).body;
 
-  const bookOne = async (overrides = {}, seats = ['5']) => {
+  // One traveller sits with the singles (26–49); two or more book as a family outside that range.
+  const bookOne = async (overrides = {}, seats = ['30']) => {
     const trip = await createTrip(overrides);
     const user = await loginPassenger(app);
     const res = await request(http())
@@ -21,6 +22,7 @@ describe('Booking administration (e2e)', () => {
       .set(user.auth)
       .send({
         paymentMethod: 'mada',
+        category: seats.length === 1 ? 'SINGLES' : 'FAMILY',
         legs: [{ tripId: trip.id, seats }],
         passengers: seats.map((_, i) => ({ fullName: `مسافر ${i + 1}` })),
       })
@@ -150,12 +152,12 @@ describe('Booking administration (e2e)', () => {
       const res = await request(http())
         .post(`${API}/bookings/admin/${booking.id}/passengers/${passenger.id}/seat`)
         .set(staff.auth)
-        .send({ seatNumber: '12', reason: 'طلب العميل', expectedUpdatedAt: booking.updatedAt })
+        .send({ seatNumber: '32', reason: 'طلب العميل', expectedUpdatedAt: booking.updatedAt })
         .expect(201);
 
-      expect(res.body.passengers[0].seatNumber).toBe('12');
-      expect(await seatFree(trip.id, '5')).toBe(true);
-      expect(await seatFree(trip.id, '12')).toBe(false);
+      expect(res.body.passengers[0].seatNumber).toBe('32');
+      expect(await seatFree(trip.id, '30')).toBe(true);
+      expect(await seatFree(trip.id, '32')).toBe(false);
       expect((await prisma.trip.findUniqueOrThrow({ where: { id: trip.id } })).availableSeats).toBe(48);
       expect(res.body.passengers[0].ticket.ticketNumber).not.toBe(passenger.ticket.ticketNumber);
 
@@ -182,7 +184,7 @@ describe('Booking administration (e2e)', () => {
 
     it('gives one free seat to exactly one of two simultaneous requests', async () => {
       const first = await bookOne({}, ['5', '6']);
-      const body = { seatNumber: '30', reason: 'نفس المقعد', expectedUpdatedAt: first.booking.updatedAt };
+      const body = { seatNumber: '12', reason: 'نفس المقعد', expectedUpdatedAt: first.booking.updatedAt };
       const results = await Promise.all(
         first.booking.passengers.map((p: any) =>
           request(http()).post(`${API}/bookings/admin/${first.booking.id}/passengers/${p.id}/seat`).set(admin.auth).send(body),
@@ -190,7 +192,7 @@ describe('Booking administration (e2e)', () => {
       );
       expect(results.map((r) => r.status).sort()).toEqual([201, 409]);
       const seats = (await details(first.booking.id)).passengers.map((p: any) => p.seatNumber);
-      expect(seats.filter((s: string) => s === '30')).toHaveLength(1);
+      expect(seats.filter((s: string) => s === '12')).toHaveLength(1);
     });
 
     it('refuses once the passenger boarded or the trip left', async () => {
@@ -376,23 +378,27 @@ describe('Booking administration (e2e)', () => {
         arrivalTime: new Date(departure + 2 * 86_400_000 + 5 * 3_600_000).toISOString(),
       });
       const user = await loginPassenger(app);
+      // A traveller alone sits with the singles (26–49); a family books outside that range.
       const bookTrip = (legs: { tripId: string; seats: string[] }[], names: string[]) =>
-        request(http()).post(`${API}/bookings`).set(user.auth).send({ paymentMethod: 'mada', legs, passengers: names.map((fullName) => ({ fullName })) }).expect(201);
+        request(http()).post(`${API}/bookings`).set(user.auth)
+          .send({ paymentMethod: 'mada', category: names.length === 1 ? 'SINGLES' : 'FAMILY', legs, passengers: names.map((fullName) => ({ fullName })) })
+          .expect(201);
 
       // Three seats go one way; the fourth has its return on another trip, so it is not counted as going only.
       await bookTrip([{ tripId: trip.id, seats: ['1', '2', '3'] }], ['راكب أول', 'راكب ثان', 'راكب ثالث']);
-      await bookTrip([{ tripId: trip.id, seats: ['4'] }, { tripId: later.id, seats: ['4'] }], ['راكب رابع']);
+      await bookTrip([{ tripId: trip.id, seats: ['26'] }, { tripId: later.id, seats: ['26'] }], ['راكب رابع']);
 
       // Publishing the trip opened its way back, which sells the whole bus again.
       const reverse = await prisma.trip.findFirstOrThrow({ where: { reverseOfTripId: trip.id } });
       expect(reverse.availableSeats).toBe(49);
-      await bookTrip([{ tripId: reverse.id, seats: ['1'] }], ['راكب عكسي']);
+      // A family of two on the way back, on the seat a go-only passenger holds outbound.
+      await bookTrip([{ tripId: reverse.id, seats: ['1', '2'] }], ['راكب عكسي', 'مرافق عكسي']);
 
       const outboundSeats = await prisma.trip.findUniqueOrThrow({ where: { id: trip.id } });
       expect(outboundSeats.availableSeats).toBe(45);
 
       const manifest = (await request(http()).get(`${API}/manifests/${trip.id}`).set(admin.auth).expect(200)).body;
-      expect(manifest.reverse).toMatchObject({ goOnlySeats: 3, isOpen: true, bookedSeats: 1, availableSeats: 48 });
+      expect(manifest.reverse).toMatchObject({ goOnlySeats: 3, isOpen: true, bookedSeats: 2, availableSeats: 47 });
       expect(manifest.passengers.filter((p: any) => p.goOnly).map((p: any) => p.seatNumber)).toEqual(['1', '2', '3']);
 
       const list = (await request(http()).get(`${API}/bookings/admin/all?tripId=${trip.id}`).set(admin.auth).expect(200)).body;
@@ -403,7 +409,7 @@ describe('Booking administration (e2e)', () => {
       const first = manifest.passengers.find((p: any) => p.seatNumber === '1');
       await request(http()).post(`${API}/bookings/${first.bookingId}/admin-cancel`).set(admin.auth).send({ note: 'قرار' }).expect(201);
       expect(await prisma.seat.findFirstOrThrow({ where: { tripId: reverse.id, seatNumber: '1' } })).toMatchObject({ isBooked: true });
-      expect((await prisma.trip.findUniqueOrThrow({ where: { id: reverse.id } })).availableSeats).toBe(48);
+      expect((await prisma.trip.findUniqueOrThrow({ where: { id: reverse.id } })).availableSeats).toBe(47);
 
       // The rule depends on the direction, so it cannot change under sales already made.
       await request(http()).put(`${API}/trips/${trip.id}`).set(admin.auth).send({ direction: 'ROUND_TRIP' }).expect(409);
@@ -476,7 +482,7 @@ describe('Booking administration (e2e)', () => {
       await request(http()).post(`${API}/bookings/${booking.id}/admin-cancel`).set(admin.auth).send({ note: 'قرار إداري' }).expect(201);
       const body = await manifest(trip.id);
       expect(body.passengers).toHaveLength(0);
-      expect(body.seats.find((s: any) => s.seatNumber === '5').status).toBe('available');
+      expect(body.seats.find((s: any) => s.seatNumber === '30').status).toBe('available');
     });
 
     it('saves national id and notes on the passenger and shows them on the sheet', async () => {
@@ -499,12 +505,12 @@ describe('Booking administration (e2e)', () => {
       const second = await request(http())
         .post(`${API}/bookings`)
         .set(user.auth)
-        .send({ paymentMethod: 'card', useWallet: true, legs: [{ tripId: trip.id, seats: ['8'] }], passengers: [{ fullName: 'مسافر 4' }] })
+        .send({ paymentMethod: 'card', useWallet: true, category: 'SINGLES', legs: [{ tripId: trip.id, seats: ['31'] }], passengers: [{ fullName: 'مسافر 4' }] })
         .expect(201);
       const third = await request(http())
         .post(`${API}/bookings`)
         .set(user.auth)
-        .send({ paymentMethod: 'mada', legs: [{ tripId: trip.id, seats: ['9'] }], passengers: [{ fullName: 'مسافر 5' }] })
+        .send({ paymentMethod: 'mada', category: 'SINGLES', legs: [{ tripId: trip.id, seats: ['32'] }], passengers: [{ fullName: 'مسافر 5' }] })
         .expect(201);
       await request(http()).post(`${API}/bookings/${third.body.bookings[0].id}/admin-cancel`).set(admin.auth).send({ refundAmount: 30, note: 'رسوم إلغاء' }).expect(201);
 

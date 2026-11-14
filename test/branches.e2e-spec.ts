@@ -26,12 +26,14 @@ describe('Branches, their staff and counter bookings', () => {
     return { user, session: await loginStaff(app, user.phone) };
   };
   const dateOf = (iso: string) => new Date(new Date(iso).getTime() + 3 * 3_600_000).toISOString().slice(0, 10);
-  let seatCounter = 0;
+  // A traveller booking alone sits with the singles (seats 26-49 while a trip has no bus), so these one-seat bookings are singles.
+  let seatCounter = 25;
   const nextSeat = () => String(++seatCounter);
 
   const single = (overrides: Record<string, unknown> = {}) => ({
     kind: 'TRANSPORT_OUTBOUND',
-    legs: [{ leg: 'OUTBOUND', tripId: outbound.id, seats: [nextSeat()] }],
+    category: 'SINGLES',
+    legs: (overrides.legs as unknown[] | undefined) ?? [{ leg: 'OUTBOUND', tripId: outbound.id, seats: [nextSeat()] }],
     customer: { name: 'عبدالله العتيبي', phone: nextPhone().replace('+966', '0'), nationality: 'مصري', city: 'جدة', gender: 'MALE', birthDate: '1990-01-01', idType: 'PASSPORT', idNumber: 'A1234567' },
     passengers: [{ fullName: 'عبدالله العتيبي', nationalId: '1087345291' }],
     ...overrides,
@@ -40,9 +42,8 @@ describe('Branches, their staff and counter bookings', () => {
   beforeAll(async () => {
     ({ app, prisma } = await createTestApp());
     await resetDatabase(prisma);
-    // The counter keeps families out of the singles section. These tests seat families from seat 1 upward, so the
-    // singles section (used while a trip has no bus) is the back row only.
-    await prisma.setting.createMany({ data: [{ key: 'defaultSinglesFromSeat', value: '45' }, { key: 'defaultSinglesToSeat', value: '49' }] });
+    // The counter keeps families out of the singles section (26-49 by default while a trip has no bus): families here sit
+    // from seat 1 upward and the one-seat bookings are singles from seat 26.
     const adminUser = await createStaff(prisma, 'ADMIN');
     admin = await loginStaff(app, adminUser.phone);
 
@@ -260,8 +261,8 @@ describe('Branches, their staff and counter bookings', () => {
       const quote = await request(http()).post(`${API}/branch-bookings/quote`).set(clerk.auth).send({ kind: 'TRANSPORT_OUTBOUND', withVisits: true, legs: [{ leg: 'OUTBOUND', tripId: visiting.id, seats: ['1'] }] }).expect(201);
       expect(quote.body).toMatchObject({ serviceType: 'WITH_VISITS', offersVisits: true, kindLabel: 'نقل مع زيارة معالم · ذهاب فقط', total: 70 });
 
-      const withVisits = await request(http()).post(`${API}/branch-bookings`).set(clerk.auth).send(single({ withVisits: true, legs: [{ leg: 'OUTBOUND', tripId: visiting.id, seats: ['2'] }] })).expect(201);
-      const without = await request(http()).post(`${API}/branch-bookings`).set(clerk.auth).send(single({ withVisits: false, legs: [{ leg: 'OUTBOUND', tripId: visiting.id, seats: ['3'] }] })).expect(201);
+      const withVisits = await request(http()).post(`${API}/branch-bookings`).set(clerk.auth).send(single({ withVisits: true, legs: [{ leg: 'OUTBOUND', tripId: visiting.id, seats: ['27'] }] })).expect(201);
+      const without = await request(http()).post(`${API}/branch-bookings`).set(clerk.auth).send(single({ withVisits: false, legs: [{ leg: 'OUTBOUND', tripId: visiting.id, seats: ['28'] }] })).expect(201);
       const saved = await prisma.booking.findMany({ where: { id: { in: [withVisits.body.legs[0].id, without.body.legs[0].id] } }, select: { id: true, serviceType: true } });
       expect(saved.find((row) => row.id === withVisits.body.legs[0].id)?.serviceType).toBe('WITH_VISITS');
       expect(saved.find((row) => row.id === without.body.legs[0].id)?.serviceType).toBe('TRANSPORT_ONLY');
@@ -302,7 +303,7 @@ describe('Branches, their staff and counter bookings', () => {
 
     it('does not sell a trip closed to branches', async () => {
       const closed = (await request(http()).post(`${API}/trips`).set(admin.auth).send(tripPayload({ channelBranch: false })).expect(201)).body;
-      await request(http()).post(`${API}/branch-bookings`).set(clerk.auth).send(single({ legs: [{ leg: 'OUTBOUND', tripId: closed.id, seats: ['1'] }] })).expect(400);
+      await request(http()).post(`${API}/branch-bookings`).set(clerk.auth).send(single({ legs: [{ leg: 'OUTBOUND', tripId: closed.id, seats: ['26'] }] })).expect(400);
       const found = await request(http()).get(`${API}/branch-bookings/trips`).set(clerk.auth).expect(200);
       expect(found.body.items.map((trip: any) => trip.id)).not.toContain(closed.id);
     });
@@ -319,41 +320,52 @@ describe('Branches, their staff and counter bookings', () => {
           passengers: seats.map((_, index) => ({ fullName: `راكب ${index + 1}` })),
         });
 
-      const map = await seatMap();
-      expect(map).toMatchObject({ singlesFromSeat: 45, singlesToSeat: 49 });
-      expect(map.seats.find((seat: any) => seat.seatNumber === '46')).toMatchObject({ status: 'available', singles: true, heldUntil: null });
-      expect(map.seats.find((seat: any) => seat.seatNumber === '1')).toMatchObject({ status: 'available', singles: false });
+      // The singles section narrowed to the back row for this test, so a full singles section is easy to reach.
+      await prisma.setting.createMany({ data: [{ key: 'defaultSinglesFromSeat', value: '45' }, { key: 'defaultSinglesToSeat', value: '49' }] });
+      try {
+        const map = await seatMap();
+        expect(map).toMatchObject({ singlesFromSeat: 45, singlesToSeat: 49, soloTravelerPolicy: 'SINGLES_ONLY' });
+        expect(map.seats.find((seat: any) => seat.seatNumber === '46')).toMatchObject({ status: 'available', singles: true, heldUntil: null });
+        expect(map.seats.find((seat: any) => seat.seatNumber === '1')).toMatchObject({ status: 'available', singles: false });
 
-      // A family, which is what a booking is when no category is sent, may not take a singles seat.
-      const family = await book(['46']).expect(400);
-      expect(family.body.message).toContain('مقاعد العزّاب');
-      await book(['46'], 'FAMILY').expect(400);
-      // Singles may not take a family seat.
-      const singles = await book(['2'], 'SINGLES').expect(400);
-      expect(singles.body.message).toContain('خارج مقاعد العزّاب');
+        // A family, which is what a booking is when no category is sent, may not take a singles seat.
+        const family = await book(['46']).expect(400);
+        expect(family.body.message).toContain('مقاعد العزّاب');
+        await book(['46'], 'FAMILY').expect(400);
+        // Singles may not take a family seat.
+        const singles = await book(['2'], 'SINGLES').expect(400);
+        expect(singles.body.message).toContain('خارج مقاعد العزّاب');
 
-      const singlesOk = await book(['46'], 'SINGLES').expect(201);
-      const familyOk = await book(['3']).expect(201);
-      const saved = await prisma.booking.findMany({ where: { id: { in: [singlesOk.body.legs[0].id, familyOk.body.legs[0].id] } }, select: { id: true, category: true } });
-      expect(saved.find((row) => row.id === singlesOk.body.legs[0].id)?.category).toBe('SINGLES');
-      expect(saved.find((row) => row.id === familyOk.body.legs[0].id)?.category).toBe('FAMILY');
+        // One traveller alone is not a family: a trip without a bus keeps them with the singles.
+        const solo = await book(['3']).expect(400);
+        expect(solo.body.message).toContain('مقاعد العزّاب فقط');
 
-      // Seats left to the server are chosen inside the booking's own section.
-      const autoSingles = await book(['', ''], 'SINGLES').expect(201);
-      expect(autoSingles.body.legs[0].seats.every((seat: string) => Number(seat) >= 45 && Number(seat) <= 49)).toBe(true);
-      const autoFamily = await book(['', '']).expect(201);
-      expect(autoFamily.body.legs[0].seats.every((seat: string) => Number(seat) < 45)).toBe(true);
-      // Two singles seats are left (45-49 less three taken): three more singles do not fit, and no family seat is used for them.
-      await book(['', '', ''], 'SINGLES').expect(409);
+        const singlesOk = await book(['46'], 'SINGLES').expect(201);
+        const familyOk = await book(['3', '4']).expect(201);
+        const saved = await prisma.booking.findMany({ where: { id: { in: [singlesOk.body.legs[0].id, familyOk.body.legs[0].id] } }, select: { id: true, category: true } });
+        expect(saved.find((row) => row.id === singlesOk.body.legs[0].id)?.category).toBe('SINGLES');
+        expect(saved.find((row) => row.id === familyOk.body.legs[0].id)?.category).toBe('FAMILY');
 
-      // A seat held in the app for its payment window reads as held, with until when; a sold one reads as booked.
-      const heldUntil = new Date(Date.now() + 10 * 60_000);
-      await prisma.seat.updateMany({ where: { tripId: trip.id, seatNumber: '10' }, data: { heldUntil } });
-      const after = await seatMap();
-      expect(after.seats.find((seat: any) => seat.seatNumber === '10')).toMatchObject({ status: 'held', singles: false });
-      expect(new Date(after.seats.find((seat: any) => seat.seatNumber === '10').heldUntil).getTime()).toBe(heldUntil.getTime());
-      expect(after.seats.find((seat: any) => seat.seatNumber === '46')).toMatchObject({ status: 'booked', singles: true, heldUntil: null });
-      await book(['10']).expect(409);
+        // Seats left to the server are chosen inside the booking's own section.
+        const autoSingles = await book(['', ''], 'SINGLES').expect(201);
+        expect(autoSingles.body.legs[0].seats.every((seat: string) => Number(seat) >= 45 && Number(seat) <= 49)).toBe(true);
+        const autoFamily = await book(['', '']).expect(201);
+        expect(autoFamily.body.legs[0].seats.every((seat: string) => Number(seat) < 45)).toBe(true);
+        // Two singles seats are left (45-49 less three taken): three more singles do not fit, and no family seat is used for them.
+        await book(['', '', ''], 'SINGLES').expect(409);
+
+        // A seat held in the app for its payment window reads as held, with until when; a sold one reads as booked.
+        const heldUntil = new Date(Date.now() + 10 * 60_000);
+        await prisma.seat.updateMany({ where: { tripId: trip.id, seatNumber: '10' }, data: { heldUntil } });
+        const after = await seatMap();
+        expect(after.seats.find((seat: any) => seat.seatNumber === '10')).toMatchObject({ status: 'held', singles: false });
+        expect(new Date(after.seats.find((seat: any) => seat.seatNumber === '10').heldUntil).getTime()).toBe(heldUntil.getTime());
+        expect(after.seats.find((seat: any) => seat.seatNumber === '46')).toMatchObject({ status: 'booked', singles: true, heldUntil: null });
+        const spare = ['40', '41', '42'].find((seat) => !autoFamily.body.legs[0].seats.includes(seat))!;
+        await book(['10', spare]).expect(409);
+      } finally {
+        await prisma.setting.deleteMany({ where: { key: { in: ['defaultSinglesFromSeat', 'defaultSinglesToSeat'] } } });
+      }
     });
   });
 
@@ -400,7 +412,8 @@ describe('Branches, their staff and counter bookings', () => {
     });
 
     it('creates one linked booking per trip, carries the stay on the first, and fills invoices in order', async () => {
-      const seats = ['33', '34'];
+      // A family of two sits in the family section, before the singles from seat 26.
+      const seats = ['3', '4'];
       const stay = stayBody();
       const res = await request(http()).post(`${API}/branch-bookings`).set(manager.auth).send({
         kind: 'PACKAGE_ROUND_STAY',

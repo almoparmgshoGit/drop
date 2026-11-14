@@ -13,12 +13,12 @@ describe('Customer screens data (e2e)', () => {
   const createTrip = async (overrides = {}) =>
     (await request(http()).post(`${API}/trips`).set(admin.auth).send(tripPayload(overrides)).expect(201)).body;
 
-  const book = async (trip: any, seats = ['5'], user?: any) => {
+  const book = async (trip: any, seats = ['30'], user?: any) => {
     const session = user ?? (await loginPassenger(app));
     const res = await request(http())
       .post(`${API}/bookings`)
       .set(session.auth)
-      .send({ paymentMethod: 'mada', legs: [{ tripId: trip.id, seats }], passengers: seats.map((s) => ({ fullName: `مسافر ${s}` })) })
+      .send({ paymentMethod: 'mada', ...(seats.length === 1 ? { category: 'SINGLES' } : {}), legs: [{ tripId: trip.id, seats }], passengers: seats.map((s) => ({ fullName: `مسافر ${s}` })) })
       .expect(201);
     return { user: session, booking: res.body.bookings[0] };
   };
@@ -309,7 +309,7 @@ describe('Customer screens data (e2e)', () => {
       const trip = await createTrip();
       const user = await loginPassenger(app);
       await prisma.user.update({ where: { phone: user.phone }, data: { walletBalance: 1000 } });
-      const { booking } = await book(trip, ['5'], user);
+      const { booking } = await book(trip, ['30'], user);
       await request(http()).post(`${API}/bookings/${booking.id}/admin-cancel`).set(admin.auth).send({ note: 'قرار إداري' }).expect(201);
 
       const history = await request(http()).get(`${API}/users/profile/wallet-transactions`).set(user.auth).expect(200);
@@ -323,7 +323,7 @@ describe('Customer screens data (e2e)', () => {
       const trip = await createTrip();
       const user = await loginPassenger(app);
       await prisma.user.update({ where: { phone: user.phone }, data: { walletBalance: 1000 } });
-      const { booking } = await book(trip, ['5'], user);
+      const { booking } = await book(trip, ['30'], user);
       await request(http()).post(`${API}/bookings/${booking.id}/admin-cancel`).set(admin.auth).send({ note: 'قرار إداري' }).expect(201);
       const [movement] = (await request(http()).get(`${API}/users/profile/wallet-transactions`).set(user.auth).expect(200)).body;
 

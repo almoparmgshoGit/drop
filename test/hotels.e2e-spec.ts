@@ -23,7 +23,7 @@ describe('Hotels and rooming (e2e)', () => {
     const res = await request(http())
       .post(`${API}/bookings`)
       .set(session.auth)
-      .send({ paymentMethod: 'mada', legs: [{ tripId: trip.id, seats, roomChoice: 'SHARED' }], passengers: seats.map((s) => ({ fullName: `مسافر ${s}` })) })
+      .send({ paymentMethod: 'mada', category: seats.length === 1 ? 'SINGLES' : 'FAMILY', legs: [{ tripId: trip.id, seats, roomChoice: 'SHARED' }], passengers: seats.map((s) => ({ fullName: `مسافر ${s}` })) })
       .expect(201);
     return { user: session, booking: res.body.bookings[0] };
   };
@@ -115,8 +115,8 @@ describe('Hotels and rooming (e2e)', () => {
     it('never fills a room past its capacity, even under simultaneous requests', async () => {
       const hotel = await createHotel();
       const trip = await hotelTrip();
-      const first = await book(trip, ['1']);
-      const second = await book(trip, ['2']);
+      const first = await book(trip, ['26']);
+      const second = await book(trip, ['27']);
       const { id } = await bookHotel(trip, hotel);
       const assign = (passenger: any) =>
         request(http()).post(`${API}/hotels/bookings/${id}/rooms`).set(staff.auth).send({ passengerIds: [passenger.id], roomNumber: '7', roomType: 'PRIVATE', capacity: 1 });
@@ -131,8 +131,8 @@ describe('Hotels and rooming (e2e)', () => {
       const hotel = await createHotel();
       const trip = await hotelTrip();
       const other = await hotelTrip();
-      const stranger = await book(other, ['1']);
-      const cancelled = await book(trip, ['2']);
+      const stranger = await book(other, ['26']);
+      const cancelled = await book(trip, ['27']);
       const { id } = await bookHotel(trip, hotel);
       const assign = (passengerIds: string[]) =>
         request(http()).post(`${API}/hotels/bookings/${id}/rooms`).set(staff.auth).send({ passengerIds, roomNumber: '1', roomType: 'SHARED' });
@@ -145,7 +145,7 @@ describe('Hotels and rooming (e2e)', () => {
     it('drops a room from the cost once it is empty', async () => {
       const hotel = await createHotel();
       const trip = await hotelTrip();
-      const { booking } = await book(trip, ['3']);
+      const { booking } = await book(trip, ['28']);
       const { id } = await bookHotel(trip, hotel);
       const passengerId = booking.passengers[0].id;
       await request(http()).post(`${API}/hotels/bookings/${id}/rooms`).set(staff.auth).send({ passengerIds: [passengerId], roomNumber: '1', roomType: 'SHARED' }).expect(201);
@@ -189,8 +189,8 @@ describe('Hotels and rooming (e2e)', () => {
       const hotel = await createHotel();
       const trip = await hotelTrip();
       const family = await book(trip, ['1', '2']);
-      const man = await book(trip, ['3']);
-      const woman = await book(trip, ['4']);
+      const man = await book(trip, ['28']);
+      const woman = await book(trip, ['29']);
       await prisma.bookingPassenger.update({ where: { id: family.booking.passengers[0].id }, data: { gender: 'MALE' } });
       await prisma.bookingPassenger.update({ where: { id: family.booking.passengers[1].id }, data: { gender: 'FEMALE' } });
       await prisma.bookingPassenger.update({ where: { id: man.booking.passengers[0].id }, data: { gender: 'MALE' } });
@@ -209,7 +209,7 @@ describe('Hotels and rooming (e2e)', () => {
       const hotel = await createHotel();
       const trip = await hotelTrip();
       const men = await book(trip, ['1', '2']);
-      const women = await book(trip, ['3']);
+      const women = await book(trip, ['28']);
       const ids = [...men.booking.passengers, ...women.booking.passengers].map((p: any) => p.id);
       await prisma.bookingPassenger.updateMany({ where: { id: { in: ids.slice(0, 2) } }, data: { gender: 'MALE' } });
       await prisma.bookingPassenger.update({ where: { id: ids[2] }, data: { gender: 'FEMALE' } });
@@ -252,13 +252,13 @@ describe('Hotels and rooming (e2e)', () => {
     it('rejects a passenger outside the booking and a booking on a trip without housing', async () => {
       const hotel = await createHotel();
       const trip = await hotelTrip();
-      const mine = await book(trip, ['1']);
-      const theirs = await book(trip, ['2']);
+      const mine = await book(trip, ['26']);
+      const theirs = await book(trip, ['27']);
       const send = (body: object) => request(http()).post(`${API}/hotels/assign-booking`).set(staff.auth).send({ hotelId: hotel.id, roomNumber: '1', roomType: 'SHARED', ...body });
       await send({ bookingId: mine.booking.id, passengerIds: [theirs.booking.passengers[0].id] }).expect(400);
 
       const transport = (await request(http()).post(`${API}/trips`).set(admin.auth).send(tripPayload()).expect(201)).body;
-      const plain = await book(transport, ['1']);
+      const plain = await book(transport, ['26']);
       await send({ bookingId: plain.booking.id }).expect(409);
     });
   });
@@ -267,7 +267,7 @@ describe('Hotels and rooming (e2e)', () => {
     it('releases everyone and takes the cost off, for admins only', async () => {
       const hotel = await createHotel();
       const trip = await hotelTrip();
-      const { booking } = await book(trip, ['4']);
+      const { booking } = await book(trip, ['29']);
       const { id } = await bookHotel(trip, hotel);
       await request(http()).post(`${API}/hotels/bookings/${id}/rooms`).set(staff.auth).send({ passengerIds: [booking.passengers[0].id], roomNumber: '1', roomType: 'SHARED' }).expect(201);
 
@@ -287,7 +287,7 @@ describe('Hotels and rooming (e2e)', () => {
       const booked = await hotelTrip(dates);
       const unbooked = await hotelTrip(dates);
       const a = await book(booked, ['1', '2']);
-      await book(unbooked, ['1']);
+      await book(unbooked, ['26']);
       const { id } = await bookHotel(booked, hotel, admin, { extraCost: 30 });
       await request(http()).post(`${API}/hotels/bookings/${id}/rooms`).set(staff.auth).send({ passengerIds: [a.booking.passengers[0].id], roomNumber: '1', roomType: 'SHARED' }).expect(201);
 
@@ -324,7 +324,7 @@ describe('Hotels and rooming (e2e)', () => {
       await block(hotel, { untilDate: '2030-01-11' }).expect(201);
       const place = async (stayExtra: object) => {
         const trip = await hotelTrip();
-        const { booking } = await book(trip, ['1']);
+        const { booking } = await book(trip, ['26']);
         const { id } = await bookHotel(trip, hotel, staff, stayExtra);
         return request(http()).post(`${API}/hotels/bookings/${id}/rooms`).set(staff.auth).send({ passengerIds: [booking.passengers[0].id], roomNumber: '1', roomType: 'SHARED' });
       };
@@ -344,7 +344,7 @@ describe('Hotels and rooming (e2e)', () => {
     it('refuses a room with guests, and refuses placing a guest in a blocked room', async () => {
       const hotel = await inventoryHotel();
       const trip = await hotelTrip();
-      const { booking } = await book(trip, ['3']);
+      const { booking } = await book(trip, ['28']);
       const { id } = await bookHotel(trip, hotel);
       const place = (roomNumber: string) => request(http()).post(`${API}/hotels/bookings/${id}/rooms`).set(staff.auth).send({ passengerIds: [booking.passengers[0].id], roomNumber, roomType: 'SHARED' });
 
@@ -405,9 +405,9 @@ describe('Hotels and rooming (e2e)', () => {
     it('finds everyone on the hotel\'s trips, roomed or not, and nobody else', async () => {
       const hotel = await createHotel();
       const trip = await hotelTrip();
-      const roomed = await book(trip, ['1']);
-      const unroomed = await book(trip, ['2']);
-      const stranger = await book(await hotelTrip(), ['1']);
+      const roomed = await book(trip, ['26']);
+      const unroomed = await book(trip, ['27']);
+      const stranger = await book(await hotelTrip(), ['26']);
       const { id } = await bookHotel(trip, hotel);
       await request(http()).post(`${API}/hotels/bookings/${id}/rooms`).set(staff.auth).send({ passengerIds: [roomed.booking.passengers[0].id], roomNumber: '7', roomType: 'SHARED' }).expect(201);
 
@@ -426,7 +426,7 @@ describe('Hotels and rooming (e2e)', () => {
     it('accepts a traveler who left their room and keeps the room they were in', async () => {
       const hotel = await createHotel();
       const trip = await hotelTrip();
-      const { booking } = await book(trip, ['4']);
+      const { booking } = await book(trip, ['29']);
       const { id } = await bookHotel(trip, hotel);
       const passengerId = booking.passengers[0].id;
       await request(http()).post(`${API}/hotels/bookings/${id}/rooms`).set(staff.auth).send({ passengerIds: [passengerId], roomNumber: '9', roomType: 'SHARED' }).expect(201);
@@ -436,13 +436,13 @@ describe('Hotels and rooming (e2e)', () => {
       const afterLeaving = (await record(hotel, { passengerId }).expect(201)).body;
 
       const saved = await prisma.hotelComplaint.findUniqueOrThrow({ where: { id: whileRoomed.id } });
-      expect(saved).toMatchObject({ roomNumber: '9', travelerName: 'مسافر 4', bookingId: booking.id, hotelBookingId: id });
-      expect(await prisma.hotelComplaint.findUniqueOrThrow({ where: { id: afterLeaving.id } })).toMatchObject({ roomNumber: null, travelerName: 'مسافر 4', hotelBookingId: id });
+      expect(saved).toMatchObject({ roomNumber: '9', travelerName: 'مسافر 29', bookingId: booking.id, hotelBookingId: id });
+      expect(await prisma.hotelComplaint.findUniqueOrThrow({ where: { id: afterLeaving.id } })).toMatchObject({ roomNumber: null, travelerName: 'مسافر 29', hotelBookingId: id });
     });
 
     it('refuses someone from another hotel\'s trip, and accepts a typed name', async () => {
       const hotel = await createHotel();
-      const stranger = await book(await hotelTrip(), ['5']);
+      const stranger = await book(await hotelTrip(), ['30']);
       await record(hotel, { passengerId: stranger.booking.passengers[0].id }).expect(400);
       await record(hotel, { passengerId: 'missing' }).expect(404);
 
@@ -554,7 +554,7 @@ describe('Hotels and rooming (e2e)', () => {
     it('shows their room and updates, and nothing internal', async () => {
       const hotel = await createHotel();
       const trip = await hotelTrip({ busRentalPrice: 1800 });
-      const { user, booking } = await book(trip, ['5']);
+      const { user, booking } = await book(trip, ['30']);
       const passengerId = booking.passengers[0].id;
       await request(http())
         .patch(`${API}/bookings/admin/${booking.id}/passengers/${passengerId}`)
@@ -589,7 +589,7 @@ describe('Hotels and rooming (e2e)', () => {
 
     it('withholds boarding tokens from staff but not from the owner', async () => {
       const trip = await hotelTrip();
-      const { user, booking } = await book(trip, ['6']);
+      const { user, booking } = await book(trip, ['31']);
       const asStaff = await request(http()).get(`${API}/bookings/${booking.id}`).set(staff.auth).expect(200);
       expect(asStaff.body.passengers[0].ticket.signedToken).toBeUndefined();
       const tickets = await request(http()).get(`${API}/tickets/booking/${booking.id}`).set(staff.auth).expect(200);

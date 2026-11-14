@@ -292,7 +292,7 @@ describe('Late and stopped tickets, and the booking card in support chat', () =>
         if (boardOne) {
           await setAt(ctx.crew, ctx.trip.id, ctx.points[0].id);
           const other = await loginPassenger(app);
-          const rider = (await request(http()).post(`${API}/bookings`).set(other.auth).send({ paymentMethod: 'mada', legs: [{ tripId: ctx.trip.id, seats: ['9'], boardingPointId: ctx.points[0].id }], passengers: [{ fullName: 'راكب ثالث' }] }).expect(201)).body.bookings[0];
+          const rider = (await request(http()).post(`${API}/bookings`).set(other.auth).send({ paymentMethod: 'mada', category: 'SINGLES', legs: [{ tripId: ctx.trip.id, seats: ['34'], boardingPointId: ctx.points[0].id }], passengers: [{ fullName: 'راكب ثالث' }] }).expect(201)).body.bookings[0];
           await scan(ctx.crew, ctx.trip.id, rider);
         }
         // Arrived, because a trip the crew still reports at a point or on the road stays open past its arrival time.

@@ -1,5 +1,5 @@
 import { Injectable, NotFoundException, ConflictException, BadRequestException } from '@nestjs/common';
-import { BusStatus, Prisma, VehicleKind } from '@prisma/client';
+import { BusStatus, Prisma, SoloTravelerPolicy, VehicleKind } from '@prisma/client';
 import { PrismaService } from '../../common/services/prisma.service';
 import { AppSettingsService } from '../../common/services/app-settings.service';
 import { applyBusServices } from '../../common/utils/bus-services.util';
@@ -23,6 +23,7 @@ interface BusInput {
   seatCount?: number;
   singlesFromSeat?: number;
   singlesToSeat?: number;
+  soloTravelerPolicy?: SoloTravelerPolicy;
 }
 
 /**
@@ -135,6 +136,7 @@ export class BusesService {
         seatCount,
         singlesFromSeat: singles.from,
         singlesToSeat: singles.to,
+        soloTravelerPolicy: dto.soloTravelerPolicy,
         plateNumber: dto.plateNumber,
         model: dto.model,
         color: dto.color || 'أبيض',
@@ -214,6 +216,7 @@ export class BusesService {
           status: dto.status,
           singlesFromSeat: singles.from,
           singlesToSeat: singles.to,
+          soloTravelerPolicy: dto.soloTravelerPolicy,
         },
         include: { services: SERVICES_SELECT, images: GALLERY_SELECT },
       });

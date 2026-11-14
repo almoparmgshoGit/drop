@@ -30,7 +30,7 @@ describe('Room type at booking time (e2e)', () => {
     request(http())
       .post(`${API}/bookings`)
       .set(session.auth)
-      .send({ paymentMethod: 'mada', legs: [{ tripId: trip.id, seats, roomChoice }], passengers: seats.map((s) => ({ fullName: `مسافر ${s}` })) });
+      .send({ paymentMethod: 'mada', category: seats.length === 1 ? 'SINGLES' : 'FAMILY', legs: [{ tripId: trip.id, seats, roomChoice }], passengers: seats.map((s) => ({ fullName: `مسافر ${s}` })) });
 
   beforeAll(async () => {
     ({ app, prisma } = await createTestApp());
@@ -74,7 +74,7 @@ describe('Room type at booking time (e2e)', () => {
     const trip = await tripWithHotel(await createHotel());
     const customer = await loginPassenger(app);
 
-    await book(customer, trip, ['1']).expect(400);
+    await book(customer, trip, ['26']).expect(400);
     expect(await prisma.booking.count({ where: { tripId: trip.id } })).toBe(0);
     expect(await prisma.seat.count({ where: { tripId: trip.id, isBooked: true } })).toBe(0);
 
@@ -89,8 +89,8 @@ describe('Room type at booking time (e2e)', () => {
 
     const preview = await quote(customer, trip, ['1']);
     expect(preview.legs[0].housing).toMatchObject({ options: ['PRIVATE'], choice: 'PRIVATE' });
-    await book(customer, trip, ['1'], 'SHARED').expect(400);
-    const res = await book(customer, trip, ['1']).expect(201);
+    await book(customer, trip, ['26'], 'SHARED').expect(400);
+    const res = await book(customer, trip, ['26']).expect(201);
     expect(res.body.bookings[0].roomChoice).toBe('PRIVATE');
   });
 
@@ -102,11 +102,12 @@ describe('Room type at booking time (e2e)', () => {
 
   it('never limits bookings by rooms: only seats limit them, and nobody is placed in a room automatically', async () => {
     const trip = await tripWithHotel(await createHotel());
-    for (let seat = 1; seat <= 12; seat++) {
+    // Travellers alone, so on the singles seats (26–49).
+    for (let seat = 26; seat <= 37; seat++) {
       const res = await book(await loginPassenger(app), trip, [String(seat)], 'SHARED').expect(201);
       expect(res.body.bookings[0].passengers[0].hotelRoom).toBeNull();
     }
-    await book(await loginPassenger(app), trip, ['1'], 'SHARED').expect(409);
+    await book(await loginPassenger(app), trip, ['26'], 'SHARED').expect(409);
     expect(await prisma.hotelRoom.count({ where: { hotelBooking: { tripId: trip.id } } })).toBe(0);
   });
 
@@ -155,7 +156,7 @@ describe('Room type at booking time (e2e)', () => {
 
   it('removes a room once its last guest leaves or cancels', async () => {
     const trip = await tripWithHotel(await createHotel());
-    const res = await book(await loginPassenger(app), trip, ['1'], 'SHARED').expect(201);
+    const res = await book(await loginPassenger(app), trip, ['26'], 'SHARED').expect(201);
     const { id } = await prisma.hotelBooking.findFirstOrThrow({ where: { tripId: trip.id } });
     await request(http()).post(`${API}/hotels/bookings/${id}/rooms`).set(admin.auth).send({ passengerIds: [res.body.bookings[0].passengers[0].id], roomNumber: '9', roomType: 'SHARED' }).expect(201);
     await request(http()).post(`${API}/bookings/${res.body.bookings[0].id}/admin-cancel`).set(admin.auth).send({ note: 'إلغاء للتجربة' }).expect(201);
@@ -166,7 +167,7 @@ describe('Room type at booking time (e2e)', () => {
     const trip = (await request(http()).post(`${API}/trips`).set(admin.auth).send(tripPayload({ bookingType: 'WITH_HOTEL', accommodation: { name: 'لاحقًا', nights: 1 } })).expect(201)).body;
     const customer = await loginPassenger(app);
     expect((await quote(customer, trip, ['1'])).legs[0].housing).toBeNull();
-    const res = await book(customer, trip, ['1']).expect(201);
+    const res = await book(customer, trip, ['26']).expect(201);
     expect(res.body.bookings[0].roomChoice).toBeNull();
   });
 

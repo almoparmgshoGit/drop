@@ -193,7 +193,7 @@ describe('Settings control panel (e2e)', () => {
       const appConfig = await request(http()).get(`${API}/settings/app-config`).expect(200);
       expect(appConfig.body).toMatchObject({ maintenanceMode: true, maintenanceMessage: 'صيانة قصيرة' });
       const trip = await request(http()).post(`${API}/trips`).set(admin.auth).send(tripPayload()).expect(201);
-      const hold = () => request(http()).post(`${API}/bookings/holds`).set(passenger.auth).send({ tripId: trip.body.id, seats: ['1'] });
+      const hold = () => request(http()).post(`${API}/bookings/holds`).set(passenger.auth).send({ tripId: trip.body.id, seats: ['26'], category: 'SINGLES' });
       expect((await hold()).status).toBe(503);
       await request(http()).put(`${API}/settings`).set(admin.auth).send({ maintenanceMode: false, bookingsEnabled: false }).expect(200);
       expect((await hold()).status).toBe(503);

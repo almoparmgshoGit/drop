@@ -918,30 +918,40 @@ model ItineraryStop {
   sortOrder Int    @default(0)
 }
 
+/// Where a booking of one traveller may sit on a bus.
+enum SoloTravelerPolicy {
+  /// Always in the singles section.
+  SINGLES_ONLY
+  /// A woman travelling alone may sit in the family section; a man sits with the singles.
+  WOMEN_ALLOWED
+}
+
 model Bus {
-  id              String              @id @default(uuid())
-  plateNumber     String              @unique
-  model           String
-  color           String              @default("أبيض")
-  imageUrl        String?
-  company         String              @default("دروب الهجرة للنقل")
-  kind            VehicleKind         @default(BUS)
+  id                 String              @id @default(uuid())
+  plateNumber        String              @unique
+  model              String
+  color              String              @default("أبيض")
+  imageUrl           String?
+  company            String              @default("دروب الهجرة للنقل")
+  kind               VehicleKind         @default(BUS)
   /// Fixed at the standard plan's count for a bus; entered when a van or minibus is added.
-  seatCount       Int                 @default(49)
-  officeId        String?
-  office          BusOffice?          @relation(fields: [officeId], references: [id], onDelete: Restrict)
-  /// Where singles may sit on this bus, from seat to seat. Families may sit anywhere.
-  singlesFromSeat Int                 @default(26)
-  singlesToSeat   Int                 @default(49)
-  status          BusStatus           @default(ACTIVE)
-  createdAt       DateTime            @default(now())
-  trips           Trip[]
-  services        BusService[]
+  seatCount          Int                 @default(49)
+  officeId           String?
+  office             BusOffice?          @relation(fields: [officeId], references: [id], onDelete: Restrict)
+  /// Where singles sit on this bus, from seat to seat; every other seat is the family section.
+  singlesFromSeat    Int                 @default(26)
+  singlesToSeat      Int                 @default(49)
+  /// Whether a traveller booking alone may sit in the family section: never, or only a woman.
+  soloTravelerPolicy SoloTravelerPolicy  @default(SINGLES_ONLY)
+  status             BusStatus           @default(ACTIVE)
+  createdAt          DateTime            @default(now())
+  trips              Trip[]
+  services           BusService[]
   /// Shown to customers on the trips the bus runs, in sortOrder; the first is the cover, which imageUrl copies.
-  images          BusImage[]
-  maintenanceLogs BusMaintenanceLog[]
+  images             BusImage[]
+  maintenanceLogs    BusMaintenanceLog[]
   /// A GPS tracker fixed in the bus; when it reports, it stands in for the supervisor's phone.
-  gpsDevice       BusGpsDevice?
+  gpsDevice          BusGpsDevice?
 
   @@index([officeId])
 }

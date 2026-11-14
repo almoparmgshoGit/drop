@@ -15,14 +15,16 @@ describe('Loyalty program (e2e)', () => {
   const summary = async (user: any) => (await request(http()).get(`${API}/users/profile/loyalty`).set(user.auth).expect(200)).body;
   const createTrip = async (overrides = {}) =>
     (await request(http()).post(`${API}/trips`).set(admin.auth).send(tripPayload(overrides)).expect(201)).body;
+  // A traveller alone sits with the singles (26–49); two or more book as a family outside that range.
+  const categoryOf = (seats: string[]) => (seats.length === 1 ? 'SINGLES' : 'FAMILY');
   const quote = (user: any, trip: any, seats: string[], extra = {}) =>
-    request(http()).post(`${API}/bookings/quote`).set(user.auth).send({ legs: [{ tripId: trip.id, seats }], ...extra });
+    request(http()).post(`${API}/bookings/quote`).set(user.auth).send({ category: categoryOf(seats), legs: [{ tripId: trip.id, seats }], ...extra });
   const bookRaw = (user: any, trip: any, seats: string[], extra = {}) =>
     request(http())
       .post(`${API}/bookings`)
       .set(user.auth)
-      .send({ paymentMethod: 'mada', legs: [{ tripId: trip.id, seats }], passengers: seats.map((s) => ({ fullName: `مسافر ${s}` })), ...extra });
-  const book = async (user: any, trip: any, seats = ['5'], extra = {}) => (await bookRaw(user, trip, seats, extra).expect(201)).body.bookings[0];
+      .send({ paymentMethod: 'mada', category: categoryOf(seats), legs: [{ tripId: trip.id, seats }], passengers: seats.map((s) => ({ fullName: `مسافر ${s}` })), ...extra });
+  const book = async (user: any, trip: any, seats = ['30'], extra = {}) => (await bookRaw(user, trip, seats, extra).expect(201)).body.bookings[0];
   const givePoints = (user: any, points: number) =>
     prisma.user.update({ where: { phone: user.phone }, data: { loyaltyPoints: points, loyaltyActivityAt: new Date() } });
   const balance = async (user: any) => (await prisma.user.findUniqueOrThrow({ where: { phone: user.phone } })).loyaltyPoints;
@@ -112,12 +114,12 @@ describe('Loyalty program (e2e)', () => {
       const user = await loginPassenger(app);
       await givePoints(user, 1000);
 
-      const q = await quote(user, trip, ['5'], { pointsToRedeem: 200 }).expect(201);
+      const q = await quote(user, trip, ['30'], { pointsToRedeem: 200 }).expect(201);
       expect(q.body.loyalty).toMatchObject({ pointsUsed: 200, discount: 10, balance: 1000, maxPoints: 1000 });
       expect(q.body.total).toBe(190);
       expect(await balance(user)).toBe(1000);
 
-      const booking = await book(user, trip, ['5'], { pointsToRedeem: 200 });
+      const booking = await book(user, trip, ['30'], { pointsToRedeem: 200 });
       expect(Number(booking.totalPrice)).toBe(190);
       // 200 spent once; the 190 actually paid earns points of its own at payment.
       const earned = await prisma.loyaltyTransaction.findFirstOrThrow({ where: { bookingId: booking.id, type: 'EARNED' } });
@@ -130,22 +132,22 @@ describe('Loyalty program (e2e)', () => {
       const trip = await createTrip({ price: 100 });
       const user = await loginPassenger(app);
       await givePoints(user, 5000);
-      await quote(user, trip, ['5'], { pointsToRedeem: 150 }).expect(400);
-      await quote(user, trip, ['5'], { pointsToRedeem: 50 }).expect(400);
-      await quote(user, trip, ['5'], { pointsToRedeem: 9000 }).expect(400);
+      await quote(user, trip, ['30'], { pointsToRedeem: 150 }).expect(400);
+      await quote(user, trip, ['30'], { pointsToRedeem: 50 }).expect(400);
+      await quote(user, trip, ['30'], { pointsToRedeem: 9000 }).expect(400);
       // 50% of 100 is 50 SAR, which is 1000 points at 100 points = 5 SAR.
-      await quote(user, trip, ['5'], { pointsToRedeem: 1100 }).expect(400);
-      const q = await quote(user, trip, ['5'], { pointsToRedeem: 1000 }).expect(201);
+      await quote(user, trip, ['30'], { pointsToRedeem: 1100 }).expect(400);
+      const q = await quote(user, trip, ['30'], { pointsToRedeem: 1000 }).expect(201);
       expect(q.body.total).toBe(50);
       expect(q.body.loyalty.maxPoints).toBe(1000);
-      await quote(user, trip, ['5'], { pointsToRedeem: -100 }).expect(400);
+      await quote(user, trip, ['30'], { pointsToRedeem: -100 }).expect(400);
     });
 
     it('cannot spend the same points twice under simultaneous bookings', async () => {
       const trip = await createTrip({ price: 200 });
       const user = await loginPassenger(app);
       await givePoints(user, 200);
-      const results = await Promise.all([bookRaw(user, trip, ['1'], { pointsToRedeem: 200 }), bookRaw(user, trip, ['2'], { pointsToRedeem: 200 })]);
+      const results = await Promise.all([bookRaw(user, trip, ['31'], { pointsToRedeem: 200 }), bookRaw(user, trip, ['32'], { pointsToRedeem: 200 })]);
       // A customer's bookings now run one at a time, so the second is refused when priced rather than when spending.
       expect(results.map((r) => r.status).sort()).toEqual([201, 400]);
       // The 200 points went once; what is left is only what the one paid booking earned.
@@ -162,7 +164,7 @@ describe('Loyalty program (e2e)', () => {
       const res = await request(http())
         .post(`${API}/bookings`)
         .set(user.auth)
-        .send({ paymentMethod: 'mada', pointsToRedeem: 400, legs: [{ tripId: out.id, seats: ['1'] }, { tripId: back.id, seats: ['1'] }], passengers: [{ fullName: 'مسافر' }] })
+        .send({ paymentMethod: 'mada', pointsToRedeem: 400, category: 'SINGLES', legs: [{ tripId: out.id, seats: ['31'] }, { tripId: back.id, seats: ['31'] }], passengers: [{ fullName: 'مسافر' }] })
         .expect(201);
       const stored = await prisma.booking.findMany({ where: { groupReference: res.body.groupReference } });
       expect(stored.reduce((sum, b) => sum + b.pointsRedeemed, 0)).toBe(400);
@@ -173,7 +175,7 @@ describe('Loyalty program (e2e)', () => {
       const trip = await createTrip({ price: 200 });
       const user = await loginPassenger(app);
       await givePoints(user, 200);
-      const booking = await book(user, trip, ['5'], { pointsToRedeem: 200 });
+      const booking = await book(user, trip, ['30'], { pointsToRedeem: 200 });
       const results = await Promise.all(
         Array.from({ length: 3 }, () => request(http()).post(`${API}/bookings/${booking.id}/admin-cancel`).set(admin.auth).send({ note: 'قرار إداري' })),
       );
@@ -191,7 +193,7 @@ describe('Loyalty program (e2e)', () => {
       expect(await balance(user)).toBe(0);
 
       // Points already spent elsewhere cannot be taken back: the withdrawal stops at the balance and says so.
-      const other = await book(user, trip, ['6']);
+      const other = await book(user, trip, ['31']);
       await givePoints(user, 30);
       await request(http()).post(`${API}/bookings/${other.id}/admin-cancel`).set(admin.auth).send({ note: 'قرار إداري' }).expect(201);
       expect(await balance(user)).toBe(0);
@@ -205,15 +207,15 @@ describe('Loyalty program (e2e)', () => {
       const user = await loginPassenger(app);
       await givePoints(user, 1000);
       await setProgram({ enabled: false });
-      await quote(user, trip, ['5'], { pointsToRedeem: 100 }).expect(400);
-      const q = await quote(user, trip, ['5']).expect(201);
+      await quote(user, trip, ['30'], { pointsToRedeem: 100 }).expect(400);
+      const q = await quote(user, trip, ['30']).expect(201);
       expect(q.body.loyalty.maxPoints).toBe(0);
       expect(q.body.loyalty.willEarn).toBe(0);
     });
   });
 
   describe('earning rules', () => {
-    const paidPoints = async (overrides: object, seats = ['5']) => {
+    const paidPoints = async (overrides: object, seats = ['30']) => {
       const trip = await createTrip({ price: 100, ...overrides });
       const user = await loginPassenger(app);
       const booking = await book(user, trip, seats);
@@ -225,7 +227,7 @@ describe('Loyalty program (e2e)', () => {
       const trip = await createTrip({ price: 200 });
       const user = await loginPassenger(app);
       await givePoints(user, 200);
-      const booking = await book(user, trip, ['5'], { pointsToRedeem: 200 });
+      const booking = await book(user, trip, ['30'], { pointsToRedeem: 200 });
       await completeTrip(trip, booking);
       expect(await balance(user)).toBe(190);
     });
@@ -276,7 +278,7 @@ describe('Loyalty program (e2e)', () => {
       await rule({ name: 'ضعف', type: 'MULTIPLIER', value: 2 }).expect(201);
       const trip = await createTrip({ price: 150 });
       const user = await loginPassenger(app);
-      const q = await quote(user, trip, ['5']).expect(201);
+      const q = await quote(user, trip, ['30']).expect(201);
       const booking = await book(user, trip);
       expect(await balance(user)).toBe(q.body.loyalty.willEarn);
       await completeTrip(trip, booking);

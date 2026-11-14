@@ -209,9 +209,10 @@ export class BranchBookingsService {
     });
     if (!trip) throw new NotFoundException('الرحلة غير موجودة');
     const now = new Date();
-    const singles = await this.appSettings.singlesRange(trip.busId);
+    const { range: singles, soloPolicy } = await this.appSettings.seatRules(trip.busId);
     return {
       totalSeats: trip.totalSeats,
+      soloTravelerPolicy: soloPolicy,
       layout: tripSeatLayout(trip),
       availableSeats: trip.availableSeats,
       // Where singles sit on this trip; every other seat is for families. The form greys out the other section.
@@ -611,7 +612,7 @@ export class BranchBookingsService {
           const seats = await this.assignSeats(tx, leg.trip, leg.seats, available, category);
           const autoSeats = seats.filter((_, position) => !leg.seats[position]);
           await this.assertSeatSection(leg.trip, seats, category);
-          await this.bookings.assertSeatRules(leg.trip, seats, category);
+          await this.bookings.assertSeatRules(leg.trip, seats, category, { travellers: passengers.length, gender: passengers[0]?.gender ?? null });
           const claimed = await tx.seat.updateMany({
             where: { tripId: leg.trip.id, seatNumber: { in: seats }, ...available },
             data: { isBooked: true, heldByUserId: null, heldUntil: null },

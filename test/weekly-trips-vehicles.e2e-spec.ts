@@ -256,9 +256,9 @@ describe('Vehicles and weekly trips (e2e)', () => {
       .send({ kind: 'TRANSPORT_OUTBOUND', legs: [{ leg: 'OUTBOUND', tripId: trip.id, seats: ['4'] }] })
       .expect(400);
 
-    // Cleared, it opens at once.
+    // Cleared, it opens at once. One seat is held as singles, where a traveller alone sits.
     await request(http()).put(`${API}/trips/${trip.id}`).set(admin.auth).send({ bookingOpensAt: null }).expect(200);
-    await request(http()).post(`${API}/bookings/holds`).set(customer.auth).send({ tripId: trip.id, seats: ['4'] }).expect(201);
+    await request(http()).post(`${API}/bookings/holds`).set(customer.auth).send({ tripId: trip.id, category: 'SINGLES', seats: ['30'] }).expect(201);
   });
 
   it('lists only this month onward with from=currentMonth, and every trip without it', async () => {

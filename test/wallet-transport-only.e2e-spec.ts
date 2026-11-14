@@ -32,7 +32,7 @@ describe('Wallet: transport-only credit', () => {
       await request(http())
         .post(`${API}/bookings`)
         .set(customer.auth)
-        .send({ legs: [{ tripId: trip.id, seats: ['1'] }], passengers: [{ fullName: 'عبدالله العتيبي' }], paymentMethod: 'mada', useWallet: true })
+        .send({ category: 'SINGLES', legs: [{ tripId: trip.id, seats: ['26'] }], passengers: [{ fullName: 'عبدالله العتيبي' }], paymentMethod: 'mada', useWallet: true })
         .expect(201)
     ).body.bookings[0];
 

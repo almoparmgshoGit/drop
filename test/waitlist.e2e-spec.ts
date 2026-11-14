@@ -12,11 +12,12 @@ describe('Waiting list (e2e)', () => {
   let admin: any;
 
   const createTrip = async (overrides = {}) => (await request(http()).post(`${API}/trips`).set(admin.auth).send(tripPayload(overrides)).expect(201)).body;
+  /** A traveller booking alone sits with the singles (26-49 on these trips), so a one-seat booking is a singles one. */
   const book = (user: any, tripId: string, seats: string[]) =>
     request(http())
       .post(`${API}/bookings`)
       .set(user.auth)
-      .send({ paymentMethod: 'mada', legs: [{ tripId, seats }], passengers: seats.map((_, i) => ({ fullName: `مسافر ${i + 1}` })) });
+      .send({ paymentMethod: 'mada', ...(seats.length === 1 && { category: 'SINGLES' }), legs: [{ tripId, seats }], passengers: seats.map((_, i) => ({ fullName: `مسافر ${i + 1}` })) });
   /** Every seat but the ones given is sold, as if other customers had bought them. */
   const fillExcept = async (tripId: string, keep: string[]) => {
     await prisma.seat.updateMany({ where: { tripId, seatNumber: { notIn: keep } }, data: { isBooked: true } });
@@ -46,7 +47,7 @@ describe('Waiting list (e2e)', () => {
   it('queues customers in order and offers a cancelled seat to the first who fits', async () => {
     const trip = await createTrip();
     const holder = await loginPassenger(app);
-    const booked = (await book(holder, trip.id, ['1']).expect(201)).body.bookings[0];
+    const booked = (await book(holder, trip.id, ['30']).expect(201)).body.bookings[0];
     await fillExcept(trip.id, []);
 
     const big = await loginPassenger(app);
@@ -60,16 +61,16 @@ describe('Waiting list (e2e)', () => {
     // One seat frees up: the first entry needs two, so the second, who fits, is offered it.
     await request(http()).post(`${API}/bookings/${booked.id}/admin-cancel`).set(admin.auth).send({ note: 'إلغاء للاختبار' }).expect(201);
     const offered = await prisma.waitlistEntry.findUniqueOrThrow({ where: { id: smallEntry.id } });
-    expect(offered).toMatchObject({ status: 'OFFERED', heldSeats: ['1'] });
+    expect(offered).toMatchObject({ status: 'OFFERED', heldSeats: ['30'] });
     expect(offered.expiresAt!.getTime() - offered.offeredAt!.getTime()).toBe(30 * 60_000);
     expect((await prisma.waitlistEntry.findUniqueOrThrow({ where: { id: bigEntry.id } })).status).toBe('WAITING');
-    const seat = await prisma.seat.findFirstOrThrow({ where: { tripId: trip.id, seatNumber: '1' } });
+    const seat = await prisma.seat.findFirstOrThrow({ where: { tripId: trip.id, seatNumber: '30' } });
     expect(seat.heldByUserId).toBe(small.user.id);
     expect(await prisma.notification.count({ where: { event: 'WAITLIST_OFFERED', tripId: trip.id } })).toBe(1);
 
     // Nobody else can take the held seat; the offered customer books it and leaves the queue.
-    await book(await loginPassenger(app), trip.id, ['1']).expect(409);
-    await book(small, trip.id, ['1']).expect(201);
+    await book(await loginPassenger(app), trip.id, ['30']).expect(409);
+    await book(small, trip.id, ['30']).expect(201);
     expect((await prisma.waitlistEntry.findUniqueOrThrow({ where: { id: smallEntry.id } })).status).toBe('BOOKED');
 
     const mine = await request(http()).get(`${API}/waitlist/mine`).set(big.auth).expect(200);
@@ -129,10 +130,10 @@ describe('Waiting list (e2e)', () => {
   it('honours the offer window setting and the switch', async () => {
     await request(http()).put(`${API}/settings`).set(admin.auth).send({ waitlistOfferMinutes: 45 }).expect(200);
     const trip = await createTrip();
-    await fillExcept(trip.id, ['9']);
-    // Seat 9 is held by someone else for now, so the trip is full to anyone asking.
+    await fillExcept(trip.id, ['35']);
+    // Seat 35 is held by someone else for now, so the trip is full to anyone asking.
     const holder = await loginPassenger(app);
-    await request(http()).post(`${API}/bookings/holds`).set(holder.auth).send({ tripId: trip.id, seats: ['9'] }).expect(201);
+    await request(http()).post(`${API}/bookings/holds`).set(holder.auth).send({ tripId: trip.id, category: 'SINGLES', seats: ['35'] }).expect(201);
     const customer = await loginPassenger(app);
     const entry = (await join(customer, trip.id, 1).expect(201)).body;
     await request(http()).delete(`${API}/bookings/holds`).set(holder.auth).send({ tripId: trip.id }).expect(200);

@@ -170,7 +170,7 @@ describe('Invoices, tax report and trip accounts', () => {
     it('issues one for an app booking, with VAT taken out of the inclusive price', async () => {
       const customer = await loginPassenger(app);
       await prisma.trip.update({ where: { id: tripId }, data: { price: 115 } });
-      await post('/bookings', { legs: [{ tripId, seats: ['1'] }], passengers: [{ fullName: 'يوسف شعبان' }], paymentMethod: 'mada' }, customer.auth).expect(201);
+      await post('/bookings', { category: 'SINGLES', legs: [{ tripId, seats: ['30'] }], passengers: [{ fullName: 'يوسف شعبان' }], paymentMethod: 'mada' }, customer.auth).expect(201);
       const invoice = await prisma.invoice.findFirstOrThrow({ where: { tripId } });
       expect(invoice.passengerName).toBe('يوسف شعبان');
       expect(Number(invoice.total)).toBe(115);

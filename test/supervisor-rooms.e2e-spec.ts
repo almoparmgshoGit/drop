@@ -32,7 +32,7 @@ describe('Supervisor room placement and the housing sheet (e2e)', () => {
       await request(http())
         .post(`${API}/bookings`)
         .set(customer.auth)
-        .send({ paymentMethod: 'mada', legs: [{ tripId: trip.id, seats, roomChoice }], passengers: seats.map((s) => ({ fullName: `مسافر ${s}` })) })
+        .send({ paymentMethod: 'mada', category: seats.length === 1 ? 'SINGLES' : 'FAMILY', legs: [{ tripId: trip.id, seats, roomChoice }], passengers: seats.map((s) => ({ fullName: `مسافر ${s}` })) })
         .expect(201)
     ).body.bookings[0];
     return { booking, customer };
@@ -77,9 +77,9 @@ describe('Supervisor room placement and the housing sheet (e2e)', () => {
 
   it('mixes customers who chose shared, up to the capacity the trip set', async () => {
     const { trip, session } = await scenario({ sharedRoomCapacity: 2 });
-    const first = await book(trip, ['1'], 'SHARED');
-    const second = await book(trip, ['2'], 'SHARED');
-    const third = await book(trip, ['3'], 'SHARED');
+    const first = await book(trip, ['26'], 'SHARED');
+    const second = await book(trip, ['27'], 'SHARED');
+    const third = await book(trip, ['28'], 'SHARED');
 
     await place(session, trip, first.booking.passengers[0], { roomNumber: '10' }).expect(201);
     await place(session, trip, second.booking.passengers[0], { roomNumber: '10' }).expect(201);
@@ -89,8 +89,8 @@ describe('Supervisor room placement and the housing sheet (e2e)', () => {
 
   it('applies a capacity the admin raises to shared rooms already in use', async () => {
     const { trip, session } = await scenario({ sharedRoomCapacity: 1 });
-    const first = await book(trip, ['1'], 'SHARED');
-    const second = await book(trip, ['2'], 'SHARED');
+    const first = await book(trip, ['26'], 'SHARED');
+    const second = await book(trip, ['27'], 'SHARED');
     await place(session, trip, first.booking.passengers[0], { roomNumber: '11' }).expect(201);
     await place(session, trip, second.booking.passengers[0], { roomNumber: '11' }).expect(409);
 
@@ -101,7 +101,7 @@ describe('Supervisor room placement and the housing sheet (e2e)', () => {
   it('keeps a private room to one booking, whichever way the supervisor splits it', async () => {
     const { trip, session } = await scenario({ privateRoomCapacity: 2, privateRoomPrice: 50 });
     const family = await book(trip, ['1', '2', '3'], 'PRIVATE');
-    const other = await book(trip, ['4'], 'PRIVATE');
+    const other = await book(trip, ['29'], 'PRIVATE');
 
     const all = await place(session, trip, family.booking.passengers[0], { roomNumber: '20', wholeBooking: true }).expect(201);
     expect(all.body.passengers).toBe(3);
@@ -115,7 +115,7 @@ describe('Supervisor room placement and the housing sheet (e2e)', () => {
   it('never mixes the two room types, and whole-booking is for private rooms only', async () => {
     const { trip, session } = await scenario();
     const shared = await book(trip, ['1', '2'], 'SHARED');
-    const privately = await book(trip, ['3'], 'PRIVATE');
+    const privately = await book(trip, ['28'], 'PRIVATE');
 
     await place(session, trip, shared.booking.passengers[0], { roomNumber: '30', wholeBooking: true }).expect(400);
     await place(session, trip, shared.booking.passengers[0], { roomNumber: '30' }).expect(201);
@@ -124,7 +124,7 @@ describe('Supervisor room placement and the housing sheet (e2e)', () => {
 
   it('refuses a passenger already in that room, so the customer is not told twice', async () => {
     const { trip, session } = await scenario();
-    const { booking } = await book(trip, ['1'], 'SHARED');
+    const { booking } = await book(trip, ['26'], 'SHARED');
     await place(session, trip, booking.passengers[0], { roomNumber: '40' }).expect(201);
     await place(session, trip, booking.passengers[0], { roomNumber: '40' }).expect(409);
     await place(session, trip, booking.passengers[0], { roomNumber: '41' }).expect(201);
@@ -133,7 +133,7 @@ describe('Supervisor room placement and the housing sheet (e2e)', () => {
 
   it('is for the supervisor of this trip only, and only once it is open to them', async () => {
     const { trip, staff, session } = await scenario();
-    const { booking } = await book(trip, ['1'], 'SHARED');
+    const { booking } = await book(trip, ['26'], 'SHARED');
 
     const outsider = await loginStaff(app, (await createStaff(prisma, 'STAFF', undefined, 'rank-supervisor')).phone);
     await place(outsider, trip, booking.passengers[0], { roomNumber: '50' }).expect(403);
@@ -150,10 +150,10 @@ describe('Supervisor room placement and the housing sheet (e2e)', () => {
   it('refuses a passenger of another trip, and a finished trip', async () => {
     const { trip, session } = await scenario();
     const elsewhere = await scenario();
-    const { booking } = await book(elsewhere.trip, ['1'], 'SHARED');
+    const { booking } = await book(elsewhere.trip, ['26'], 'SHARED');
     await place(session, trip, booking.passengers[0], { roomNumber: '60' }).expect(404);
 
-    const own = await book(trip, ['1'], 'SHARED');
+    const own = await book(trip, ['26'], 'SHARED');
     await prisma.trip.update({ where: { id: trip.id }, data: { tripStatus: 'COMPLETED' } });
     await place(session, trip, own.booking.passengers[0], { roomNumber: '60' }).expect(409);
   });
@@ -173,7 +173,7 @@ describe('Supervisor room placement and the housing sheet (e2e)', () => {
     const { trip } = await scenario({ sharedRoomCapacity: 4, privateRoomCapacity: 2, privateRoomPrice: 50 });
     await book(trip, ['1', '2', '3', '4', '5'], 'SHARED');
     await book(trip, ['6', '7', '8'], 'PRIVATE');
-    await book(trip, ['9'], 'PRIVATE');
+    await book(trip, ['34'], 'PRIVATE');
 
     const { housing, passengers } = (await request(http()).get(`${API}/manifests/${trip.id}`).set(admin.auth).expect(200)).body;
     expect(housing).toMatchObject({
@@ -194,7 +194,7 @@ describe('Supervisor room placement and the housing sheet (e2e)', () => {
 
   it('saves what goes to the hotel on the trip, keeps out what it should not, and hides it from customers', async () => {
     const { trip } = await scenario();
-    const { booking } = await book(trip, ['1'], 'SHARED');
+    const { booking } = await book(trip, ['26'], 'SHARED');
     const url = `${API}/manifests/${trip.id}/housing-sheet`;
 
     await request(http()).put(url).set(admin.auth).send({ columns: ['nope'] }).expect(400);

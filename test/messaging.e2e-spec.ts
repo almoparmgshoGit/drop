@@ -21,12 +21,13 @@ describe('Messaging (e2e)', () => {
 
   const createTrip = async (overrides: Record<string, unknown> = {}) => (await request(http()).post(`${API}/trips`).set(admin.auth).send(tripPayload(overrides)).expect(201)).body;
 
-  const book = async (trip: any, passenger: any, seat = '1', extra: Record<string, unknown> = {}) =>
+  /** One traveller alone, so a singles booking in the singles seats (26-49 on these trips). */
+  const book = async (trip: any, passenger: any, seat = '30', extra: Record<string, unknown> = {}) =>
     (
       await request(http())
         .post(`${API}/bookings`)
         .set(passenger.auth)
-        .send({ paymentMethod: 'mada', legs: [{ tripId: trip.id, seats: [seat] }], passengers: [{ fullName: 'سارة أحمد' }], ...extra })
+        .send({ paymentMethod: 'mada', category: 'SINGLES', legs: [{ tripId: trip.id, seats: [seat] }], passengers: [{ fullName: 'سارة أحمد' }], ...extra })
         .expect(201)
     ).body.bookings[0];
 
@@ -243,11 +244,11 @@ describe('Messaging (e2e)', () => {
       const old = await loginPassenger(app);
       const recent = await loginPassenger(app);
       const oldWithNext = await loginPassenger(app);
-      await travelled(old, 120, '1');
-      await travelled(recent, 10, '2');
-      await travelled(oldWithNext, 150, '3');
+      await travelled(old, 120, '30');
+      await travelled(recent, 10, '31');
+      await travelled(oldWithNext, 150, '32');
       const next = await createTrip({ destination: `${place} قادمة` });
-      await prisma.booking.update({ where: { id: (await book(next, oldWithNext, '4')).id }, data: { status: 'CONFIRMED' } });
+      await prisma.booking.update({ where: { id: (await book(next, oldWithNext, '33')).id }, data: { status: 'CONFIRMED' } });
       await prisma.user.update({ where: { id: old.user.id }, data: { gender: 'FEMALE', nationality: 'مصري' } });
       await prisma.user.update({ where: { id: oldWithNext.user.id }, data: { gender: 'MALE', nationality: 'يمني' } });
 
@@ -310,8 +311,8 @@ describe('Messaging (e2e)', () => {
       const arabic = await loginPassenger(app);
       const english = await loginPassenger(app);
       await prisma.user.update({ where: { id: english.user.id }, data: { messageLanguage: 'en' } });
-      await book(trip, arabic, '1');
-      await book(trip, english, '2');
+      await book(trip, arabic, '30');
+      await book(trip, english, '31');
       const content = { ar: { title: 'عرض', body: 'نص العرض' }, en: { title: 'Offer', body: 'Offer text' }, ur: { title: 'آفر', body: 'آفر کا متن' } };
       const filters = { tripIds: [trip.id] };
 
@@ -366,8 +367,8 @@ describe('Messaging (e2e)', () => {
     it('holds staff to the cap unless their rank may go beyond it', async () => {
       await request(http()).put(`${API}/settings`).set(admin.auth).send({ campaignMaxRecipients: 1 }).expect(200);
       const trip = await createTrip();
-      await book(trip, await loginPassenger(app), '1');
-      await book(trip, await loginPassenger(app), '2');
+      await book(trip, await loginPassenger(app), '30');
+      await book(trip, await loginPassenger(app), '31');
       const limited = await employee(['notifications.campaigns']);
       const campaign = await draft(limited.session, { filters: { tripIds: [trip.id] } });
       await request(http()).post(`${url}/${campaign.id}/send`).set(limited.session.auth).send({ confirmCount: 2 }).expect(403);
@@ -417,7 +418,7 @@ describe('Messaging (e2e)', () => {
       const supervisor = await createStaff(prisma, 'STAFF', undefined, 'rank-supervisor');
       const trip = await createTrip({ supervisorIds: [supervisor.id], boardingPoints: POINTS });
       const passenger = await loginPassenger(app);
-      await book(trip, passenger, '1', { boardingPointId: undefined });
+      await book(trip, passenger, '30', { boardingPointId: undefined });
       const point = await prisma.boardingPoint.findFirstOrThrow({ where: { tripId: trip.id, name: 'حي الشرم' } });
       await prisma.booking.updateMany({ where: { tripId: trip.id }, data: { boardingPointId: point.id, boardingPointName: point.name } });
       await openBoarding(prisma, trip.id);

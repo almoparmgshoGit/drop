@@ -54,7 +54,7 @@ describe('Fixed bus plan (e2e)', () => {
     const trip = await createTrip();
     const user = await loginPassenger(app);
     await request(http()).post(`${API}/bookings`).set(user.auth)
-      .send({ paymentMethod: 'mada', legs: [{ tripId: trip.id, seats: ['50'] }], passengers: [{ fullName: 'راكب' }] })
+      .send({ paymentMethod: 'mada', legs: [{ tripId: trip.id, seats: ['1', '50'] }], passengers: [{ fullName: 'راكب' }, { fullName: 'مرافق' }] })
       .expect(409);
   });
 
@@ -62,14 +62,14 @@ describe('Fixed bus plan (e2e)', () => {
     const trip = await createTrip();
     const user = await loginPassenger(app);
     const booked = await request(http()).post(`${API}/bookings`).set(user.auth)
-      .send({ paymentMethod: 'mada', legs: [{ tripId: trip.id, seats: ['21'] }], passengers: [{ fullName: 'راكب' }] })
+      .send({ paymentMethod: 'mada', category: 'SINGLES', legs: [{ tripId: trip.id, seats: ['30'] }], passengers: [{ fullName: 'راكب' }] })
       .expect(201);
 
     const plan = JSON.parse(JSON.stringify(BUS_SEAT_LAYOUT));
     const app_ = (await request(http()).get(`${API}/bookings/seat-map/${trip.id}`).set(user.auth).expect(200)).body;
     expect(app_.layout).toEqual(plan);
     expect(app_).toMatchObject({ singlesFromSeat: 26, singlesToSeat: 49 });
-    expect(app_.seats.find((seat: any) => seat.seatNumber === '21').status).toBe('booked');
+    expect(app_.seats.find((seat: any) => seat.seatNumber === '30').status).toBe('booked');
     expect((await request(http()).get(`${API}/branch-bookings/trips/${trip.id}/seats`).set(admin.auth).expect(200)).body.layout).toEqual(plan);
     expect((await request(http()).get(`${API}/bookings/admin/${booked.body.bookings[0].id}/seat-map`).set(admin.auth).expect(200)).body.layout).toEqual(plan);
     expect((await request(http()).get(`${API}/manifests/${trip.id}`).set(admin.auth).expect(200)).body.layout).toEqual(plan);
@@ -87,7 +87,7 @@ describe('Fixed bus plan (e2e)', () => {
     const user = await loginPassenger(app);
     const seats = Array.from({ length: 5 }, (_, idx) => String(idx + 26));
     await request(http()).post(`${API}/bookings`).set(user.auth)
-      .send({ paymentMethod: 'mada', legs: [{ tripId: trip.id, seats }], passengers: seats.map((seat) => ({ fullName: `راكب ${seat}` })) })
+      .send({ paymentMethod: 'mada', category: 'SINGLES', legs: [{ tripId: trip.id, seats }], passengers: seats.map((seat) => ({ fullName: `راكب ${seat}` })) })
       .expect(201);
     const reverse = (await request(http()).post(`${API}/trips/${trip.id}/open-reverse`).set(admin.auth).send({ boardingPointName: 'مكة' }).expect(201)).body;
 

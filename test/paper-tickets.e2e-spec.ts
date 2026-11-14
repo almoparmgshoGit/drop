@@ -11,22 +11,26 @@ describe('Printed branch tickets and branch performance', () => {
   let branchId: string;
   let trip: { id: string };
   let seat = 0;
+  // A ticket of one traveller sits with the singles (26-49 with no bus), so those take their own seats.
+  let singleSeat = 25;
   const http = () => request(app.getHttpServer());
 
   /** A ticket for several travellers, as the counter form sends it. */
   const counterBooking = async (travellers: number, names: string[] = []) => {
-    const seats = Array.from({ length: travellers }, () => String(++seat));
+    const singles = travellers === 1;
+    const seats = Array.from({ length: travellers }, () => String(singles ? ++singleSeat : ++seat));
     const res = await http()
       .post(`${API}/branch-bookings`)
       .set(admin.auth)
       .send({
         branchId,
         kind: 'TRANSPORT_OUTBOUND',
+        ...(singles ? { category: 'SINGLES' } : {}),
         legs: [{ leg: 'OUTBOUND', tripId: trip.id, seats }],
         customer: { name: 'صاحب الحجز', phone: nextPhone().replace('+966', '0'), nationality: 'مصري', city: 'جدة', gender: 'MALE', birthDate: '1990-01-01', idType: 'PASSPORT', idNumber: 'A1234567' },
         passengers: seats.map((_, index) => ({ fullName: names[index] ?? `مسافر ${index + 1}` })),
         payments: [],
-        idempotencyKey: `paper-${seat}-${Math.random()}`,
+        idempotencyKey: `paper-${seats[0]}-${Math.random()}`,
       })
       .expect(201);
     return res.body.legs[0] as { id: string; reference: string };
@@ -91,7 +95,7 @@ describe('Printed branch tickets and branch performance', () => {
     const created = await http()
       .post(`${API}/bookings`)
       .set(passenger.auth)
-      .send({ paymentMethod: 'mada', legs: [{ tripId: trip.id, seats: [String(++seat)] }], passengers: [{ fullName: 'مسافر التطبيق' }] })
+      .send({ paymentMethod: 'mada', category: 'SINGLES', legs: [{ tripId: trip.id, seats: [String(++singleSeat)] }], passengers: [{ fullName: 'مسافر التطبيق' }] })
       .expect(201);
     const booking = created.body.bookings[0];
     expect((await printable(booking.id)).boardingCode).toBeNull();

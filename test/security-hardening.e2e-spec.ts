@@ -17,9 +17,10 @@ describe('Security hardening (e2e)', () => {
     return { user, ...(await loginStaff(app, user.phone)) };
   };
   const createTrip = async (overrides = {}) => (await request(http()).post(`${API}/trips`).set(admin.auth).send(tripPayload(overrides)).expect(201)).body;
-  const bookReq = (user: any, tripId: string, seats = ['5'], extra = {}) =>
-    request(http()).post(`${API}/bookings`).set(user.auth).send({ paymentMethod: 'mada', legs: [{ tripId, seats }], passengers: seats.map((seat) => ({ fullName: `مسافر ${seat}` })), ...extra });
-  const book = async (user: any, tripId: string, seats = ['5']) => (await bookReq(user, tripId, seats).expect(201)).body.bookings[0];
+  /** A traveller booking alone sits with the singles (26-49 on these trips), so a one-seat booking is a singles one. */
+  const bookReq = (user: any, tripId: string, seats = ['30'], extra = {}) =>
+    request(http()).post(`${API}/bookings`).set(user.auth).send({ paymentMethod: 'mada', ...(seats.length === 1 && { category: 'SINGLES' }), legs: [{ tripId, seats }], passengers: seats.map((seat) => ({ fullName: `مسافر ${seat}` })), ...extra });
+  const book = async (user: any, tripId: string, seats = ['30']) => (await bookReq(user, tripId, seats).expect(201)).body.bookings[0];
   const saveRules = (cancellationRules: object[]) => request(http()).put(`${API}/settings`).set(admin.auth).send({ cancellationRules }).expect(200);
 
   beforeAll(async () => {
@@ -128,12 +129,12 @@ describe('Security hardening (e2e)', () => {
       const customer = await loginPassenger(app);
       const staff = await rankedStaff(['bookings.cancel']);
 
-      const first = await book(customer, trip.id, ['5']);
+      const first = await book(customer, trip.id, ['30']);
       await request(http()).post(`${API}/bookings/${first.id}/admin-cancel`).set(staff.auth).send({ note: 'قرار', refundAmount: 180 }).expect(403);
       await request(http()).post(`${API}/bookings/${first.id}/admin-cancel`).set(staff.auth).send({ note: 'قرار' }).expect(201);
       expect(Number((await prisma.user.findUniqueOrThrow({ where: { id: customer.user.id } })).walletBalance)).toBe(90);
 
-      const second = await book(customer, trip.id, ['6']);
+      const second = await book(customer, trip.id, ['31']);
       const senior = await rankedStaff(['bookings.cancel', 'refunds.override_policy']);
       await request(http()).post(`${API}/bookings/${second.id}/admin-cancel`).set(senior.auth).send({ note: 'قرار', refundAmount: 180 }).expect(201);
     });
@@ -211,7 +212,7 @@ describe('Security hardening (e2e)', () => {
       await prisma.coupon.create({ data: { code: 'ONCE', type: 'FIXED_PER_SEAT', value: 10, isActive: true, perUserLimit: 1 } as any });
       const trip = await createTrip();
       const customer = await loginPassenger(app);
-      const results = await Promise.all(['5', '6', '7'].map((seat) => bookReq(customer, trip.id, [seat], { couponCode: 'ONCE' })));
+      const results = await Promise.all(['30', '31', '32'].map((seat) => bookReq(customer, trip.id, [seat], { couponCode: 'ONCE' })));
       expect(results.filter((res) => res.status === 201)).toHaveLength(1);
     });
 
@@ -238,25 +239,25 @@ describe('Security hardening (e2e)', () => {
         arrivalTime: new Date(departure + 3_600_000).toISOString(),
       });
       const customer = await loginPassenger(app);
-      await book(customer, trip.id, ['1']);
+      await book(customer, trip.id, ['26']);
       // Publishing opened the way back; the seat sold since is closed on it by the link.
       const reverse = await prisma.trip.findFirstOrThrow({ where: { reverseOfTripId: trip.id } });
       expect(reverse.availableSeats).toBe(48);
 
-      const outbound = await book(customer, trip.id, ['2']);
+      const outbound = await book(customer, trip.id, ['27']);
       expect((await prisma.trip.findUniqueOrThrow({ where: { id: reverse.id } })).availableSeats).toBe(47);
-      await bookReq(customer, reverse.id, ['2']).expect(409);
+      await bookReq(customer, reverse.id, ['27']).expect(409);
 
-      const onReverse = await book(customer, reverse.id, ['3']);
-      await bookReq(customer, trip.id, ['3']).expect(409);
+      const onReverse = await book(customer, reverse.id, ['28']);
+      await bookReq(customer, trip.id, ['28']).expect(409);
       expect((await prisma.trip.findUniqueOrThrow({ where: { id: trip.id } })).availableSeats).toBe(46);
 
       await request(http()).post(`${API}/bookings/${outbound.id}/admin-cancel`).set(admin.auth).send({ note: 'قرار' }).expect(201);
       expect((await prisma.trip.findUniqueOrThrow({ where: { id: reverse.id } })).availableSeats).toBe(47);
-      await book(customer, reverse.id, ['2']);
+      await book(customer, reverse.id, ['27']);
 
       await request(http()).post(`${API}/bookings/${onReverse.id}/admin-cancel`).set(admin.auth).send({ note: 'قرار' }).expect(201);
-      expect(await prisma.seat.findFirstOrThrow({ where: { tripId: trip.id, seatNumber: '3' } })).toMatchObject({ isBooked: false });
+      expect(await prisma.seat.findFirstOrThrow({ where: { tripId: trip.id, seatNumber: '28' } })).toMatchObject({ isBooked: false });
     });
 
     it('splits the wallet so no leg of a round trip is charged below zero', async () => {
@@ -266,7 +267,7 @@ describe('Security hardening (e2e)', () => {
       const res = await request(http())
         .post(`${API}/bookings`)
         .set(customer.auth)
-        .send({ useWallet: true, legs: [{ tripId: outbound.id, seats: ['5'] }, { tripId: back.id, seats: ['5'] }], passengers: [{ fullName: 'مسافر واحد' }] })
+        .send({ useWallet: true, category: 'SINGLES', legs: [{ tripId: outbound.id, seats: ['30'] }, { tripId: back.id, seats: ['30'] }], passengers: [{ fullName: 'مسافر واحد' }] })
         .expect(201);
       for (const booking of res.body.bookings) expect(Number(booking.payment.amount)).toBe(0);
     });

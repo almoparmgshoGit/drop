@@ -181,7 +181,7 @@ describe('Realtime delivery', () => {
     const setup = async () => {
       const trip = (await request(http()).post(`${API}/trips`).set(admin.auth).send(tripPayload()).expect(201)).body;
       const passenger = await loginPassenger(app);
-      const booking = (await request(http()).post(`${API}/bookings`).set(passenger.auth).send({ paymentMethod: 'mada', legs: [{ tripId: trip.id, seats: ['1'] }], passengers: [{ fullName: 'راكب' }] }).expect(201)).body.bookings[0];
+      const booking = (await request(http()).post(`${API}/bookings`).set(passenger.auth).send({ paymentMethod: 'mada', category: 'SINGLES', legs: [{ tripId: trip.id, seats: ['26'] }], passengers: [{ fullName: 'راكب' }] }).expect(201)).body.bookings[0];
       const staff = await createStaff(prisma, 'STAFF', undefined, 'rank-supervisor');
       await prisma.tripSupervisor.create({ data: { tripId: trip.id, userId: staff.id, isPrimary: true } });
       await openBoarding(prisma, trip.id);

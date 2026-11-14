@@ -181,20 +181,21 @@ describe('Housing prices chosen by the admin', () => {
 
     it('still asks for a room type or no housing before booking', async () => {
       const trip = await createTrip(await createHotel(), ADDED);
-      await send('', { legs: [{ tripId: trip.id, seats: ['1'] }], passengers: people(1) }).expect(400);
+      await send('', { category: 'SINGLES', legs: [{ tripId: trip.id, seats: ['31'] }], passengers: people(1) }).expect(400);
       await send('/quote', { legs: [{ tripId: trip.id, seats: ['1'], roomChoice: 'SHARED', withoutHousing: true }] }).expect(400);
     });
 
     it('leaves out only the trip whose hotel the customer skipped on a round trip', async () => {
       const outbound = await createTrip(await createHotel(), ADDED);
       const inbound = await createTrip(await createHotel(), { ...ADDED, origin: 'مكة المكرمة', destination: 'ينبع' });
+      // A traveller alone sits with the singles.
       const legs = [
-        { tripId: outbound.id, seats: ['1'], roomChoice: 'SHARED' },
-        { tripId: inbound.id, seats: ['1'], withoutHousing: true },
+        { tripId: outbound.id, seats: ['31'], roomChoice: 'SHARED' },
+        { tripId: inbound.id, seats: ['31'], withoutHousing: true },
       ];
-      const priced = (await send('/quote', { legs }).expect(201)).body;
+      const priced = (await send('/quote', { category: 'SINGLES', legs }).expect(201)).body;
       expect(priced.legs.map((leg: any) => leg.housingAmount)).toEqual([100, 0]);
-      const created = await send('', { legs, passengers: people(1) }).expect(201);
+      const created = await send('', { category: 'SINGLES', legs, passengers: people(1) }).expect(201);
       const rows = await prisma.booking.findMany({ where: { groupReference: created.body.groupReference }, orderBy: { tripId: 'asc' } });
       const byTrip = Object.fromEntries(rows.map((row) => [row.tripId, row]));
       expect(byTrip[outbound.id]).toMatchObject({ kind: null, roomChoice: 'SHARED' });

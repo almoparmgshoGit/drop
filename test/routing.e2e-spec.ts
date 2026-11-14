@@ -34,7 +34,7 @@ describe('Routing platforms chosen from the panel (e2e)', () => {
       const who = await loginPassenger(app);
       // A trip that has left no longer sells seats, so its clock goes back only for the booking.
       await prisma.trip.update({ where: { id: trip.id }, data: { departureTime: new Date(Date.now() + 600_000) } });
-      const booking = (await request(http()).post(`${API}/bookings`).set(who.auth).send({ paymentMethod: 'mada', legs: [{ tripId: trip.id, seats: [seat], boardingPointId: point.id }], passengers: [{ fullName: `راكب ${seat}` }] }).expect(201)).body.bookings[0];
+      const booking = (await request(http()).post(`${API}/bookings`).set(who.auth).send({ paymentMethod: 'mada', category: 'SINGLES', legs: [{ tripId: trip.id, seats: [seat], boardingPointId: point.id }], passengers: [{ fullName: `راكب ${seat}` }] }).expect(201)).body.bookings[0];
       await prisma.trip.update({ where: { id: trip.id }, data: { departureTime: new Date(Date.now() - 600_000) } });
       return { who, booking };
     };
@@ -131,7 +131,7 @@ describe('Routing platforms chosen from the panel (e2e)', () => {
   describe('what the passenger sees', () => {
     it('makes no outside request and gives no estimate while no platform is chosen', async () => {
       const { passengerOn } = await liveTrip();
-      const { who, booking } = await passengerOn('1');
+      const { who, booking } = await passengerOn('26');
       const seen = await track(who, booking.id);
       expect(seen.etaToMyPoint).toBeNull();
       expect(seen.distanceToMyPointKm).toBeGreaterThan(85);
@@ -141,7 +141,7 @@ describe('Routing platforms chosen from the panel (e2e)', () => {
     it('gives an estimate from the bus to the point, and never sends the key to the phone', async () => {
       await save({ routingProvider: 'mapbox', mapboxAccessToken: MAPBOX_TOKEN }).expect(200);
       const { passengerOn } = await liveTrip();
-      const { who, booking } = await passengerOn('1');
+      const { who, booking } = await passengerOn('26');
       const before = Date.now();
       const seen = await track(who, booking.id);
       expect(seen.etaToMyPoint).toMatchObject({ minutes: 60, km: 90, trafficAware: true });
@@ -155,8 +155,8 @@ describe('Routing platforms chosen from the panel (e2e)', () => {
     it('pays once however many phones are polling the same point', async () => {
       await save({ routingProvider: 'mapbox', mapboxAccessToken: MAPBOX_TOKEN }).expect(200);
       const { passengerOn } = await liveTrip();
-      const first = await passengerOn('1');
-      const second = await passengerOn('2');
+      const first = await passengerOn('26');
+      const second = await passengerOn('27');
       await Promise.all([track(first.who, first.booking.id), track(second.who, second.booking.id), track(first.who, first.booking.id)]);
       await track(second.who, second.booking.id);
       expect(fetchMock).toHaveBeenCalledTimes(1);
@@ -165,7 +165,7 @@ describe('Routing platforms chosen from the panel (e2e)', () => {
     it('switches platform at once when the admin changes it', async () => {
       await save({ routingProvider: 'mapbox', mapboxAccessToken: MAPBOX_TOKEN }).expect(200);
       const { passengerOn } = await liveTrip();
-      const { who, booking } = await passengerOn('1');
+      const { who, booking } = await passengerOn('26');
       expect((await track(who, booking.id)).etaToMyPoint.minutes).toBe(60);
 
       fetchMock.mockImplementation(async () => googleOk());
@@ -180,7 +180,7 @@ describe('Routing platforms chosen from the panel (e2e)', () => {
       await save({ routingProvider: 'mapbox', mapboxAccessToken: MAPBOX_TOKEN }).expect(200);
       fetchMock.mockImplementation(async () => reply({ message: 'Not Authorized' }, 401));
       const { passengerOn } = await liveTrip();
-      const { who, booking } = await passengerOn('1');
+      const { who, booking } = await passengerOn('26');
       const failed = await track(who, booking.id);
       expect(failed.etaToMyPoint).toBeNull();
       expect(failed.distanceToMyPointKm).toBeGreaterThan(85);
@@ -195,17 +195,17 @@ describe('Routing platforms chosen from the panel (e2e)', () => {
     it('spends nothing when the position is old, the bus has reached the point, or the point has no coordinates', async () => {
       await save({ routingProvider: 'mapbox', mapboxAccessToken: MAPBOX_TOKEN }).expect(200);
       const stale = await liveTrip();
-      const waitingOnStale = await stale.passengerOn('1');
+      const waitingOnStale = await stale.passengerOn('26');
       await prisma.tripLocation.update({ where: { tripId: stale.trip.id }, data: { recordedAt: new Date(Date.now() - 600_000) } });
       expect((await track(waitingOnStale.who, waitingOnStale.booking.id)).etaToMyPoint).toBeNull();
 
       const here = await liveTrip();
-      const waitingHere = await here.passengerOn('1');
+      const waitingHere = await here.passengerOn('26');
       await prisma.trip.update({ where: { id: here.trip.id }, data: { currentBoardingPointId: here.point.id } });
       expect((await track(waitingHere.who, waitingHere.booking.id)).etaToMyPoint).toBeNull();
 
       const unmapped = await liveTrip();
-      const waitingUnmapped = await unmapped.passengerOn('1');
+      const waitingUnmapped = await unmapped.passengerOn('26');
       await prisma.boardingPoint.update({ where: { id: unmapped.point.id }, data: { lat: null, lng: null } });
       expect((await track(waitingUnmapped.who, waitingUnmapped.booking.id)).etaToMyPoint).toBeNull();
 

@@ -21,11 +21,12 @@ describe('Flexible pricing (e2e)', () => {
     await prisma.trip.update({ where: { id: tripId }, data: { availableSeats: { decrement: count } } });
   };
   const quote = (user: any, tripId: string, seats: string[]) => request(http()).post(`${API}/bookings/quote`).set(user.auth).send({ legs: [{ tripId, seats }] });
+  /** A traveller booking alone sits with the singles (26-49 on these trips), so a one-seat booking is a singles one. */
   const book = (user: any, tripId: string, seats: string[]) =>
     request(http())
       .post(`${API}/bookings`)
       .set(user.auth)
-      .send({ paymentMethod: 'mada', legs: [{ tripId, seats }], passengers: seats.map((_, i) => ({ fullName: `مسافر ${i + 1}` })) });
+      .send({ paymentMethod: 'mada', ...(seats.length === 1 && { category: 'SINGLES' }), legs: [{ tripId, seats }], passengers: seats.map((_, i) => ({ fullName: `مسافر ${i + 1}` })) });
 
   // Neutral on every day of the week, so the result does not depend on the day the test runs.
   const rules = (extra = {}) => ({ enabled: true, occupancyTiers: [{ fromPercent: 50, adjustPercent: 20 }], earlyBird: { minDays: 2, adjustPercent: -10 }, ...extra });
@@ -47,8 +48,8 @@ describe('Flexible pricing (e2e)', () => {
     const page = await request(http()).get(`${API}/trips/${trip.id}`).expect(200);
     expect(page.body).toMatchObject({ pricePerSeat: 180, basePricePerSeat: 180 });
     expect(page.body).not.toHaveProperty('pricingRules');
-    expect((await quote(user, trip.id, ['1']).expect(201)).body.legs[0]).toMatchObject({ pricePerSeat: 180, basePricePerSeat: 180 });
-    const booking = (await book(user, trip.id, ['1']).expect(201)).body.bookings[0];
+    expect((await quote(user, trip.id, ['30']).expect(201)).body.legs[0]).toMatchObject({ pricePerSeat: 180, basePricePerSeat: 180 });
+    const booking = (await book(user, trip.id, ['30']).expect(201)).body.bookings[0];
     expect(Number(booking.subtotal)).toBe(180);
     expect(Number(booking.seatPrice)).toBe(180);
   });

@@ -146,6 +146,22 @@ describe('Buses, drivers and office statements (e2e)', () => {
       await request(http()).put(`${API}/buses/${bus.id}`).set(admin.auth).send({ officeId: null }).expect(409);
     });
 
+    it('saves who may book alone in the family section, keeping solos with the singles by default', async () => {
+      const standard = await createBus();
+      expect(standard.soloTravelerPolicy).toBe('SINGLES_ONLY');
+
+      const women = await createBus(null, { soloTravelerPolicy: 'WOMEN_ALLOWED' });
+      expect(women.soloTravelerPolicy).toBe('WOMEN_ALLOWED');
+      expect((await prisma.bus.findUniqueOrThrow({ where: { id: women.id } })).soloTravelerPolicy).toBe('WOMEN_ALLOWED');
+
+      const updated = await request(http()).put(`${API}/buses/${standard.id}`).set(admin.auth).send({ soloTravelerPolicy: 'WOMEN_ALLOWED' }).expect(200);
+      expect(updated.body.soloTravelerPolicy).toBe('WOMEN_ALLOWED');
+      // Saving other fields leaves it as it was.
+      await request(http()).put(`${API}/buses/${standard.id}`).set(admin.auth).send({ color: 'أبيض' }).expect(200);
+      expect((await prisma.bus.findUniqueOrThrow({ where: { id: standard.id } })).soloTravelerPolicy).toBe('WOMEN_ALLOWED');
+      await request(http()).put(`${API}/buses/${standard.id}`).set(admin.auth).send({ soloTravelerPolicy: 'ANYONE' }).expect(400);
+    });
+
     it('refuses linking a bus to a stopped office', async () => {
       const office = await createOffice();
       await request(http()).patch(`${API}/bus-offices/${office.id}`).set(admin.auth).send({ isActive: false }).expect(200);

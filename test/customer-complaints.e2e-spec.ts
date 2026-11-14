@@ -17,7 +17,7 @@ describe('Customer photos, complaints and roommates (e2e)', () => {
     const res = await request(http())
       .post(`${API}/bookings`)
       .set(session.auth)
-      .send({ paymentMethod: 'mada', legs: [{ tripId: trip.id, seats, ...(roomChoice && { roomChoice }) }], passengers: seats.map((s) => ({ fullName: `مسافر ${s}` })) })
+      .send({ paymentMethod: 'mada', ...(seats.length === 1 ? { category: 'SINGLES' } : {}), legs: [{ tripId: trip.id, seats, ...(roomChoice && { roomChoice }) }], passengers: seats.map((s) => ({ fullName: `مسافر ${s}` })) })
       .expect(201);
     return { user: session, booking: res.body.bookings[0] };
   };
@@ -88,7 +88,7 @@ describe('Customer photos, complaints and roommates (e2e)', () => {
 
     it('needs the customer\'s own booking for a trip or supervisor complaint, and copies the supervisors', async () => {
       const trip = (await request(http()).post(`${API}/trips`).set(admin.auth).send(tripPayload()).expect(201)).body;
-      const { user, booking } = await book(trip, ['3']);
+      const { user, booking } = await book(trip, ['30']);
       const stranger = await loginPassenger(app);
 
       await request(http()).post(`${API}/complaints`).set(user.auth).send({ category: 'TRIP', details: 'تأخر الباص كثيرًا' }).expect(400);
@@ -119,22 +119,22 @@ describe('Customer photos, complaints and roommates (e2e)', () => {
     it('gives each customer in a shared room the names of the others, and nothing else about them', async () => {
       const hotel = (await request(http()).post(`${API}/hotels`).set(admin.auth).send({ name: 'فندق الشركاء', city: 'مكة', nightlyRate: 50 }).expect(201)).body;
       const trip = (await request(http()).post(`${API}/trips`).set(admin.auth).send(tripPayload({ bookingType: 'WITH_HOTEL', housingPrice: 40 })).expect(201)).body;
-      const first = await book(trip, ['7'], undefined, 'SHARED');
-      const second = await book(trip, ['8'], undefined, 'SHARED');
+      const first = await book(trip, ['27'], undefined, 'SHARED');
+      const second = await book(trip, ['28'], undefined, 'SHARED');
 
       await request(http()).post(`${API}/hotels/assign-booking`).set(admin.auth).send({ bookingId: first.booking.id, hotelId: hotel.id, roomNumber: '301', roomType: 'SHARED' }).expect(201);
       await request(http()).post(`${API}/hotels/assign-booking`).set(admin.auth).send({ bookingId: second.booking.id, hotelId: hotel.id, roomNumber: '301', roomType: 'SHARED' }).expect(201);
 
       const seenByFirst = await request(http()).get(`${API}/bookings/${first.booking.id}`).set(first.user.auth).expect(200);
-      expect(seenByFirst.body.passengers[0].roommates).toEqual(['مسافر 8']);
+      expect(seenByFirst.body.passengers[0].roommates).toEqual(['مسافر 28']);
       expect(JSON.stringify(seenByFirst.body)).not.toContain(second.booking.passengers[0].id);
       const seenBySecond = await request(http()).get(`${API}/bookings/${second.booking.id}`).set(second.user.auth).expect(200);
-      expect(seenBySecond.body.passengers[0].roommates).toEqual(['مسافر 7']);
+      expect(seenBySecond.body.passengers[0].roommates).toEqual(['مسافر 27']);
 
       // Both bookings hear who joined: the one already there and the one moving in.
       const told = await prisma.notification.findMany({ where: { event: 'ROOMMATES_UPDATED', bookingId: { in: [first.booking.id, second.booking.id] } } });
       expect(told.map((n) => n.bookingId).sort()).toEqual([first.booking.id, second.booking.id].sort());
-      expect(told.find((n) => n.bookingId === first.booking.id)!.body).toContain('مسافر 8');
+      expect(told.find((n) => n.bookingId === first.booking.id)!.body).toContain('مسافر 28');
     });
   });
 });

@@ -24,9 +24,9 @@ describe('Bus position, ticket points and crew reports', () => {
     const passenger = await loginPassenger(app);
     const other = await loginPassenger(app);
     const bookOn = async (who: any, seat: string, boardingPointId?: string) =>
-      (await request(http()).post(`${API}/bookings`).set(who.auth).send({ paymentMethod: 'mada', legs: [{ tripId: trip.id, seats: [seat], boardingPointId }], passengers: [{ fullName: `راكب ${seat}` }] }).expect(201)).body.bookings[0];
-    const atFirst = await bookOn(passenger, '1', points[0].id);
-    const atSecond = await bookOn(other, '2', points[1].id);
+      (await request(http()).post(`${API}/bookings`).set(who.auth).send({ paymentMethod: 'mada', category: 'SINGLES', legs: [{ tripId: trip.id, seats: [seat], boardingPointId }], passengers: [{ fullName: `راكب ${seat}` }] }).expect(201)).body.bookings[0];
+    const atFirst = await bookOn(passenger, '26', points[0].id);
+    const atSecond = await bookOn(other, '27', points[1].id);
     const staff = await createStaff(prisma, 'STAFF', undefined, 'rank-supervisor');
     await prisma.tripSupervisor.create({ data: { tripId: trip.id, userId: staff.id, isPrimary: true } });
     const driver = await createStaff(prisma, 'DRIVER');
@@ -256,7 +256,7 @@ describe('Bus position, ticket points and crew reports', () => {
     it('never warns about a booking that chose no point', async () => {
       const { trip, crew } = await setup();
       const passenger = await loginPassenger(app);
-      const booking = (await request(http()).post(`${API}/bookings`).set(passenger.auth).send({ paymentMethod: 'mada', legs: [{ tripId: trip.id, seats: ['9'] }], passengers: [{ fullName: 'راكب' }] }).expect(201)).body.bookings[0];
+      const booking = (await request(http()).post(`${API}/bookings`).set(passenger.auth).send({ paymentMethod: 'mada', category: 'SINGLES', legs: [{ tripId: trip.id, seats: ['34'] }], passengers: [{ fullName: 'راكب' }] }).expect(201)).body.bookings[0];
       expect((await scan(crew, trip.id, booking)).body.result).toBe('BOARDED');
     });
 

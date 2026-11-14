@@ -66,7 +66,7 @@ describe('Post-trip states: executed trips, no-shows and financial closing', () 
       await request(http())
         .post(`${API}/bookings`)
         .set(otherCustomer.auth)
-        .send({ paymentMethod: 'mada', legs: [{ tripId: trip.id, seats: ['3'], boardingPointId: point.id }], passengers: [{ fullName: 'راكب ملغى' }] })
+        .send({ paymentMethod: 'mada', category: 'SINGLES', legs: [{ tripId: trip.id, seats: ['26'], boardingPointId: point.id }], passengers: [{ fullName: 'راكب ملغى' }] })
         .expect(201)
     ).body.bookings[0];
     await prisma.booking.update({ where: { id: other.id }, data: { status: 'CANCELLED' } });

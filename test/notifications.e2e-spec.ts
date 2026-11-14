@@ -13,12 +13,12 @@ describe('Notifications (e2e)', () => {
   const createTrip = async (overrides: Record<string, unknown> = {}) =>
     (await request(http()).post(`${API}/trips`).set(admin.auth).send(tripPayload(overrides)).expect(201)).body;
 
-  const book = async (trip: any, passenger: any, seat = '1') =>
+  const book = async (trip: any, passenger: any, seat = '26') =>
     (
       await request(http())
         .post(`${API}/bookings`)
         .set(passenger.auth)
-        .send({ paymentMethod: 'mada', legs: [{ tripId: trip.id, seats: [seat] }], passengers: [{ fullName: 'سارة أحمد' }] })
+        .send({ paymentMethod: 'mada', category: 'SINGLES', legs: [{ tripId: trip.id, seats: [seat] }], passengers: [{ fullName: 'سارة أحمد' }] })
         .expect(201)
     ).body.bookings[0];
 
@@ -192,11 +192,11 @@ describe('Notifications (e2e)', () => {
       const trip = await createTrip();
       const passenger = await loginPassenger(app);
       await prisma.user.update({ where: { id: passenger.user.id }, data: { name: 'خالد' } });
-      await book(trip, passenger, '7');
+      await book(trip, passenger, '27');
 
       const [item] = await received(passenger, 'BOOKING_CONFIRMED');
       expect(item.title).toBe('أهلًا خالد');
-      expect(item.body).toBe(`مقعدك 7 في رحلة ${trip.destination}`);
+      expect(item.body).toBe(`مقعدك 27 في رحلة ${trip.destination}`);
     });
 
     it("sends each customer their language's wording, with the admin's own translation where there is one", async () => {
@@ -216,11 +216,11 @@ describe('Notifications (e2e)', () => {
       const urdu = await loginPassenger(app);
       await prisma.user.update({ where: { id: english.user.id }, data: { name: 'Khalid', messageLanguage: 'en' } });
       await prisma.user.update({ where: { id: urdu.user.id }, data: { messageLanguage: 'ur' } });
-      await book(trip, english, '7');
-      await book(trip, urdu, '8');
+      await book(trip, english, '27');
+      await book(trip, urdu, '28');
 
       const [en] = await received(english, 'BOOKING_CONFIRMED');
-      expect(en).toMatchObject({ title: 'Hi Khalid', body: 'Your seat 7' });
+      expect(en).toMatchObject({ title: 'Hi Khalid', body: 'Your seat 27' });
       const [ur] = await received(urdu, 'BOOKING_CONFIRMED');
       expect(ur.title).not.toContain('أهلًا');
       expect(ur.body).not.toContain('{{');

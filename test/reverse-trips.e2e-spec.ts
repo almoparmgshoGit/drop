@@ -56,10 +56,11 @@ describe('Reverse trips (e2e)', () => {
     })).expect(201)).body;
   };
 
+  /** A traveller booking alone sits with the singles (26-49 on these trips), so a one-seat booking is a singles one. */
   const book = async (tripId: string, seats: string[], customer?: any) => {
     const user = customer ?? await loginPassenger(app);
     const res = await request(http()).post(`${API}/bookings`).set(user.auth)
-      .send({ paymentMethod: 'mada', legs: [{ tripId, seats }], passengers: seats.map((seat) => ({ fullName: `راكب ${seat}` })) })
+      .send({ paymentMethod: 'mada', ...(seats.length === 1 && { category: 'SINGLES' }), legs: [{ tripId, seats }], passengers: seats.map((seat) => ({ fullName: `راكب ${seat}` })) })
       .expect(201);
     return { user, booking: res.body.bookings[0] };
   };
@@ -147,7 +148,7 @@ describe('Reverse trips (e2e)', () => {
     it('still refuses a ticket from an unrelated trip, a one-way trip and a cancelled booking', async () => {
       const { reverse, booking, session } = await riding();
       await opensBoardingNow(reverse.id);
-      const other = await book((await createOutbound('ROUND_TRIP')).id, ['1']);
+      const other = await book((await createOutbound('ROUND_TRIP')).id, ['26']);
       const stranger = await request(http()).post(`${API}/tickets/${other.booking.passengers[0].ticket.ticketNumber}/board`).set(session.auth).send({ tripId: reverse.id }).expect(201);
       expect(stranger.body.result).toBe('WRONG_TRIP');
 
@@ -178,7 +179,7 @@ describe('Reverse trips (e2e)', () => {
       await request(http()).post(`${API}/bookings/${booking.id}/admin-cancel`).set(admin.auth).send({ note: 'قرار' }).expect(201);
       const after = await prisma.trip.findUniqueOrThrow({ where: { id: reverse.id } });
       expect(after).toMatchObject({ totalSeats: 49, availableSeats: 49 });
-      await book(reverse.id, ['1']);
+      await book(reverse.id, ['26']);
     });
   });
 
@@ -187,7 +188,7 @@ describe('Reverse trips (e2e)', () => {
       const trip = await createOutbound('ONE_WAY');
       await book(trip.id, ['1', '2']);
       const reverse = await openReverse(trip.id);
-      const { user } = await book(reverse.id, ['1']);
+      const { user } = await book(reverse.id, ['26']);
 
       const later = new Date(trip.departure + 2 * HOUR).toISOString();
       await edit(trip.id, { departureTime: later }).expect(200);
@@ -262,9 +263,9 @@ describe('Reverse trips (e2e)', () => {
   describe('cancelling and opening again', () => {
     it('protects riders from a silent cancellation, tells them when it goes ahead, and can reopen', async () => {
       const trip = await createOutbound('ROUND_TRIP');
-      const { user } = await book(trip.id, ['1']);
+      const { user } = await book(trip.id, ['26']);
       const reverse = await openReverse(trip.id);
-      await book(reverse.id, ['2']);
+      await book(reverse.id, ['27']);
 
       await request(http()).post(`${API}/trips/${reverse.id}/cancel`).set(admin.auth).send({}).expect(409);
       expect((await prisma.trip.findUniqueOrThrow({ where: { id: reverse.id } })).tripStatus).toBe('PUBLISHED');
@@ -276,14 +277,14 @@ describe('Reverse trips (e2e)', () => {
       const row = await reverseRow(trip.id);
       expect(row).toMatchObject({ status: 'READY', wasCancelled: true, reverse: null });
 
-      // Its seats start over from the outbound: seat 1 is still sold there, and seat 2 was freed with the cancelled booking.
+      // Its seats start over from the outbound: seat 26 is still sold there, and seat 27 was freed with the cancelled booking.
       const reopened = await openReverse(trip.id, { boardingPointName: 'نقطة جديدة' });
       expect(reopened.id).toBe(reverse.id);
       expect(reopened).toMatchObject({ tripStatus: 'PUBLISHED', availableSeats: 48 });
       expect(reopened.boardingPoints.map((p: any) => p.name)).toEqual(['نقطة جديدة']);
-      const { booking } = await book(reverse.id, ['2']);
+      const { booking } = await book(reverse.id, ['27']);
       expect(booking.status).toBe('CONFIRMED');
-      expect(await prisma.seat.findFirstOrThrow({ where: { tripId: trip.id, seatNumber: '2' } })).toMatchObject({ isBooked: true });
+      expect(await prisma.seat.findFirstOrThrow({ where: { tripId: trip.id, seatNumber: '27' } })).toMatchObject({ isBooked: true });
     });
 
     it('corrects a wrong direction through a cancellation', async () => {
@@ -331,7 +332,7 @@ describe('Reverse trips (e2e)', () => {
       const reverse = await prisma.trip.findFirstOrThrow({ where: { reverseOfTripId: trip.id } });
       expect(reverse.totalSeats).toBe(trip.totalSeats);
       // A seat the outbound sells afterwards is kept for its passenger on the way back.
-      await book(trip.id, ['1']);
+      await book(trip.id, ['26']);
       expect((await prisma.trip.findUniqueOrThrow({ where: { id: reverse.id } })).availableSeats).toBe(trip.totalSeats - 1);
     });
   });
@@ -341,7 +342,7 @@ describe('Reverse trips (e2e)', () => {
       const trip = await createOutbound('ONE_WAY', {
         itineraryStops: [{ title: 'الطائف', time: '10:00', kind: 'STOP' }, { title: 'ميقات السيل', time: '11:00', kind: 'MIQAT' }],
       });
-      await book(trip.id, ['1']);
+      await book(trip.id, ['26']);
       const before = await reverseRow(trip.id);
       expect(before.outboundStops.map((stop: any) => stop.title)).toEqual(['الطائف', 'ميقات السيل']);
 
@@ -369,7 +370,7 @@ describe('Reverse trips (e2e)', () => {
 
     it('still opens with a single point name', async () => {
       const trip = await createOutbound('ONE_WAY');
-      await book(trip.id, ['1']);
+      await book(trip.id, ['26']);
       const reverse = await openReverse(trip.id);
       expect(reverse.boardingPoints).toEqual([expect.objectContaining({ name: 'فندق العزيزية' })]);
     });
@@ -378,10 +379,10 @@ describe('Reverse trips (e2e)', () => {
   describe('the reverse screen', () => {
     it('counts real bookings, not seats closed by the link', async () => {
       const trip = await createOutbound('ROUND_TRIP');
-      await book(trip.id, ['1']);
+      await book(trip.id, ['26']);
       const reverse = await openReverse(trip.id);
-      await book(trip.id, ['2']);
-      await book(reverse.id, ['3']);
+      await book(trip.id, ['27']);
+      await book(reverse.id, ['28']);
       await edit(reverse.id, { price: 200 }).expect(200);
 
       const row = await reverseRow(trip.id);
@@ -447,7 +448,7 @@ describe('Reverse trips (e2e)', () => {
       const trip = await createOutbound('ONE_WAY');
       await book(trip.id, ['1', '2']);
       const reverse = await openReverse(trip.id);
-      await book(reverse.id, ['7']);
+      await book(reverse.id, ['26']);
 
       const list = (await request(http()).get(`${API}/trip-accounts?view=trip&q=${encodeURIComponent(reverse.tripCode)}`).set(admin.auth).expect(200)).body;
       // One row for the journey, found by either leg's code; the way back has no row of its own.
@@ -476,13 +477,13 @@ describe('Reverse trips (e2e)', () => {
       const { departureTime, arrivalTime } = times();
       const later = (await request(http()).post(`${API}/trips`).set(admin.auth)
         .send(tripPayload({ origin: 'مكة المكرمة', destination: 'ينبع', departureTime, arrivalTime })).expect(201)).body;
-      const seatOnReverse = () => prisma.seat.findFirstOrThrow({ where: { tripId: reverse.id, seatNumber: '5' } });
+      const seatOnReverse = () => prisma.seat.findFirstOrThrow({ where: { tripId: reverse.id, seatNumber: '30' } });
 
       const customer = await loginPassenger(app);
       const journey = (await request(http()).post(`${API}/bookings`).set(customer.auth)
-        .send({ paymentMethod: 'mada', legs: [{ tripId: trip.id, seats: ['5'] }, { tripId: later.id, seats: ['5'] }], passengers: [{ fullName: 'راكب يعود لاحقًا' }] })
+        .send({ paymentMethod: 'mada', category: 'SINGLES', legs: [{ tripId: trip.id, seats: ['30'] }, { tripId: later.id, seats: ['30'] }], passengers: [{ fullName: 'راكب يعود لاحقًا' }] })
         .expect(201)).body;
-      // Coming home on the later trip, so seat 5 on this journey's way back can be sold to someone else.
+      // Coming home on the later trip, so seat 30 on this journey's way back can be sold to someone else.
       expect(await seatOnReverse()).toMatchObject({ isBooked: false });
 
       const returnLeg = journey.bookings.find((booking: any) => booking.tripId === later.id);
@@ -495,23 +496,23 @@ describe('Reverse trips (e2e)', () => {
   describe('holds across the two directions', () => {
     it('blocks the other direction while a seat is held, and lets go together', async () => {
       const trip = await createOutbound('ROUND_TRIP');
-      await book(trip.id, ['1']);
+      await book(trip.id, ['26']);
       const reverse = await openReverse(trip.id);
       const [first, second] = [await loginPassenger(app), await loginPassenger(app)];
-      const hold = (user: any, tripId: string, seats: string[]) => request(http()).post(`${API}/bookings/holds`).set(user.auth).send({ tripId, seats });
+      const hold = (user: any, tripId: string, seats: string[]) => request(http()).post(`${API}/bookings/holds`).set(user.auth).send({ tripId, seats, category: 'SINGLES' });
 
-      await hold(first, trip.id, ['3']).expect(201);
-      await hold(second, reverse.id, ['3']).expect(409);
+      await hold(first, trip.id, ['28']).expect(201);
+      await hold(second, reverse.id, ['28']).expect(409);
       const map = (await request(http()).get(`${API}/bookings/seat-map/${reverse.id}`).set(second.auth).expect(200)).body;
-      expect(map.seats.find((seat: any) => seat.seatNumber === '3').status).toBe('held');
+      expect(map.seats.find((seat: any) => seat.seatNumber === '28').status).toBe('held');
 
       // Picking another seat frees the first one on both directions.
-      await hold(first, trip.id, ['4']).expect(201);
-      await hold(second, reverse.id, ['3']).expect(201);
+      await hold(first, trip.id, ['29']).expect(201);
+      await hold(second, reverse.id, ['28']).expect(201);
 
       // The first customer still books their own held seat.
-      await book(trip.id, ['4'], first);
-      await hold(second, reverse.id, ['4']).expect(409);
+      await book(trip.id, ['29'], first);
+      await hold(second, reverse.id, ['29']).expect(409);
     });
   });
 });

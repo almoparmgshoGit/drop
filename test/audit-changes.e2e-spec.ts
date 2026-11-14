@@ -82,7 +82,7 @@ describe('Audit log before and after values (e2e)', () => {
       await request(http())
         .post(`${API}/bookings`)
         .set(customer.auth)
-        .send({ paymentMethod: 'mada', legs: [{ tripId: trip.id, seats: ['5'] }], passengers: [{ fullName: 'اسم قديم' }] })
+        .send({ paymentMethod: 'mada', category: 'SINGLES', legs: [{ tripId: trip.id, seats: ['30'] }], passengers: [{ fullName: 'اسم قديم' }] })
         .expect(201)
     ).body.bookings[0];
     await request(http())
