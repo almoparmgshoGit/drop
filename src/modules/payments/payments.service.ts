@@ -4,7 +4,7 @@ import { transactionCode } from '../../common/services/payment-ledger.service';
 import { PrismaService } from '../../common/services/prisma.service';
 import { csvFile } from '../../common/utils/csv.util';
 import { halalas } from '../../common/utils/payment.util';
-import { riyadhMonth, riyadhMonthRange } from '../../common/utils/time.util';
+import { riyadhDaysRange, riyadhMonth, riyadhMonthRange } from '../../common/utils/time.util';
 import { PAGE_SIZE, PaymentState, PaymentsQuery } from './payments.dto';
 
 const EXPORT_LIMIT = 5000;
@@ -49,8 +49,15 @@ const placeOf = (booking: { source: 'APP' | 'BRANCH'; branch: { name: string } |
 export class PaymentsService {
   constructor(private prisma: PrismaService) {}
 
-  private buildWhere(query: PaymentsQuery, month: string): Prisma.PaymentTransactionWhereInput {
-    const where: Prisma.PaymentTransactionWhereInput = { createdAt: riyadhMonthRange(month), ...(query.state && STATE_FILTER[query.state]) };
+  /** The chosen day range, else the month (this one by default). */
+  private period(query: PaymentsQuery) {
+    const month = query.month ?? riyadhMonth(new Date());
+    const days = query.from && query.to ? riyadhDaysRange(query.from, query.to) : null;
+    return { month, range: days ?? riyadhMonthRange(month) };
+  }
+
+  private buildWhere(query: PaymentsQuery, range: { gte: Date; lt: Date }): Prisma.PaymentTransactionWhereInput {
+    const where: Prisma.PaymentTransactionWhereInput = { createdAt: range,...(query.state && STATE_FILTER[query.state]) };
     if (query.method) where.method = query.method;
     if (query.source) where.booking = { source: query.source };
     if (query.search) {
@@ -68,16 +75,16 @@ export class PaymentsService {
   }
 
   async list(query: PaymentsQuery) {
-    const month = query.month ?? riyadhMonth(new Date());
+    const { month, range } = this.period(query);
     const page = query.page ?? 1;
-    const where = this.buildWhere(query, month);
+    const where = this.buildWhere(query, range);
     const succeededFrom = (source: 'APP' | 'BRANCH') =>
-      this.prisma.paymentTransaction.aggregate({ where: { createdAt: riyadhMonthRange(month), ...STATE_FILTER.SUCCEEDED, booking: { source } }, _count: true, _sum: { amount: true } });
+      this.prisma.paymentTransaction.aggregate({ where: { createdAt: range, ...STATE_FILTER.SUCCEEDED, booking: { source } }, _count: true, _sum: { amount: true } });
     const [items, total, groups, fromApp, fromBranches] = await Promise.all([
       this.prisma.paymentTransaction.findMany({ where, include: ROW_INCLUDE, orderBy: { number: 'desc' }, skip: (page - 1) * PAGE_SIZE, take: PAGE_SIZE }),
       this.prisma.paymentTransaction.count({ where }),
       // The cards describe the month as a whole, so the table's filters do not change them.
-      this.prisma.paymentTransaction.groupBy({ by: ['type', 'status', 'destination'], where: { createdAt: riyadhMonthRange(month) }, _count: true, _sum: { amount: true } }),
+      this.prisma.paymentTransaction.groupBy({ by: ['type', 'status', 'destination'], where: { createdAt: range }, _count: true, _sum: { amount: true } }),
       succeededFrom('APP'),
       succeededFrom('BRANCH'),
     ]);
@@ -124,8 +131,8 @@ export class PaymentsService {
   }
 
   async exportCsv(actorId: string, query: PaymentsQuery, ip?: string) {
-    const month = query.month ?? riyadhMonth(new Date());
-    const rows = await this.prisma.paymentTransaction.findMany({ where: this.buildWhere(query, month), include: ROW_INCLUDE, orderBy: { number: 'desc' }, take: EXPORT_LIMIT });
+    const { range } = this.period(query);
+    const rows = await this.prisma.paymentTransaction.findMany({ where: this.buildWhere(query, range), include: ROW_INCLUDE, orderBy: { number: 'desc' }, take: EXPORT_LIMIT });
     // Exports carry customer data out of the system, and the audit interceptor only covers writes.
     await this.prisma.auditLog.create({
       data: { userId: actorId, action: 'GET /payments/export', entity: 'PaymentTransaction', ip, details: { filters: { ...query }, rows: rows.length } as Prisma.InputJsonValue },

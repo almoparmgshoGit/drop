@@ -235,6 +235,16 @@ class UpdateSettingsDto {
 
   @IsOptional()
   @IsInt()
+  @Min(5)
+  @Max(1440)
+  waitlistOfferMinutes?: number;
+
+  @IsOptional()
+  @IsBoolean()
+  waitlistEnabled?: boolean;
+
+  @IsOptional()
+  @IsInt()
   @Min(1)
   @Max(168)
   boardingOpensBeforeHours?: number;
@@ -262,6 +272,24 @@ class UpdateSettingsDto {
   @Min(50)
   @Max(5000)
   arrivalRadiusMeters?: number;
+
+  @IsOptional()
+  @IsInt()
+  @Min(10)
+  @Max(720)
+  supervisorAppCheckBeforeMinutes?: number;
+
+  @IsOptional()
+  @IsInt()
+  @Min(3)
+  @Max(240)
+  trackingSilentAlertMinutes?: number;
+
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(60)
+  gpsDeviceStaleMinutes?: number;
 
   // Same ceilings as a trip's own fields on its form.
   @IsOptional()

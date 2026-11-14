@@ -59,6 +59,7 @@ enum PackageKind {
 }
 
 enum WalletTransactionType {
+  VOUCHER_TOPUP
   CREDIT_ADDED
   DEBIT_SPENT
   ADMIN_ADJUSTMENT
@@ -90,6 +91,14 @@ enum BookingCategory {
 enum BookingSource {
   APP
   BRANCH
+}
+
+/// What the customer bought, stored on the booking itself: the trip only says what it offers.
+enum BookingServiceType {
+  TRANSPORT_ONLY
+  WITH_HOTEL
+  WITH_VISITS
+  WITH_HOTEL_VISITS
 }
 
 /// What the customer bought as a whole, shown on the manifest, the rooming sheet and the customer's own screen.
@@ -155,6 +164,7 @@ enum JobTripRole {
 }
 
 enum LoyaltyTransactionType {
+  VOUCHER_BONUS
   EARNED
   REDEEMED
   ADJUSTED
@@ -325,97 +335,109 @@ enum PromoFrequency {
 }
 
 model User {
-  id                  String               @id @default(uuid())
-  phone               String               @unique
-  email               String?              @unique
+  id                     String                @id @default(uuid())
+  phone                  String                @unique
+  email                  String?               @unique
   /// The Google account linked for quick sign-in; the subject of Google's ID token.
-  googleId            String?              @unique
-  name                String?
-  role                Role                 @default(PASSENGER)
-  rankId              String?
-  rank                Rank?                @relation(fields: [rankId], references: [id], onDelete: Restrict)
-  branchId            String?
-  branch              Branch?              @relation("BranchEmployees", fields: [branchId], references: [id], onDelete: Restrict)
-  managedBranches     Branch[]             @relation("BranchManager")
+  googleId               String?               @unique
+  name                   String?
+  role                   Role                  @default(PASSENGER)
+  rankId                 String?
+  rank                   Rank?                 @relation(fields: [rankId], references: [id], onDelete: Restrict)
+  branchId               String?
+  branch                 Branch?               @relation("BranchEmployees", fields: [branchId], references: [id], onDelete: Restrict)
+  managedBranches        Branch[]              @relation("BranchManager")
   /// Permissions this employee holds beyond their rank.
-  extraPermissions    String[]             @default([])
+  extraPermissions       String[]              @default([])
   /// Permissions of their rank that this employee does not get.
-  revokedPermissions  String[]             @default([])
-  passwordHash        String?
-  isVerified          Boolean              @default(false)
-  walletBalance       Decimal              @default(0) @db.Decimal(10, 2)
-  loyaltyPoints       Int                  @default(0)
-  loyaltyActivityAt   DateTime?
+  revokedPermissions     String[]              @default([])
+  passwordHash           String?
+  isVerified             Boolean               @default(false)
+  walletBalance          Decimal               @default(0) @db.Decimal(10, 2)
+  /// The part of walletBalance that pays for transport only (compensations, promotional credit, staff credit marked so); never above walletBalance.
+  voucherPurchases       VoucherPurchase[]     @relation("VoucherPurchases")
+  voucherRedemptions     VoucherCard[]         @relation("VoucherRedemptions")
+  walletTransportBalance Decimal               @default(0) @db.Decimal(10, 2)
+  loyaltyPoints          Int                   @default(0)
+  loyaltyActivityAt      DateTime?
   /// Chosen from NATIONALITIES by the customer or staff; the customers' audience filter reads it.
-  nationality         String?
+  nationality            String?
   /// Chosen from CUSTOMER_CITIES when the customer first opens the app; the customers list filters by it.
-  city                String?
-  gender              Gender?
+  city                   String?
+  gender                 Gender?
   /// Chosen by the customer at registration: national ID, iqama or passport. Both are set together or neither.
-  idType              IdType?
+  idType                 IdType?
   /// Normalized (Latin digits, upper-case passport letters), so a search matches however it was typed.
-  idNumber            String?
+  idNumber               String?
   /// When the identity document above was issued.
-  idIssueDate         DateTime?            @db.Date
+  idIssueDate            DateTime?             @db.Date
   /// When the identity document above stops being valid. Recorded for staff, whose documents HR follows up.
-  idExpiryDate        DateTime?            @db.Date
-  birthDate           DateTime?            @db.Date
+  idExpiryDate           DateTime?             @db.Date
+  birthDate              DateTime?             @db.Date
   /// A key of NATIVE_LANGUAGES. It can be a language no alert is written in, which is why messageLanguage is separate.
-  nativeLanguage      String?
+  nativeLanguage         String?
   /// ar, en or ur: the language of the alerts this person receives.
-  messageLanguage     String               @default("ar")
+  messageLanguage        String                @default("ar")
   /// Set when the customer turned off offers. Messages about their own trips still reach them.
-  marketingOptOutAt   DateTime?
+  marketingOptOutAt      DateTime?
   /// Set while a customer is blocked: they cannot sign in, book or write to support.
-  blockedAt           DateTime?
-  blockedReason       String?
+  blockedAt              DateTime?
+  blockedReason          String?
   /// The last sign-in or session refresh; a refresh moves it at most every few minutes. Shown to admins as "last login".
-  lastLoginAt         DateTime?
-  conversation        Conversation?        @relation("CustomerConversation")
-  tripChatThreads     TripChatThread[]     @relation("TripChatCustomer")
-  appPresence         AppPresence?
-  referralCode        String?              @unique
-  referredById        String?
-  referredBy          User?                @relation("Referrals", fields: [referredById], references: [id], onDelete: SetNull)
-  referrals           User[]               @relation("Referrals")
-  ownedCoupons        Coupon[]
-  createdAt           DateTime             @default(now())
-  updatedAt           DateTime             @updatedAt
-  refreshTokens       RefreshToken[]
-  bookings            Booking[]
-  auditLogs           AuditLog[]
-  walletTransactions  WalletTransaction[]
-  loyaltyTransactions LoyaltyTransaction[]
-  tripDrivers         TripDriver[]
-  tripSupervisors     TripSupervisor[]
-  driverProfile       DriverProfile?
-  notifications       Notification[]
-  pushTokens          PushToken[]
-  messageDeliveries   MessageDelivery[]
-  custodies           Custody[]
-  releaseRequests     CrewReleaseRequest[] @relation("CrewReleaseRequester")
-  releaseReviews      CrewReleaseRequest[] @relation("CrewReleaseReviewer")
-  penalties           StaffPenalty[]       @relation("StaffPenaltyEmployee")
-  penaltiesIssued     StaffPenalty[]       @relation("StaffPenaltyIssuer")
-  employeeProfile     EmployeeProfile?
-  leaveRequests       LeaveRequest[]
-  leaveAdjustments    LeaveAdjustment[]
-  salaryAdvances      SalaryAdvance[]
-  payrollAdjustments  PayrollAdjustment[]
-  payrollLines        PayrollLine[]
-  finalSettlements    FinalSettlement[]
-  documents           EmployeeDocument[]
-  crewAssignments     CrewAssignmentLog[]
+  lastLoginAt            DateTime?
+  /// The last time a crew member's app was open (in the foreground, or on a trip screen). The crew watchdog reads it.
+  crewAppSeenAt          DateTime?
+  conversation           Conversation?         @relation("CustomerConversation")
+  tripChatThreads        TripChatThread[]      @relation("TripChatCustomer")
+  appPresence            AppPresence?
+  referralCode           String?               @unique
+  referredById           String?
+  referredBy             User?                 @relation("Referrals", fields: [referredById], references: [id], onDelete: SetNull)
+  referrals              User[]                @relation("Referrals")
+  ownedCoupons           Coupon[]
+  createdAt              DateTime              @default(now())
+  updatedAt              DateTime              @updatedAt
+  refreshTokens          RefreshToken[]
+  bookings               Booking[]
+  auditLogs              AuditLog[]
+  walletTransactions     WalletTransaction[]
+  loyaltyTransactions    LoyaltyTransaction[]
+  tripDrivers            TripDriver[]
+  tripSupervisors        TripSupervisor[]
+  driverProfile          DriverProfile?
+  notifications          Notification[]
+  pushTokens             PushToken[]
+  messageDeliveries      MessageDelivery[]
+  custodies              Custody[]
+  releaseRequests        CrewReleaseRequest[]  @relation("CrewReleaseRequester")
+  releaseReviews         CrewReleaseRequest[]  @relation("CrewReleaseReviewer")
+  penalties              StaffPenalty[]        @relation("StaffPenaltyEmployee")
+  penaltiesIssued        StaffPenalty[]        @relation("StaffPenaltyIssuer")
+  employeeProfile        EmployeeProfile?
+  leaveRequests          LeaveRequest[]
+  leaveAdjustments       LeaveAdjustment[]
+  salaryAdvances         SalaryAdvance[]
+  payrollAdjustments     PayrollAdjustment[]
+  payrollLines           PayrollLine[]
+  finalSettlements       FinalSettlement[]
+  documents              EmployeeDocument[]
+  crewAssignments        CrewAssignmentLog[]
   /// When the customer's photo last changed; null while they have none. The bytes live in UserPhoto.
-  photoUpdatedAt      DateTime?
+  photoUpdatedAt         DateTime?
   /// The customer's own reminders before the miqat and their gathering point. Null minutes follow the trip's.
-  tripAlertsEnabled   Boolean              @default(true)
-  alertLeadMinutes    Int?
-  alertRepeatMinutes  Int?
-  photo               UserPhoto?
-  customerComplaints  CustomerComplaint[]
+  tripAlertsEnabled      Boolean               @default(true)
+  alertLeadMinutes       Int?
+  alertRepeatMinutes     Int?
+  photo                  UserPhoto?
+  customerComplaints     CustomerComplaint[]
+  tablePreferences       UserTablePreference[]
+  waitlistEntries        WaitlistEntry[]
+  /// Set on a duplicate customer account once staff merged it into another; everything it held moved there and it stays blocked.
+  mergedIntoId           String?
+  mergedAt               DateTime?
 
   @@unique([idType, idNumber])
+  @@index([mergedIntoId])
   @@index([idNumber])
   @@index([phone])
   @@index([rankId])
@@ -452,20 +474,22 @@ model Rank {
 }
 
 model WalletTransaction {
-  id             String                @id @default(uuid())
-  userId         String
-  user           User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
-  amount         Decimal               @db.Decimal(10, 2)
-  type           WalletTransactionType
-  description    String
-  balanceAfter   Decimal?              @db.Decimal(10, 2)
+  id              String                @id @default(uuid())
+  userId          String
+  user            User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  amount          Decimal               @db.Decimal(10, 2)
+  type            WalletTransactionType
+  description     String
+  balanceAfter    Decimal?              @db.Decimal(10, 2)
   /// On promotional credit: when what is left of it stops being spendable.
-  expiresAt      DateTime?
+  expiresAt       DateTime?
   /// On promotional credit: how much is still unspent. Spending uses the credit that expires soonest first.
-  promoRemaining Decimal?              @db.Decimal(10, 2)
-  bookingId      String?
-  createdById    String?
-  createdAt      DateTime              @default(now())
+  promoRemaining  Decimal?              @db.Decimal(10, 2)
+  /// Of this entry, the amount that is (on a credit) or came from (on a debit) transport-only credit.
+  transportAmount Decimal               @default(0) @db.Decimal(10, 2)
+  bookingId       String?
+  createdById     String?
+  createdAt       DateTime              @default(now())
 
   @@index([userId])
 }
@@ -523,6 +547,12 @@ model Trip {
   /// When the office sent the passenger manifest to the crew; from then the crew reads it in the app, without phone numbers, before the trip opens.
   manifestSentAt             DateTime?
   manifestSentByName         String?
+  /// When the trip was executed (منفذة): set once boarding has closed, an hour after departure at the earliest. Its passengers who did not board are then marked as no-shows.
+  /// tripStatus stays PUBLISHED until arrival, so the crew can still report the bus on the road; COMPLETED follows at arrival.
+  executedAt                 DateTime?
+  /// The office closed the trip's account after reviewing it; set on the way there (D), which carries the DR journey's account.
+  financeClosedAt            DateTime?
+  financeClosedByName        String?
   tripStatus                 TripStatus            @default(DRAFT)
   scheduleType               TripScheduleType      @default(TEMPORARY)
   /// Which calendar a fixed trip repeats on; the employee picks it per trip.
@@ -564,7 +594,9 @@ model Trip {
   channelBranch              Boolean               @default(true)
   /// No booking is taken before this moment, even once published. Null opens booking on publish.
   bookingOpensAt             DateTime?
-  busRentalPrice          Decimal?              @db.Decimal(10, 2)
+  /// Flexible pricing on the seat price (occupancy, early bird, last minute, weekday/weekend, min/max). Null or enabled=false keeps the fixed price.
+  pricingRules               Json?
+  busRentalPrice             Decimal?              @db.Decimal(10, 2)
   /// The bed price: charged per person when added to the base price, or its value inside it for reports.
   housingPrice               Decimal?              @db.Decimal(10, 2)
   /// When housing is included in the base price, this is the extra a private room costs.
@@ -585,6 +617,8 @@ model Trip {
   accountEntries             TripAccountEntry[]
   busCost                    TripBusCost?
   location                   TripLocation?
+  /// Alerts the crew watchdog raised for this trip, one per kind.
+  crewAlerts                 TripCrewAlert[]
   reports                    TripReport[]
   loyaltyRules               LoyaltyRule[]
   stationRules               TripStationRule[]
@@ -606,10 +640,13 @@ model Trip {
   releaseRequests            CrewReleaseRequest[]
   crewAssignmentLogs         CrewAssignmentLog[]
   staffPenalties             StaffPenalty[]
+  waitlistEntries            WaitlistEntry[]
+  ratings                    TripRating[]
 
   @@index([origin, destination, departureTime])
   @@index([seriesId])
   @@index([codePeriod, codeNumber])
+  @@index([executedAt])
 }
 
 model TripImage {
@@ -882,26 +919,29 @@ model ItineraryStop {
 }
 
 model Bus {
-  id              String       @id @default(uuid())
-  plateNumber     String       @unique
+  id              String              @id @default(uuid())
+  plateNumber     String              @unique
   model           String
-  color           String       @default("أبيض")
+  color           String              @default("أبيض")
   imageUrl        String?
-  company         String       @default("دروب الهجرة للنقل")
-  kind            VehicleKind  @default(BUS)
+  company         String              @default("دروب الهجرة للنقل")
+  kind            VehicleKind         @default(BUS)
   /// Fixed at the standard plan's count for a bus; entered when a van or minibus is added.
-  seatCount       Int          @default(49)
+  seatCount       Int                 @default(49)
   officeId        String?
-  office          BusOffice?   @relation(fields: [officeId], references: [id], onDelete: Restrict)
+  office          BusOffice?          @relation(fields: [officeId], references: [id], onDelete: Restrict)
   /// Where singles may sit on this bus, from seat to seat. Families may sit anywhere.
-  singlesFromSeat Int          @default(26)
-  singlesToSeat   Int          @default(49)
-  status          BusStatus    @default(ACTIVE)
-  createdAt       DateTime     @default(now())
+  singlesFromSeat Int                 @default(26)
+  singlesToSeat   Int                 @default(49)
+  status          BusStatus           @default(ACTIVE)
+  createdAt       DateTime            @default(now())
   trips           Trip[]
   services        BusService[]
   /// Shown to customers on the trips the bus runs, in sortOrder; the first is the cover, which imageUrl copies.
   images          BusImage[]
+  maintenanceLogs BusMaintenanceLog[]
+  /// A GPS tracker fixed in the bus; when it reports, it stands in for the supervisor's phone.
+  gpsDevice       BusGpsDevice?
 
   @@index([officeId])
 }
@@ -998,81 +1038,94 @@ model Seat {
 }
 
 model Booking {
-  id                  String               @id @default(uuid())
-  bookingReference    String               @unique
-  userId              String
-  user                User                 @relation(fields: [userId], references: [id])
-  tripId              String
-  trip                Trip                 @relation(fields: [tripId], references: [id])
-  status              BookingStatus        @default(PENDING)
-  groupReference      String?
-  category            BookingCategory      @default(FAMILY)
+  id                    String               @id @default(uuid())
+  bookingReference      String               @unique
+  userId                String
+  user                  User                 @relation(fields: [userId], references: [id])
+  tripId                String
+  trip                  Trip                 @relation(fields: [tripId], references: [id])
+  status                BookingStatus        @default(PENDING)
+  groupReference        String?
+  category              BookingCategory      @default(FAMILY)
   /// The room type the customer asked for; staff place them in actual rooms later.
-  roomChoice          RoomType?
+  roomChoice            RoomType?
   /// What housing added to the subtotal when booked, kept so later price changes do not rewrite it.
-  housingAmount       Decimal              @default(0) @db.Decimal(10, 2)
-  source              BookingSource        @default(APP)
-  branchId            String?
-  branch              Branch?              @relation(fields: [branchId], references: [id], onDelete: Restrict)
-  kind                BookingKind?
-  leg                 BookingLeg?
+  housingAmount         Decimal              @default(0) @db.Decimal(10, 2)
+  source                BookingSource        @default(APP)
+  branchId              String?
+  branch                Branch?              @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  kind                  BookingKind?
+  leg                   BookingLeg?
+  /// What was bought; every screen labels the booking from this and its kind, never from the trip's type.
+  serviceType           BookingServiceType   @default(TRANSPORT_ONLY)
   /// The hotel chosen when the booking was made. Staff still place the customer in actual rooms.
-  stayHotelId         String?
-  stayHotel           Hotel?               @relation(fields: [stayHotelId], references: [id], onDelete: Restrict)
-  stayCheckIn         DateTime?            @db.Date
-  stayCheckOut        DateTime?            @db.Date
-  stayNights          Int?
+  stayHotelId           String?
+  stayHotel             Hotel?               @relation(fields: [stayHotelId], references: [id], onDelete: Restrict)
+  stayCheckIn           DateTime?            @db.Date
+  stayCheckOut          DateTime?            @db.Date
+  stayNights            Int?
   /// The employee who registered it at a branch.
-  createdById         String?
-  createdByName       String?
-  subtotal            Decimal              @default(0) @db.Decimal(10, 2)
-  discountAmount      Decimal              @default(0) @db.Decimal(10, 2)
-  walletAmount        Decimal              @default(0) @db.Decimal(10, 2)
-  vatAmount           Decimal              @default(0) @db.Decimal(10, 2)
-  totalPrice          Decimal              @db.Decimal(10, 2)
-  couponId            String?
-  coupon              Coupon?              @relation(fields: [couponId], references: [id], onDelete: SetNull)
-  boardingPointId     String?
-  boardingPointName   String?
-  boardingPointTime   String?
-  cancelReason        String?
-  cancelRequestedAt   DateTime?
-  cancelReviewNote    String?
+  createdById           String?
+  createdByName         String?
+  subtotal              Decimal              @default(0) @db.Decimal(10, 2)
+  discountAmount        Decimal              @default(0) @db.Decimal(10, 2)
+  walletAmount          Decimal              @default(0) @db.Decimal(10, 2)
+  vatAmount             Decimal              @default(0) @db.Decimal(10, 2)
+  totalPrice            Decimal              @db.Decimal(10, 2)
+  /// A price typed by staff instead of the listed one: the difference (negative is a reduction), why, and who typed it.
+  priceAdjustment       Decimal              @default(0) @db.Decimal(10, 2)
+  priceAdjustmentReason String?
+  priceAdjustedById     String?
+  priceAdjustedByName   String?
+  couponId              String?
+  coupon                Coupon?              @relation(fields: [couponId], references: [id], onDelete: SetNull)
+  boardingPointId       String?
+  boardingPointName     String?
+  boardingPointTime     String?
+  cancelReason          String?
+  cancelRequestedAt     DateTime?
+  cancelReviewNote      String?
   /// The part of the review the customer may read; cancelReviewNote can hold an internal reason.
-  cancelCustomerNote  String?
-  cancelReviewedById  String?
-  cancelReviewedAt    DateTime?
+  cancelCustomerNote    String?
+  cancelReviewedById    String?
+  cancelReviewedAt      DateTime?
   /// Credited to the wallet. Cash handed back lives in cashMovements and everything else in externalRefunded.
-  refundAmount        Decimal?             @db.Decimal(10, 2)
+  refundAmount          Decimal?             @db.Decimal(10, 2)
   /// Confirmed as returned to the customer's card, network or transfer.
-  externalRefunded    Decimal              @default(0) @db.Decimal(10, 2)
-  idempotencyKey      String?              @unique
-  createdAt           DateTime             @default(now())
-  updatedAt           DateTime             @updatedAt
-  passengers          BookingPassenger[]
-  tickets             Ticket[]
-  payment             Payment?
-  events              BookingEvent[]
-  hotelComplaints     HotelComplaint[]
-  customerComplaints  CustomerComplaint[]
-  cashMovements       CashMovement[]
-  collections         BookingCollection[]
-  paymentTransactions PaymentTransaction[]
-  compensation        TicketCompensation?
+  externalRefunded      Decimal              @default(0) @db.Decimal(10, 2)
+  idempotencyKey        String?              @unique
+  createdAt             DateTime             @default(now())
+  updatedAt             DateTime             @updatedAt
+  passengers            BookingPassenger[]
+  tickets               Ticket[]
+  payment               Payment?
+  events                BookingEvent[]
+  hotelComplaints       HotelComplaint[]
+  customerComplaints    CustomerComplaint[]
+  cashMovements         CashMovement[]
+  collections           BookingCollection[]
+  paymentTransactions   PaymentTransaction[]
+  compensation          TicketCompensation?
   /// When the customer was told the bus left their point; each message goes once, however often the crew's status changes.
-  lateAlertAt         DateTime?
+  lateAlertAt           DateTime?
   /// When the customer was told their ticket stopped.
-  stoppedAlertAt      DateTime?
-  invoice             Invoice?
-  creditNotes         CreditNote[]
-  loyaltyTransactions LoyaltyTransaction[]
-  pointsRedeemed      Int                  @default(0)
-  pointsDiscount      Decimal              @default(0) @db.Decimal(10, 2)
-  loyaltyPlan         Json?
-  loyaltySettledAt    DateTime?
+  stoppedAlertAt        DateTime?
+  invoice               Invoice?
+  creditNotes           CreditNote[]
+  loyaltyTransactions   LoyaltyTransaction[]
+  pointsRedeemed        Int                  @default(0)
+  pointsDiscount        Decimal              @default(0) @db.Decimal(10, 2)
+  loyaltyPlan           Json?
+  loyaltySettledAt      DateTime?
   /// The customer-built package this booking belongs to.
-  customPackageId     String?
-  customPackage       Package?             @relation(fields: [customPackageId], references: [id], onDelete: Restrict)
+  customPackageId       String?
+  customPackage         Package?             @relation(fields: [customPackageId], references: [id], onDelete: Restrict)
+  /// The seat price charged when booked (after flexible pricing) and the trip's listed price at that moment. Null on older bookings.
+  seatPrice             Decimal?             @db.Decimal(10, 2)
+  seatBasePrice         Decimal?             @db.Decimal(10, 2)
+  /// The secret in the public tracking link the customer shares with family. Made on first share, and only opens the trip's live position until it ends.
+  trackingToken         String?              @unique
+  rating                TripRating?
 
   @@index([userId])
   @@index([tripId])
@@ -1083,6 +1136,12 @@ model Booking {
   @@index([createdById])
   @@index([cancelReviewedById])
   @@index([customPackageId])
+}
+
+/// The last booking number given out in each month (YYMM), shared by the app and the branches.
+model BookingNumberCounter {
+  period String @id
+  last   Int    @default(0)
 }
 
 model BookingPassenger {
@@ -1107,18 +1166,26 @@ model BookingPassenger {
 }
 
 model Ticket {
-  id              String           @id @default(uuid())
-  bookingId       String
-  booking         Booking          @relation(fields: [bookingId], references: [id], onDelete: Cascade)
-  passengerId     String           @unique
-  passenger       BookingPassenger @relation(fields: [passengerId], references: [id], onDelete: Cascade)
-  ticketNumber    String           @unique
-  signedToken     String           @db.Text
-  isBoarded       Boolean          @default(false)
-  boardedAt       DateTime?
+  id                   String           @id @default(uuid())
+  bookingId            String
+  booking              Booking          @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  passengerId          String           @unique
+  passenger            BookingPassenger @relation(fields: [passengerId], references: [id], onDelete: Cascade)
+  ticketNumber         String           @unique
+  signedToken          String           @db.Text
+  isBoarded            Boolean          @default(false)
+  boardedAt            DateTime?
   /// A round trip's passenger rides back on its reverse with this same ticket, so the return is recorded apart from the outbound.
-  returnBoardedAt DateTime?
-  createdAt       DateTime         @default(now())
+  returnBoardedAt      DateTime?
+  /// Set when the trip was executed and this passenger had not boarded it (لم يحضر); boarding them afterwards clears it.
+  noShowAt             DateTime?
+  /// The same for the way back on a round trip's reverse.
+  returnNoShowAt       DateTime?
+  /// The crew recorded this boarding on the road without internet and the app sent it later; boardedAt is when it was scanned.
+  boardedOffline       Boolean          @default(false)
+  /// The same for the way back on a round trip's reverse.
+  returnBoardedOffline Boolean          @default(false)
+  createdAt            DateTime         @default(now())
 
   @@index([ticketNumber])
   @@index([bookingId])
@@ -1159,14 +1226,85 @@ model LoyaltyRule {
   createdAt     DateTime        @default(now())
 }
 
+/// A top-up card sold in the app: each one bought becomes a VoucherCard with its own code and QR.
 model LoyaltyVoucher {
-  id         String   @id @default(uuid())
-  name       String
-  pointsCost Int
-  value      Decimal  @db.Decimal(10, 2)
-  validDays  Int      @default(90)
-  isActive   Boolean  @default(true)
-  createdAt  DateTime @default(now())
+  id                  String            @id @default(uuid())
+  name                String
+  description         String?
+  /// Price in points; null when it cannot be bought with points.
+  pointsCost          Int?
+  /// Price in riyals; null when it cannot be bought with money.
+  price               Decimal?          @db.Decimal(10, 2)
+  /// Wallet balance the card adds when it is redeemed.
+  value               Decimal           @default(0) @db.Decimal(10, 2)
+  /// Extra loyalty points the card adds when it is redeemed.
+  bonusPoints         Int               @default(0)
+  /// The balance it adds pays for transport only, like compensations.
+  creditTransportOnly Boolean           @default(false)
+  /// How long a bought card can still be redeemed.
+  validDays           Int               @default(90)
+  /// How many may be sold in all; null is no limit.
+  stockTotal          Int?
+  soldCount           Int               @default(0)
+  maxPerPurchase      Int               @default(10)
+  imageUrl            String?
+  /// Where the QR sits on the image: { x, y, size } as fractions of the image width/height, plus color and background.
+  design              Json?
+  isActive            Boolean           @default(true)
+  createdAt           DateTime          @default(now())
+  cards               VoucherCard[]
+  purchases           VoucherPurchase[]
+}
+
+enum VoucherPayMethod {
+  MONEY
+  POINTS
+}
+
+model VoucherPurchase {
+  id            String           @id @default(uuid())
+  reference     String           @unique
+  voucherId     String
+  voucher       LoyaltyVoucher   @relation(fields: [voucherId], references: [id], onDelete: Restrict)
+  buyerId       String
+  buyer         User             @relation("VoucherPurchases", fields: [buyerId], references: [id], onDelete: Cascade)
+  quantity      Int
+  method        VoucherPayMethod
+  amount        Decimal          @default(0) @db.Decimal(10, 2)
+  points        Int              @default(0)
+  paymentMethod String?
+  paymentStatus String           @default("COMPLETED")
+  createdAt     DateTime         @default(now())
+  cards         VoucherCard[]
+
+  @@index([buyerId, createdAt])
+  @@index([voucherId])
+}
+
+/// One bought card. Whoever enters or scans its code first gets its balance and points; it works once.
+model VoucherCard {
+  id            String          @id @default(uuid())
+  code          String          @unique
+  voucherId     String
+  voucher       LoyaltyVoucher  @relation(fields: [voucherId], references: [id], onDelete: Restrict)
+  purchaseId    String
+  purchase      VoucherPurchase @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
+  buyerId       String
+  /// What it gives, fixed when bought so later edits to the voucher never change a card already sold.
+  value         Decimal         @db.Decimal(10, 2)
+  bonusPoints   Int             @default(0)
+  transportOnly Boolean         @default(false)
+  name          String
+  imageUrl      String?
+  design        Json?
+  expiresAt     DateTime
+  redeemedById  String?
+  redeemedBy    User?           @relation("VoucherRedemptions", fields: [redeemedById], references: [id], onDelete: SetNull)
+  redeemedAt    DateTime?
+  createdAt     DateTime        @default(now())
+
+  @@index([buyerId, createdAt])
+  @@index([voucherId])
 }
 
 /// Only the latest position per trip: passengers need "where is the bus", not a record of the crew's movements.
@@ -1176,8 +1314,47 @@ model TripLocation {
   lat          Float
   lng          Float
   speed        Float?
-  reportedById String
+  /// The crew member whose phone sent it; empty for a fix from the bus's GPS device.
+  reportedById String?
+  /// PHONE (the supervisor's app) or DEVICE (the bus's fixed GPS tracker).
+  source       String   @default("PHONE")
+  accuracy     Float?
+  heading      Float?
   recordedAt   DateTime
+}
+
+/// The GPS tracker fixed in a bus. Its token is shown once when generated; only its hash is kept.
+model BusGpsDevice {
+  busId         String    @id
+  bus           Bus       @relation(fields: [busId], references: [id], onDelete: Cascade)
+  /// The tracker's own identifier (IMEI or the id set in the tracking app), sent as `id` with each fix.
+  deviceId      String    @unique
+  tokenHash     String?   @unique
+  /// The token's last characters, so staff can tell which one a device carries.
+  tokenHint     String?
+  tokenIssuedAt DateTime?
+  isEnabled     Boolean   @default(true)
+  lastSeenAt    DateTime?
+  lastLat       Float?
+  lastLng       Float?
+  lastSpeed     Float?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+}
+
+/// Raised once per trip and kind by the crew watchdog, so staff are told once and not every minute.
+model TripCrewAlert {
+  id         String    @id @default(uuid())
+  tripId     String
+  trip       Trip      @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  /// SUPERVISOR_APP_NOT_OPENED or TRACKING_SILENT.
+  kind       String
+  createdAt  DateTime  @default(now())
+  /// Set when the condition cleared: the supervisor opened the app, or the position came back.
+  resolvedAt DateTime?
+
+  @@unique([tripId, kind])
+  @@index([createdAt])
 }
 
 /// An incident the crew raises during a trip. The reporter's name is copied in, so the record survives later account edits.
@@ -1203,10 +1380,18 @@ model TripReport {
   updatedAt          DateTime               @default(now()) @updatedAt
   updates            TripReportUpdate[]
   attachments        TripReportAttachment[]
+  /// An SOS is acknowledged by whoever in the office takes it; the name is copied so the crew sees who answered.
+  acknowledgedAt     DateTime?
+  acknowledgedById   String?
+  acknowledgedByName String?
+  /// Set once when an SOS waited too long without an acknowledgement and the managers were told; never twice.
+  escalatedAt        DateTime?
+  maintenanceLog     BusMaintenanceLog?
 
   @@index([tripId])
   @@index([createdAt])
   @@index([status, createdAt])
+  @@index([category, acknowledgedAt, escalatedAt])
 }
 
 /// A status change or a note on a report; names are copied so the record survives account edits.
@@ -1454,17 +1639,19 @@ model BookingEvent {
 }
 
 model Payment {
-  id               String   @id @default(uuid())
-  bookingId        String   @unique
-  booking          Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
-  amount           Decimal  @db.Decimal(10, 2)
-  currency         String   @default("SAR")
-  status           String   @default("PENDING")
-  method           String?
-  walletAmount     Decimal  @default(0) @db.Decimal(10, 2)
-  gatewayReference String?
-  followUpNote     String?
-  createdAt        DateTime @default(now())
+  id                    String   @id @default(uuid())
+  bookingId             String   @unique
+  booking               Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  amount                Decimal  @db.Decimal(10, 2)
+  currency              String   @default("SAR")
+  status                String   @default("PENDING")
+  method                String?
+  walletAmount          Decimal  @default(0) @db.Decimal(10, 2)
+  /// Of walletAmount, what came from transport-only credit; a refund to the wallet gives this part back as transport-only.
+  walletTransportAmount Decimal  @default(0) @db.Decimal(10, 2)
+  gatewayReference      String?
+  followUpNote          String?
+  createdAt             DateTime @default(now())
 }
 
 /// Money moving through the payment channels. A database trigger freezes a row once it leaves PENDING.
@@ -1511,20 +1698,27 @@ model AppEvent {
 }
 
 model AuditLog {
-  id        String   @id @default(uuid())
-  userId    String?
-  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
-  action    String
-  entity    String
-  entityId  String?
-  ip        String?
-  userAgent String?
-  details   Json?
-  createdAt DateTime @default(now())
+  id         String   @id @default(uuid())
+  userId     String?
+  user       User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  action     String
+  entity     String
+  entityId   String?
+  ip         String?
+  userAgent  String?
+  details    Json?
+  /// The record whose values were compared (a booking, trip, user, rank, the settings...), which can differ from entityId.
+  recordType String?
+  recordId   String?
+  /// { label, deleted?, truncated?, fields: [{ field, before, after }] }: what the write changed, read before and after it.
+  changes    Json?
+  createdAt  DateTime @default(now())
 
   @@index([userId])
   @@index([action])
   @@index([userId, createdAt])
+  @@index([recordId])
+  @@index([recordType, createdAt])
 }
 
 model Coupon {
@@ -1731,26 +1925,28 @@ model CustodyExpense {
 
 /// A simplified tax invoice. Everything on it is copied in at issue and a database trigger rejects UPDATE and DELETE, so editing a booking or the settings cannot rewrite one. Its number shows as INV-<tripCode>-<number>.
 model Invoice {
-  id            String       @id @default(uuid())
-  number        Int          @unique @default(autoincrement())
-  bookingId     String       @unique
-  booking       Booking      @relation(fields: [bookingId], references: [id], onDelete: Restrict)
+  id            String         @id @default(uuid())
+  number        Int            @unique @default(autoincrement())
+  bookingId     String         @unique
+  booking       Booking        @relation(fields: [bookingId], references: [id], onDelete: Restrict)
   tripId        String
-  trip          Trip         @relation(fields: [tripId], references: [id], onDelete: Restrict)
+  trip          Trip           @relation(fields: [tripId], references: [id], onDelete: Restrict)
   tripCode      String
   destination   String
   tripDate      DateTime
   passengerName String?
   nationalId    String?
-  subtotal      Decimal      @db.Decimal(12, 2)
-  total         Decimal      @db.Decimal(12, 2)
-  taxable       Decimal      @db.Decimal(12, 2)
-  vat           Decimal      @db.Decimal(12, 2)
-  vatRate       Decimal      @db.Decimal(5, 2)
+  subtotal      Decimal        @db.Decimal(12, 2)
+  total         Decimal        @db.Decimal(12, 2)
+  taxable       Decimal        @db.Decimal(12, 2)
+  vat           Decimal        @db.Decimal(12, 2)
+  vatRate       Decimal        @db.Decimal(5, 2)
   /// The seller as it stood at issue. Empty fields fall back to the current settings when printed.
   seller        Json?
-  issuedAt      DateTime     @default(now())
+  issuedAt      DateTime       @default(now())
   creditNotes   CreditNote[]
+  /// ZATCA phase 2: the signed copy and its reporting state, once e-invoicing is switched on.
+  zatcaDocument ZatcaDocument?
 
   @@index([issuedAt])
   @@index([tripId, issuedAt])
@@ -1758,22 +1954,70 @@ model Invoice {
 
 /// Reverses all or part of an invoice when a booking is cancelled or refunded. Append-only, like the invoice.
 model CreditNote {
-  id          String   @id @default(uuid())
-  number      Int      @unique @default(autoincrement())
-  invoiceId   String
-  invoice     Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
-  bookingId   String
-  booking     Booking  @relation(fields: [bookingId], references: [id], onDelete: Restrict)
-  tripCode    String
-  total       Decimal  @db.Decimal(12, 2)
-  taxable     Decimal  @db.Decimal(12, 2)
-  vat         Decimal  @db.Decimal(12, 2)
-  reason      String?
-  createdById String?
-  issuedAt    DateTime @default(now())
+  id            String         @id @default(uuid())
+  number        Int            @unique @default(autoincrement())
+  invoiceId     String
+  invoice       Invoice        @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+  bookingId     String
+  booking       Booking        @relation(fields: [bookingId], references: [id], onDelete: Restrict)
+  tripCode      String
+  total         Decimal        @db.Decimal(12, 2)
+  taxable       Decimal        @db.Decimal(12, 2)
+  vat           Decimal        @db.Decimal(12, 2)
+  reason        String?
+  createdById   String?
+  issuedAt      DateTime       @default(now())
+  zatcaDocument ZatcaDocument?
 
   @@index([issuedAt])
   @@index([invoiceId])
+}
+
+enum ZatcaDocumentKind {
+  INVOICE
+  CREDIT_NOTE
+}
+
+enum ZatcaStatus {
+  PENDING
+  REPORTED
+  WARNING
+  REJECTED
+  FAILED
+}
+
+/// ZATCA phase 2 (integration): one signed UBL document per invoice or credit note issued after switching on, chained by ICV and
+/// previous hash, and the queue that reports it to ZATCA within 24 hours. Append-only once signed: the chain depends on every byte.
+model ZatcaDocument {
+  id            String            @id @default(uuid())
+  kind          ZatcaDocumentKind
+  invoiceId     String?           @unique
+  invoice       Invoice?          @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+  creditNoteId  String?           @unique
+  creditNote    CreditNote?       @relation(fields: [creditNoteId], references: [id], onDelete: Restrict)
+  /// developer-portal, simulation or core: each has its own chain.
+  environment   String
+  uuid          String            @unique
+  /// Invoice counter value, assigned under a lock when signed.
+  icv           Int?
+  invoiceHash   String?
+  previousHash  String?
+  xml           String?
+  qr            String?
+  signedAt      DateTime?
+  status        ZatcaStatus       @default(PENDING)
+  attempts      Int               @default(0)
+  nextAttemptAt DateTime          @default(now())
+  claimedAt     DateTime?
+  response      Json?
+  errorMessage  String?
+  reportedAt    DateTime?
+  createdAt     DateTime          @default(now())
+  updatedAt     DateTime          @updatedAt
+
+  @@unique([environment, icv])
+  @@index([status, nextAttemptAt])
+  @@index([environment, signedAt])
 }
 
 model AccountCategory {
@@ -2741,4 +2985,129 @@ model TripChatMessage {
 
   @@unique([threadId, clientId])
   @@index([threadId, createdAt])
+}
+
+enum BusMaintenanceType {
+  BREAKDOWN
+  REPAIR
+  PREVENTIVE
+  INSPECTION
+  OTHER
+}
+
+enum BusMaintenanceStatus {
+  OPEN
+  IN_PROGRESS
+  DONE
+}
+
+/// The bus's maintenance log. A crew report of a breakdown opens an entry on its own; the office adds or edits the rest.
+/// The trip's code and the author's name are copied, so the record survives later edits.
+model BusMaintenanceLog {
+  id            String               @id @default(uuid())
+  busId         String
+  bus           Bus                  @relation(fields: [busId], references: [id], onDelete: Cascade)
+  tripId        String?
+  tripCode      String?
+  reportId      String?
+  report        TripReport?          @relation(fields: [reportId], references: [id], onDelete: SetNull)
+  type          BusMaintenanceType   @default(BREAKDOWN)
+  status        BusMaintenanceStatus @default(OPEN)
+  description   String
+  cost          Decimal?             @db.Decimal(10, 2)
+  reportedAt    DateTime             @default(now())
+  resolvedAt    DateTime?
+  createdById   String?
+  createdByName String?
+  createdAt     DateTime             @default(now())
+  updatedAt     DateTime             @default(now()) @updatedAt
+
+  @@unique([reportId])
+  @@index([busId, reportedAt])
+  @@index([status])
+}
+
+/// How a staff member arranged one admin table (hidden columns, pinned first column), kept on the server so it
+/// follows them to every device. tableKey names the table, such as "bookings" or "hr.payroll".
+model UserTablePreference {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tableKey  String
+  settings  Json
+  updatedAt DateTime @default(now()) @updatedAt
+
+  @@unique([userId, tableKey])
+}
+
+/// A customer's rating of a trip they rode, one per booking. Asked for once after the trip, and from the app's past trips.
+model TripRating {
+  id               String   @id @default(uuid())
+  bookingId        String   @unique
+  booking          Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  tripId           String
+  trip             Trip     @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  /// The whole trip, 1 to 5 stars.
+  rating           Int
+  /// Optional parts of the trip, 1 to 5 each.
+  busRating        Int?
+  supervisorRating Int?
+  driverRating     Int?
+  comment          String?
+  createdAt        DateTime @default(now())
+
+  @@index([tripId, createdAt])
+}
+
+/// One boarding the crew's app recorded without internet and sent later. Keyed by the phone's own id for the scan,
+/// so sending the same queue again (a lost reply, a retry) answers the same way instead of boarding twice.
+model OfflineBoardingSync {
+  id           String   @id @default(uuid())
+  actorId      String
+  clientId     String
+  tripId       String
+  ticketNumber String?
+  scannedAt    DateTime
+  /// ACCEPTED, ALREADY_BOARDED or REJECTED: what the app is told every time this scan is sent again.
+  status       String
+  response     Json
+  createdAt    DateTime @default(now())
+
+  @@unique([actorId, clientId])
+  @@index([tripId, createdAt])
+}
+
+enum WaitlistStatus {
+  WAITING
+  OFFERED
+  BOOKED
+  EXPIRED
+  CANCELLED
+}
+
+/// A customer waiting for seats on a full trip. Freed seats are held for the first eligible entry for a set window, then passed on.
+model WaitlistEntry {
+  id            String         @id @default(uuid())
+  tripId        String
+  trip          Trip           @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  userId        String
+  user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  seats         Int
+  status        WaitlistStatus @default(WAITING)
+  /// Order within the trip's queue: lower is served first.
+  position      Int
+  offeredAt     DateTime?
+  expiresAt     DateTime?
+  /// The seats held for this entry while it is offered.
+  heldSeats     String[]       @default([])
+  bookedAt      DateTime?
+  cancelledAt   DateTime?
+  /// The employee who offered or removed it by hand from the panel.
+  handledByName String?
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  @@index([tripId, status, position])
+  @@index([userId, status])
+  @@index([status, expiresAt])
 }

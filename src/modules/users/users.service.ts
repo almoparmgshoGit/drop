@@ -97,6 +97,7 @@ const USER_SELECT = {
   rank: { select: { id: true, name: true, job: { select: { id: true, name: true } } } },
   isVerified: true,
   walletBalance: true,
+  walletTransportBalance: true,
   loyaltyPoints: true,
   nationality: true,
   city: true,
@@ -283,15 +284,12 @@ export class UsersService implements OnModuleInit, OnModuleDestroy {
     return this.loyalty.applyReferralCode(userId, code);
   }
 
-  redeemVoucher(userId: string, voucherId: string) {
-    return this.loyalty.redeemVoucher(userId, voucherId);
-  }
-
   /** Without customers.list an employee gets no table: only the few customers one exact search points at. */
   async getCustomers(actor: LookupActor, query: { search?: string; page?: number; limit?: number; status?: string; sort?: string; nationality?: string; city?: string; gender?: string }, ip?: string) {
     if (!actor.permissions.includes('customers.list')) return this.lookupCustomers(actor, query.search ?? '', ip);
     const { search, page = 1, limit = 50, status, sort = 'newest', nationality, city, gender } = query;
-    const where: Prisma.UserWhereInput = { role: 'PASSENGER' };
+    // An account merged into another is kept only so old references resolve; the customer is the account it went into.
+    const where: Prisma.UserWhereInput = { role: 'PASSENGER', mergedIntoId: null };
     if (status === 'blocked') where.blockedAt = { not: null };
     if (status === 'active') where.blockedAt = null;
     if (nationality) where.nationality = nationality === 'none' ? null : nationality;
@@ -339,7 +337,7 @@ export class UsersService implements OnModuleInit, OnModuleDestroy {
     if (!search.trim()) return empty;
     const lookup = parseCustomerLookup(search);
     await this.lookup.consume(actor);
-    const where: Prisma.UserWhereInput = { role: 'PASSENGER', ...customerLookupWhere(lookup) };
+    const where: Prisma.UserWhereInput = { role: 'PASSENGER', mergedIntoId: null, ...customerLookupWhere(lookup) };
     const [items, total] = await Promise.all([
       this.prisma.user.findMany({ where, select: CUSTOMER_ROW_SELECT, orderBy: { name: 'asc' }, take: LOOKUP_RESULT_LIMIT }),
       this.prisma.user.count({ where }),
@@ -422,6 +420,7 @@ export class UsersService implements OnModuleInit, OnModuleDestroy {
           name: true,
           phone: true,
           walletBalance: true,
+          walletTransportBalance: true,
           loyaltyPoints: true,
           walletTransactions: {
             where: { OR: [liveCredit, { type: { not: 'PROMO_CREDIT' } }] },
@@ -591,6 +590,8 @@ export class UsersService implements OnModuleInit, OnModuleDestroy {
         blockedAt: true,
         blockedReason: true,
         lastLoginAt: true,
+        mergedIntoId: true,
+        mergedAt: true,
         conversation: { select: { id: true } },
         bookings: {
           // Field by field: a ticket's signed token boards whoever holds it, and costs are not a support employee's concern.
@@ -861,7 +862,7 @@ export class UsersService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  async adjustWalletBalance(actor: UserActor, userId: string, amount: number, description: string) {
+  async adjustWalletBalance(actor: UserActor, userId: string, amount: number, description: string, transportOnly = false) {
     if (amount === 0) throw new BadRequestException('يجب أن يكون المبلغ أكبر من صفر');
     const admin = { id: actor.userId, name: actor.name };
     const descText = `${description.trim()} (بواسطة: ${admin.name || 'الإدارة'})`;
@@ -872,7 +873,9 @@ export class UsersService implements OnModuleInit, OnModuleDestroy {
         userId,
         amount,
         type: amount > 0 ? 'CREDIT_ADDED' : 'ADMIN_ADJUSTMENT',
-        description: descText,
+        description: transportOnly && amount > 0 ? `${descText} • للنقل فقط` : descText,
+        // A credit is ordinary money unless staff chose transport-only; a deduction takes transport-only credit first.
+        ...(amount > 0 && { transportAmount: transportOnly ? amount : 0 }),
         createdById: admin.id,
       });
       await this.notifications.toUser(tx, amount > 0 ? 'WALLET_CREDITED' : 'WALLET_DEBITED', userId, {

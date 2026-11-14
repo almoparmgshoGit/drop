@@ -1,5 +1,6 @@
 import { ArgumentsHost, Catch, ExceptionFilter, HttpStatus } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
+import { reportError } from '../monitoring/error-reporter';
 
 const KNOWN_ERRORS: Record<string, { status: number; message: string }> = {
   P2002: { status: HttpStatus.CONFLICT, message: 'هذه القيمة مستخدمة مسبقًا' },
@@ -19,6 +20,8 @@ export class PrismaExceptionFilter implements ExceptionFilter {
     const status = known?.status ?? (exception instanceof Prisma.PrismaClientValidationError ? HttpStatus.BAD_REQUEST : HttpStatus.INTERNAL_SERVER_ERROR);
     if (status === HttpStatus.INTERNAL_SERVER_ERROR) {
       console.error(exception);
+      // The request is read only for its route and account id; the reporter strips everything personal.
+      reportError(exception, host.switchToHttp().getRequest?.());
     }
     response.status(status).json({
       statusCode: status,

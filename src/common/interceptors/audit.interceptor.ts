@@ -1,7 +1,8 @@
 import { CallHandler, ExecutionContext, Injectable, NestInterceptor } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 import { Prisma } from '@prisma/client';
-import { Observable, tap } from 'rxjs';
+import { Observable, defer, switchMap, tap } from 'rxjs';
+import { AuditChanges, AuditTarget, diffAuditSnapshots, resolveAuditTarget, snapshotAuditTarget } from '../audit-snapshots';
 import { SKIP_AUDIT_KEY } from '../decorators/auth.decorators';
 import { PrismaService } from '../services/prisma.service';
 
@@ -28,22 +29,39 @@ export class AuditInterceptor implements NestInterceptor {
       return next.handle();
     }
 
-    return next.handle().pipe(
-      tap(() => {
-        this.prisma.auditLog
-          .create({
-            data: {
-              userId: actor.userId,
-              action: `${request.method} ${request.route?.path ?? request.url}`,
-              entity: context.getClass().name.replace('Controller', ''),
-              entityId: request.params?.id ?? request.params?.tripId ?? request.params?.bookingId ?? null,
-              ip: request.ip,
-              userAgent: request.headers['user-agent'],
-              details: sanitize(request.body) as Prisma.InputJsonValue,
-            },
-          })
-          .catch((err) => console.error('Audit log failed:', err.message));
-      }),
+    const write = (target: AuditTarget | null, changes: AuditChanges | null) =>
+      this.prisma.auditLog
+        .create({
+          data: {
+            userId: actor.userId,
+            action: `${request.method} ${request.route?.path ?? request.url}`,
+            entity: context.getClass().name.replace('Controller', ''),
+            entityId: request.params?.id ?? request.params?.tripId ?? request.params?.bookingId ?? null,
+            ip: request.ip,
+            userAgent: request.headers['user-agent'],
+            details: sanitize(request.body) as Prisma.InputJsonValue,
+            recordType: target?.type ?? null,
+            recordId: target?.id ?? null,
+            changes: (changes ?? undefined) as Prisma.InputJsonValue | undefined,
+          },
+        })
+        .catch((err) => console.error('Audit log failed:', err.message));
+
+    // Writes on an existing record keep its values before and after; creations and actions without a record keep the body only.
+    const target = resolveAuditTarget(request.method, request.route?.path, request.params);
+    if (!target) {
+      return next.handle().pipe(tap(() => void write(null, null)));
+    }
+
+    return defer(() => snapshotAuditTarget(this.prisma, target)).pipe(
+      switchMap((before) =>
+        next.handle().pipe(
+          tap(() => {
+            // Read once the handler has answered, so its transaction has committed.
+            void snapshotAuditTarget(this.prisma, target).then((after) => write(target, diffAuditSnapshots(before, after)));
+          }),
+        ),
+      ),
     );
   }
 }

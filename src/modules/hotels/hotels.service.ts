@@ -4,7 +4,7 @@ import { BookingEventsService } from '../../common/services/booking-events.servi
 import { NotificationsService } from '../../common/services/notifications.service';
 import { PrismaService } from '../../common/services/prisma.service';
 import { RoomAllocationService } from '../../common/services/room-allocation.service';
-import { BOOKING_KIND_LABELS } from '../../common/utils/booking-kinds.util';
+import { bookingTypeLabel } from '../../common/utils/booking-kinds.util';
 import { includedBedValue } from '../../common/utils/housing-price.util';
 import { HOUSING_BOOKING_TYPES, includesHousing } from '../../common/utils/booking-types.util';
 import { CREW_WINDOW_SELECT, crewWindow } from '../../common/utils/crew-window.util';
@@ -13,6 +13,7 @@ import { SERVICE_SELECT, withHotelServices } from '../../common/utils/services.u
 import { GALLERY_SELECT, galleryRows } from '../../common/utils/gallery.util';
 import { suggestServiceIcon } from '../../common/service-icons';
 import { NATIONALITIES } from '../../common/profile-options';
+import { riyadhDaysRange } from '../../common/utils/time.util';
 import { PROFILE_ACCOUNT_SELECT, PROFILE_PASSENGER_SELECT, passengerProfiles } from '../../common/utils/passenger-profile.util';
 import {
   AssignBookingRoomDto,
@@ -494,11 +495,12 @@ export class HotelsService {
     });
   }
 
-  async overview(month?: string) {
+  async overview(month?: string, from?: string, to?: string) {
     const [year, monthNumber] = (month ?? riyadhDate(new Date()).slice(0, 7)).split('-').map(Number);
+    const days = from && to ? riyadhDaysRange(from, to) : null;
     const trips = await this.prisma.trip.findMany({
       where: {
-        departureTime: {
+        departureTime: days ?? {
           gte: new Date(Date.UTC(year, monthNumber - 1, 1) - RIYADH_OFFSET_MS),
           lt: new Date(Date.UTC(year, monthNumber, 1) - RIYADH_OFFSET_MS),
         },
@@ -633,6 +635,7 @@ export class HotelsService {
             status: true,
             roomChoice: true,
             kind: true,
+            serviceType: true,
             stayNights: true,
             stayCheckIn: true,
             stayCheckOut: true,
@@ -665,7 +668,7 @@ export class HotelsService {
           bookingReference: booking.bookingReference,
           bookingSize: booking.passengers.length,
           roomChoice: booking.roomChoice,
-          bookingKind: booking.kind ? BOOKING_KIND_LABELS[booking.kind] : null,
+          bookingKind: bookingTypeLabel(booking),
           stayHotel: booking.stayHotel,
           stayCheckIn: booking.stayCheckIn,
           stayCheckOut: booking.stayCheckOut,

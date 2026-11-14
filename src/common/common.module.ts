@@ -19,8 +19,9 @@ import { TicketAlertsService } from './services/ticket-alerts.service';
 import { TicketCompensationService } from './services/ticket-compensation.service';
 import { CustomerLookupService } from './services/customer-lookup.service';
 import { PushService } from './services/push.service';
+import { WaitlistService } from './services/waitlist.service';
 
-const SHARED_SERVICES = [PrismaService, RealtimeService, RedisService, WalletService, BookingCancellationService, BookingEventsService, LoyaltyService, NotificationsService, RoomAllocationService, InvoiceLedgerService, PaymentLedgerService, AppSettingsService, IntegrationsService, RoutingService, WhatsAppService, StationAlertsService, TicketAlertsService, TicketCompensationService, CustomerLookupService, PushService];
+const SHARED_SERVICES = [PrismaService, RealtimeService, RedisService, WalletService, BookingCancellationService, BookingEventsService, LoyaltyService, NotificationsService, RoomAllocationService, InvoiceLedgerService, PaymentLedgerService, AppSettingsService, IntegrationsService, RoutingService, WhatsAppService, StationAlertsService, TicketAlertsService, TicketCompensationService, CustomerLookupService, PushService, WaitlistService];
 
 @Global()
 @Module({

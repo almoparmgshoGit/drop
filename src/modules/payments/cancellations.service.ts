@@ -9,6 +9,7 @@ import { WalletService } from '../../common/services/wallet.service';
 import { applicableRule, daysUntil, parseCancellationRules } from '../../common/utils/cancellation-policy.util';
 import { halalas, paymentFigures } from '../../common/utils/payment.util';
 import { startOfRiyadhMonth } from '../../common/utils/time.util';
+import { bookingTypeLabel } from '../../common/utils/booking-kinds.util';
 import { CashActor, CashService } from '../cash/cash.service';
 import { CancellationsQuery, CancellationTab, ExecuteRefundDto, MoveRefundToWalletDto, PAGE_SIZE } from './payments.dto';
 
@@ -93,6 +94,8 @@ export class CancellationsService {
           status: true,
           cancelRequestedAt: true,
           cancelReviewedAt: true,
+          kind: true,
+          serviceType: true,
           user: { select: { name: true } },
           trip: { select: { origin: true, destination: true, departureTime: true, bookingType: true } },
           payment: { select: { amount: true, walletAmount: true, status: true } },
@@ -113,6 +116,7 @@ export class CancellationsService {
         status: booking.status,
         customerName: booking.user.name,
         trip: booking.trip,
+        typeLabel: bookingTypeLabel(booking),
         requestedAt: booking.cancelRequestedAt,
         reviewedAt: booking.cancelReviewedAt,
         paid: paidOf(booking).paid,
@@ -155,6 +159,7 @@ export class CancellationsService {
       source: booking.source,
       customer: booking.user,
       trip: booking.trip,
+      typeLabel: bookingTypeLabel(booking),
       seats: booking.passengers.length,
       cancelReason: booking.cancelReason,
       cancelReviewNote: booking.cancelReviewNote,

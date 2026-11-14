@@ -48,14 +48,15 @@ const passwordFingerprint = (passwordHash: string) => crypto.createHash('sha256'
 /** Shows the employee which number the code went to without printing all of it: +966 •• ••• 4580. */
 const maskPhone = (phone: string) => `${phone.slice(0, 4)} •• ••• ${phone.slice(-4)}`;
 
-/** Permissions that let an employee work in any branch, so any branch may be chosen at sign-in. */
+/** Permissions that let an employee work in any branch, so they start in all branches and may switch inside the panel. */
 const ALL_BRANCHES_PERMISSIONS = ['bookings.all_branches', 'cash.all_branches'];
 
-/** What the panel adds to a staff sign-in: the branch chosen on the form, and the token of a device remembered earlier. */
+/** What the panel adds to a staff sign-in: the token of a device remembered earlier. The branch is never the client's choice. */
 export interface PanelLoginOptions {
-  branchId?: string;
   deviceToken?: string;
 }
+
+type BranchAccount = { id: string; role: string; branchId: string | null; extraPermissions: string[]; revokedPermissions: string[]; rank: { permissions: string[] } | null };
 
 /** A refreshed session moves the last-login time only when it is older than this, so frequent refreshes do not each write to the account. */
 const LAST_LOGIN_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
@@ -73,6 +74,7 @@ const AUTH_USER_SELECT = {
   name: true,
   role: true,
   walletBalance: true,
+  walletTransportBalance: true,
   branchId: true,
   branch: { select: { id: true, name: true } },
   extraPermissions: true,
@@ -298,13 +300,27 @@ export class AuthService {
     return { googleId: payload.sub, email };
   }
 
-  /** Active branches for the sign-in form. Only names: nothing here is private. */
-  async loginBranches() {
-    return this.prisma.branch.findMany({
-      where: { isActive: true },
+  private worksInEveryBranch(user: BranchAccount) {
+    const permissions = permissionsOf(user);
+    return ALL_BRANCHES_PERMISSIONS.some((key) => permissions.includes(key));
+  }
+
+  /**
+   * The branches a signed-in employee may switch the panel to: every active branch for all-branch access,
+   * otherwise only their own. Replaces the public list the sign-in form used to show to anyone.
+   */
+  async sessionBranches(userId: string) {
+    const user = await this.prisma.user.findUniqueOrThrow({
+      where: { id: userId },
+      select: { id: true, role: true, branchId: true, extraPermissions: true, revokedPermissions: true, rank: { select: { permissions: true } } },
+    });
+    const allBranches = this.worksInEveryBranch(user);
+    const branches = await this.prisma.branch.findMany({
+      where: { isActive: true, ...(!allBranches && { id: user.branchId ?? '' }) },
       select: { id: true, name: true, city: true },
       orderBy: { name: 'asc' },
     });
+    return { canSwitch: allBranches, branches };
   }
 
   /**
@@ -322,27 +338,19 @@ export class AuthService {
     return !!stored && stored === passwordFingerprint(user.passwordHash);
   }
 
-  /** An employee of one branch signs in to that branch only; holders of all-branch access may choose any. */
-  private async assertBranchChoice(
-    user: { id: string; role: string; branchId: string | null; extraPermissions: string[]; revokedPermissions: string[]; rank: { permissions: string[] } | null },
-    branchId?: string,
-  ) {
-    const permissions = permissionsOf(user);
-    const allBranches = ALL_BRANCHES_PERMISSIONS.some((key) => permissions.includes(key));
-    if (!branchId) {
-      if (allBranches || !user.branchId) return null;
-      throw new BadRequestException('اختر فرعك لتسجيل الدخول');
-    }
-    const branch = await this.prisma.branch.findFirst({ where: { id: branchId, isActive: true }, select: { id: true, name: true } });
-    if (!branch) throw new BadRequestException('الفرع المختار غير موجود أو موقوف');
-    if (!allBranches && user.branchId !== branch.id) {
-      throw new ForbiddenException(user.branchId ? 'هذا الحساب غير مرتبط بالفرع المختار' : 'حسابك غير مرتبط بأي فرع، اختر «كل الفروع» أو راجع مدير النظام');
-    }
+  /**
+   * The session's branch comes from the account, never from the sign-in form: all-branch access starts in every
+   * branch (null), anyone else in the branch they are assigned to.
+   */
+  private async accountBranch(user: BranchAccount) {
+    if (this.worksInEveryBranch(user) || !user.branchId) return null;
+    const branch = await this.prisma.branch.findFirst({ where: { id: user.branchId, isActive: true }, select: { id: true, name: true } });
+    if (!branch) throw new ForbiddenException('فرعك موقوف حاليًا، راجع مدير النظام');
     return branch;
   }
 
   /**
-   * The panel's sign-in: the password, then the chosen branch, then a WhatsApp code unless this device was remembered.
+   * The panel's sign-in: the password, then a WhatsApp code unless this device was remembered. The branch is the account's.
    * The mobile app keeps the plain staffLogin, whose response it already understands.
    */
   async panelLogin(rawIdentifier: string, password: string, options: PanelLoginOptions, ip?: string, userAgent?: string) {
@@ -351,7 +359,7 @@ export class AuthService {
       where: { id: user.id },
       select: { id: true, phone: true, role: true, branchId: true, passwordHash: true, extraPermissions: true, revokedPermissions: true, rank: { select: { permissions: true } } },
     });
-    const branch = await this.assertBranchChoice(full, options.branchId);
+    const branch = await this.accountBranch(full);
 
     if ((await this.staffSecondStepAvailable()) && !(await this.isTrustedDevice(full, options.deviceToken))) {
       const sent = await this.sendOtp(full.phone);

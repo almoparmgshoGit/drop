@@ -1,0 +1,67 @@
+name: CI
+
+# Type-checks, builds and runs the e2e suite against a throwaway PostgreSQL on every push and pull request.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    services:
+      postgres:
+        # The production server runs PostgreSQL 18 (see the 23001 handling in prisma-exception.filter.ts).
+        image: postgres:18
+        env:
+          POSTGRES_USER: durob_test
+          POSTGRES_PASSWORD: durob_test
+          POSTGRES_DB: durob_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U durob_test -d durob_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      # test/setup-env.ts refuses any database that is not on localhost, and sets every other variable the app
+      # validates (NODE_ENV=test, JWT and ticket secrets, settings key, simulated payments, throttling off).
+      # REDIS_HOST stays unset: limits, locks and live events then live in memory, which a single test process needs.
+      DATABASE_URL: postgresql://durob_test:durob_test@localhost:5432/durob_test?schema=public
+      # Sentry stays off in CI.
+      SENTRY_DSN: ''
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Apply migrations to the test database
+        run: npx prisma migrate deploy
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Type-check (app and tests)
+        run: npx tsc --noEmit -p tsconfig.json
+
+      - name: Build
+        run: npm run build
+
+      - name: E2E tests
+        run: npm run test:e2e

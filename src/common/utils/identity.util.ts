@@ -77,7 +77,7 @@ const LOOKUP_NAME_MIN_WORD_LENGTH = 2;
  */
 export function parseCustomerLookup(raw: string, { allowCodes = false } = {}): CustomerLookup {
   const term = toEnglishDigits(String(raw ?? '')).trim().replace(/\s+/g, ' ');
-  // Booking and ticket codes: DRB-XXXXXXXX, DR-123, TKT-XXXXXXXXXX, or a scanned paper ticket (code.signature). Matched whole.
+  // Booking and ticket codes: DH-2611-0123, the older DRB-XXXXXXXX and DR-123, TKT-XXXXXXXXXX, or a scanned paper ticket (code.signature). Matched whole.
   if (allowCodes && /^[A-Za-z]{2,4}-[A-Za-z0-9-]{2,}(\.[\w-]+)?$/.test(term)) return { kind: 'code', code: term };
   const phone = fullSaudiPhone(term);
   if (phone) return { kind: 'phone', phone };

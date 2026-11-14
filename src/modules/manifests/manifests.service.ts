@@ -2,7 +2,7 @@ import { BadRequestException, ConflictException, ForbiddenException, Injectable,
 import { BookingStatus, Prisma } from '@prisma/client';
 import { NotificationsService } from '../../common/services/notifications.service';
 import { PrismaService } from '../../common/services/prisma.service';
-import { BOOKING_KIND_LABELS } from '../../common/utils/booking-kinds.util';
+import { bookingTypeLabel } from '../../common/utils/booking-kinds.util';
 import { bookingHasStay, includesHousing } from '../../common/utils/booking-types.util';
 import { tripSeatLayout } from '../../common/utils/bus-layout.util';
 import { goOnlyBookings, returningBookingIds, reverseSeatsSummary } from '../../common/utils/linked-seats.util';
@@ -35,6 +35,7 @@ const MANIFEST_BOOKING_SELECT = {
   updatedAt: true,
   boardingPointName: true,
   kind: true,
+  serviceType: true,
   leg: true,
   roomChoice: true,
   stayNights: true,
@@ -55,7 +56,7 @@ const MANIFEST_BOOKING_SELECT = {
       notes: true,
       seatNumber: true,
       hotelRoom: { select: { id: true, number: true, type: true, hotelBooking: { select: { hotel: { select: { name: true } } } } } },
-      ticket: { select: { isBoarded: true, boardedAt: true, returnBoardedAt: true } },
+      ticket: { select: { isBoarded: true, boardedAt: true, returnBoardedAt: true, noShowAt: true, returnNoShowAt: true } },
     },
   },
 } satisfies Prisma.BookingSelect;
@@ -115,7 +116,8 @@ export class ManifestsService {
           bookingReference: booking.bookingReference,
           bookingStatus: booking.status,
           bookingUpdatedAt: booking.updatedAt,
-          bookingKind: booking.kind ? BOOKING_KIND_LABELS[booking.kind] : null,
+          // The booking's own type, the same words as the bookings list, its page, the invoice and the app.
+          bookingKind: bookingTypeLabel(booking),
           leg: booking.leg,
           goOnly: goOnly.has(booking.id),
           branchName: booking.branch?.name ?? null,
@@ -137,6 +139,8 @@ export class ManifestsService {
           boardingPointName: isReturning ? null : booking.boardingPointName,
           isBoarded: isReturning ? !!p.ticket?.returnBoardedAt : p.ticket?.isBoarded ?? false,
           boardedAt: isReturning ? p.ticket?.returnBoardedAt ?? null : p.ticket?.boardedAt ?? null,
+          /** The trip was executed without this passenger aboard (لم يحضر). */
+          isNoShow: isReturning ? !!p.ticket?.returnNoShowAt && !p.ticket?.returnBoardedAt : !!p.ticket?.noShowAt && !p.ticket?.isBoarded,
         })),
       )
       .sort((a, b) => Number(a.seatNumber) - Number(b.seatNumber));
@@ -180,6 +184,7 @@ export class ManifestsService {
         departureTime: trip.departureTime,
         arrivalTime: trip.arrivalTime,
         tripStatus: trip.tripStatus,
+        executedAt: trip.executedAt,
         bookingType: trip.bookingType,
         busType: trip.busType,
         totalSeats: trip.totalSeats,
@@ -203,6 +208,7 @@ export class ManifestsService {
       summary: {
         total: passengers.length,
         boarded: passengers.filter((p) => p.isBoarded).length,
+        noShow: passengers.filter((p) => p.isNoShow).length,
         available: seats.filter((s) => s.status === 'available').length,
       },
       housing: {
@@ -303,6 +309,8 @@ export class ManifestsService {
             collections: { select: { amount: true, method: true } },
             cashMovements: { where: { type: 'BOOKING_REFUND' }, select: { amount: true } },
             roomChoice: true,
+            kind: true,
+            serviceType: true,
             housingAmount: true,
             subtotal: true,
             passengers: { orderBy: { position: 'asc' }, select: { id: true, fullName: true, notes: true, seatNumber: true } },
@@ -356,6 +364,7 @@ export class ManifestsService {
           fullName: passenger.fullName,
           seatNumber: passenger.seatNumber,
           bookingReference: booking.bookingReference,
+          bookingType: bookingTypeLabel(booking),
           nights: trip.accommodations[0]?.nights ?? null,
           price: toSar(prices[idx]),
           cash: toSar(cashShares[idx]),

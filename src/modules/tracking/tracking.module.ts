@@ -1,12 +1,15 @@
-import { Body, Controller, ForbiddenException, ConflictException, Get, Injectable, Module, NotFoundException, Param, Post, Req } from '@nestjs/common';
+import { Body, Controller, ForbiddenException, ConflictException, Delete, Get, HttpCode, Injectable, Module, NotFoundException, Param, Post, Put, Req } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
+import { Throttle } from '@nestjs/throttler';
 import { Type } from 'class-transformer';
-import { ArrayMaxSize, ArrayMinSize, IsArray, IsNumber, IsOptional, Max, Min, ValidateNested } from 'class-validator';
-import { RequirePermission, SkipAudit } from '../../common/decorators/auth.decorators';
+import { ArrayMaxSize, ArrayMinSize, IsArray, IsBoolean, IsIn, IsNumber, IsOptional, IsString, Matches, Max, MaxLength, Min, ValidateNested } from 'class-validator';
+import { Public, RequirePermission, SkipAudit } from '../../common/decorators/auth.decorators';
 import { AppSettingsService, withinHours } from '../../common/services/app-settings.service';
 import { PrismaService } from '../../common/services/prisma.service';
-import { RealtimeService } from '../../common/services/realtime.service';
 import { MAX_ROAD_POINTS, RoutingService } from '../../common/services/routing.service';
+import { CREW_ALERT, CrewWatchdogService, supervisorCheckStarted, supervisorWasActive } from './crew-watchdog.service';
+import { GpsDeviceService, parseFix } from './gps-device.service';
+import { nearestBoardingPoint, TripLocationService } from './trip-location.service';
 import { CREW_WINDOW_SELECT, crewWindow } from '../../common/utils/crew-window.util';
 import { distanceInMeters } from '../../common/utils/geo.util';
 import { bookedOnTrips } from '../../common/utils/linked-seats.util';
@@ -92,13 +95,37 @@ class RoadDto {
   points: RoadPointDto[];
 }
 
+class HeartbeatDto {
+  /** The trip whose screen is open, when one is. */
+  @IsOptional()
+  @IsString()
+  @MaxLength(64)
+  tripId?: string;
+
+  @IsOptional()
+  @IsIn(['ios', 'android'])
+  platform?: string;
+}
+
+class GpsDeviceDto {
+  /** The tracker's IMEI or the id set in its tracking app. */
+  @IsString()
+  @MaxLength(64)
+  @Matches(/^[A-Za-z0-9._:-]+$/, { message: 'رقم الجهاز يقبل الحروف الإنجليزية والأرقام و . _ : - فقط' })
+  deviceId: string;
+
+  @IsOptional()
+  @IsBoolean()
+  isEnabled?: boolean;
+}
+
 @Injectable()
 class TrackingService {
   constructor(
     private prisma: PrismaService,
     private appSettings: AppSettingsService,
     private routing: RoutingService,
-    private realtime: RealtimeService,
+    private locations: TripLocationService,
   ) {}
 
   private async assertAssigned(actor: { userId: string; role: string }, tripId: string) {
@@ -139,17 +166,59 @@ class TrackingService {
     ) {
       throw new ConflictException(`بث الموقع متاح قبل الانطلاق ${withinHours(limits.trackingOpensBeforeHours)} وحتى بعد الوصول ${withinHours(limits.trackingClosesAfterHours)} فقط`);
     }
-    // The server clock stamps the position, so a device cannot make an old one look fresh.
-    const data = { lat: dto.lat, lng: dto.lng, speed: dto.speed ?? null, reportedById: actor.userId, recordedAt: new Date() };
-    await this.prisma.tripLocation.upsert({ where: { tripId }, create: { tripId, ...data }, update: data });
-    this.realtime.tripLocation(tripId, { lat: data.lat, lng: data.lng, speed: data.speed, recordedAt: data.recordedAt, isLive: true });
+    // Sending a position means the app is open: the crew watchdog counts it like a heartbeat.
+    await this.locations.crewSeen(actor.userId);
+    // The server clock stamps the position, so a device cannot make an old one look fresh. While the bus's GPS device
+    // is reporting, the phone's fix is not used, but the crew is still asked about a point it is near.
+    const result = await this.locations.record(tripId, { lat: dto.lat, lng: dto.lng, speed: dto.speed ?? null, source: 'PHONE', reportedById: actor.userId, recordedAt: new Date() });
     // Only a suggestion: the crew confirms, because passing near a point is not the same as stopping there.
-    const nearPoint = trip.boardingPoints
-      .flatMap((point) => (point.lat !== null && point.lng !== null && point.id !== trip.currentBoardingPointId ? [{ id: point.id, name: point.name, meters: distanceInMeters(dto, { lat: point.lat, lng: point.lng }) }] : []))
-      // Close enough to a boarding point to ask the crew whether the bus has arrived.
-      .filter((point) => point.meters <= limits.arrivalRadiusMeters)
-      .sort((a, b) => a.meters - b.meters)[0];
-    return { success: true, recordedAt: data.recordedAt, nearPoint: nearPoint ? { id: nearPoint.id, name: nearPoint.name, meters: Math.round(nearPoint.meters) } : null };
+    const nearPoint = nearestBoardingPoint(trip.boardingPoints, dto, trip.currentBoardingPointId, limits.arrivalRadiusMeters);
+    return { success: true, recordedAt: result.recordedAt, source: result.source, nearPoint };
+  }
+
+  /** For the trip's page in the panel: whether the supervisors opened the app, where the position comes from, and the watchdog's open alerts. */
+  async crewStatus(tripId: string) {
+    const now = Date.now();
+    const limits = await this.appSettings.numbers('supervisorAppCheckBeforeMinutes', 'gpsDeviceStaleMinutes');
+    const trip = await this.prisma.trip.findUnique({
+      where: { id: tripId },
+      select: {
+        tripStatus: true,
+        liveStatus: true,
+        departureTime: true,
+        location: { select: { source: true, recordedAt: true } },
+        bus: { select: { gpsDevice: { select: { deviceId: true, isEnabled: true, lastSeenAt: true } } } },
+        supervisors: { orderBy: { isPrimary: 'desc' }, select: { user: { select: { id: true, name: true, crewAppSeenAt: true } } } },
+        crewAlerts: { orderBy: { createdAt: 'desc' }, select: { kind: true, createdAt: true, resolvedAt: true } },
+      },
+    });
+    if (!trip) throw new NotFoundException('Trip not found');
+    const supervisors = trip.supervisors.map((row) => row.user);
+    // Only while the trip is still to run or on the road; afterwards the supervisors' app activity is no longer news.
+    const checkStarted = trip.tripStatus === 'PUBLISHED' && trip.liveStatus !== 'ARRIVED' && supervisorCheckStarted(trip.departureTime, limits.supervisorAppCheckBeforeMinutes, now);
+    const device = trip.bus?.gpsDevice ?? null;
+    return {
+      checkStarted,
+      supervisorAppNotOpened:
+        trip.tripStatus === 'PUBLISHED' &&
+        trip.liveStatus === 'NOT_STARTED' &&
+        supervisors.length > 0 &&
+        checkStarted &&
+        !supervisors.some((user) => supervisorWasActive(user, trip.departureTime, limits.supervisorAppCheckBeforeMinutes)),
+      supervisors: supervisors.map((user) => ({ id: user.id, name: user.name, appSeenAt: user.crewAppSeenAt })),
+      location: trip.location ? { source: trip.location.source, recordedAt: trip.location.recordedAt, isLive: now - trip.location.recordedAt.getTime() <= LIVE_FOR_MS } : null,
+      gpsDevice: device ? { ...device, isOnline: device.isEnabled && !!device.lastSeenAt && now - device.lastSeenAt.getTime() <= limits.gpsDeviceStaleMinutes * MINUTE_MS } : null,
+      alerts: trip.crewAlerts,
+    };
+  }
+
+  /** The crew app is open (sent on foreground and while a trip screen is open), for the "did not open the app" alert. */
+  async heartbeat(actor: { userId: string; role: string }, dto: HeartbeatDto) {
+    if (actor.role === 'PASSENGER') return { ok: true };
+    if (dto.tripId) await this.assertAssigned(actor, dto.tripId);
+    const now = new Date();
+    await this.locations.crewSeen(actor.userId, now);
+    return { ok: true, seenAt: now };
   }
 
   /** The road the bus should take through the crew's places, drawn on their map. Null means straight lines. */
@@ -160,8 +229,8 @@ class TrackingService {
 
   async stop(actor: { userId: string; role: string }, tripId: string) {
     await this.assertAssigned(actor, tripId);
-    await this.prisma.tripLocation.deleteMany({ where: { tripId } });
-    this.realtime.tripLocation(tripId, null);
+    // Only the phone's position leaves the map; one from the bus's GPS device is not the crew's to clear.
+    await this.locations.clearPhone(tripId);
     return { success: true };
   }
 
@@ -172,9 +241,9 @@ class TrackingService {
    */
   async live() {
     const now = Date.now();
-    const limits = await this.appSettings.numbers('trackingOpensBeforeHours', 'trackingClosesAfterHours');
+    const limits = await this.appSettings.numbers('trackingOpensBeforeHours', 'trackingClosesAfterHours', 'supervisorAppCheckBeforeMinutes', 'gpsDeviceStaleMinutes');
     const today = riyadhDay(now);
-    const [trips, waiting, arrived, unsupervised] = await Promise.all([
+    const [trips, waiting, arrived, unsupervised, crewAlerts] = await Promise.all([
       this.liveTrips(now, limits),
       // Published for today and not yet moving, the earliest first: the next ones the office has to watch go out.
       this.prisma.trip.findMany({
@@ -198,6 +267,19 @@ class TrackingService {
         take: MAX_ALERTS,
         select: { id: true, tripCode: true, departureTime: true },
       }),
+      // Raised by the crew watchdog and still standing: a supervisor who has not opened the app, a bus gone silent.
+      this.prisma.tripCrewAlert.findMany({
+        where: { resolvedAt: null, createdAt: { gte: new Date(now - DAY_MS) } },
+        orderBy: { createdAt: 'desc' },
+        take: MAX_ALERTS,
+        select: {
+          id: true,
+          kind: true,
+          tripId: true,
+          createdAt: true,
+          trip: { select: { tripCode: true, departureTime: true, supervisors: { orderBy: { isPrimary: 'desc' }, take: 1, select: { user: { select: { name: true } } } } } },
+        },
+      }),
     ]);
     const liveIds = trips.trips.map((trip) => trip.id);
     const reports = liveIds.length
@@ -219,6 +301,17 @@ class TrackingService {
         message: `${report.trip.tripCode}: ${report.category === 'SOS' ? 'استغاثة' : REPORT_LABELS[report.type] ?? 'بلاغ'} من الطاقم — ${report.details.slice(0, 80)}`,
         at: report.createdAt,
         href: '/trip-reports',
+      })),
+      ...crewAlerts.map((alert) => ({
+        id: `crew:${alert.id}`,
+        tone: alert.kind === CREW_ALERT.TRACKING_SILENT ? ('danger' as const) : ('warning' as const),
+        tripId: alert.tripId,
+        message:
+          alert.kind === CREW_ALERT.TRACKING_SILENT
+            ? `${alert.trip.tripCode}: انقطع موقع الحافلة (لا جوال المشرف ولا جهاز GPS) — تواصل مع الطاقم`
+            : `${alert.trip.tripCode}: المشرف ${alert.trip.supervisors[0]?.user.name ?? ''} لم يفتح التطبيق، والانطلاق ${formatRiyadhTime(alert.trip.departureTime)}`,
+        at: alert.createdAt,
+        href: `/trips/${alert.tripId}`,
       })),
       ...notLeft.map((trip) => ({
         id: `not-left:${trip.id}`,
@@ -249,7 +342,7 @@ class TrackingService {
     };
   }
 
-  private async liveTrips(now: number, limits: { trackingOpensBeforeHours: number; trackingClosesAfterHours: number }) {
+  private async liveTrips(now: number, limits: { trackingOpensBeforeHours: number; trackingClosesAfterHours: number; supervisorAppCheckBeforeMinutes: number; gpsDeviceStaleMinutes: number }) {
     const trips = await this.prisma.trip.findMany({
       where: {
         tripStatus: 'PUBLISHED',
@@ -273,17 +366,27 @@ class TrackingService {
         currentBoardingPointId: true,
         boardingPoints: { select: { id: true, name: true, time: true, lat: true, lng: true } },
         statusUpdates: { orderBy: { createdAt: 'asc' }, select: { status: true, boardingPointId: true, pointName: true, createdAt: true } },
-        bus: { select: { plateNumber: true } },
-        location: { select: { lat: true, lng: true, speed: true, recordedAt: true } },
+        bus: { select: { plateNumber: true, gpsDevice: { select: { deviceId: true, isEnabled: true, lastSeenAt: true } } } },
+        location: { select: { lat: true, lng: true, speed: true, recordedAt: true, source: true, accuracy: true, heading: true } },
         drivers: { select: { user: { select: { name: true, phone: true } } } },
-        supervisors: { orderBy: { isPrimary: 'desc' }, select: { user: { select: { name: true, phone: true } } } },
+        supervisors: { orderBy: { isPrimary: 'desc' }, select: { user: { select: { name: true, phone: true, crewAppSeenAt: true } } } },
+        crewAlerts: { where: { resolvedAt: null }, select: { kind: true, createdAt: true } },
       },
     });
+    const deviceStaleMs = limits.gpsDeviceStaleMinutes * MINUTE_MS;
     const booked = await bookedOnTrips(this.prisma, trips.map((trip) => trip.id));
     return {
       serverTime: new Date(now),
       liveForMs: LIVE_FOR_MS,
-      trips: trips.map(({ boardingPoints, statusUpdates, location, drivers, supervisors, bus, currentBoardingPointId, estimatedArrivalAt, ...trip }) => {
+      trips: trips.map(({ boardingPoints, statusUpdates, location, drivers, supervisors, bus, currentBoardingPointId, estimatedArrivalAt, crewAlerts, ...trip }) => {
+        const device = bus?.gpsDevice ?? null;
+        const supervisorUsers = supervisors.map((row) => row.user);
+        // Shown on the map as «لم يفتح التطبيق» from the check's start until a supervisor opens it.
+        const supervisorAppNotOpened =
+          trip.liveStatus === 'NOT_STARTED' &&
+          supervisorUsers.length > 0 &&
+          supervisorCheckStarted(trip.departureTime, limits.supervisorAppCheckBeforeMinutes, now) &&
+          !supervisorUsers.some((user) => supervisorWasActive(user, trip.departureTime, limits.supervisorAppCheckBeforeMinutes));
         // The first time the crew said so: a point visited twice was still reached when it was first reported.
         const reachedAt = new Map<string, Date>();
         for (const row of statusUpdates.filter((update) => update.status === 'AT_POINT')) {
@@ -316,9 +419,14 @@ class TrackingService {
           bookedSeats: booked.get(trip.id)?.seats ?? 0,
           busPlate: bus?.plateNumber ?? null,
           drivers: drivers.map((row) => row.user),
-          supervisors: supervisors.map((row) => row.user),
+          supervisors: supervisorUsers.map(({ crewAppSeenAt, ...user }) => ({ ...user, appSeenAt: crewAppSeenAt })),
+          supervisorAppNotOpened: supervisorAppNotOpened || crewAlerts.some((alert) => alert.kind === CREW_ALERT.SUPERVISOR_APP_NOT_OPENED),
+          trackingSilent: crewAlerts.some((alert) => alert.kind === CREW_ALERT.TRACKING_SILENT),
           points,
           location: location ? { ...location, isLive: now - location.recordedAt.getTime() <= LIVE_FOR_MS } : null,
+          gpsDevice: device
+            ? { deviceId: device.deviceId, isEnabled: device.isEnabled, lastSeenAt: device.lastSeenAt, isOnline: device.isEnabled && !!device.lastSeenAt && now - device.lastSeenAt.getTime() <= deviceStaleMs }
+            : null,
         };
       }),
     };
@@ -507,6 +615,22 @@ class TrackingController {
     return this.tracking.stop(req.user, tripId);
   }
 
+  @Post('heartbeat')
+  @SkipAudit()
+  @HttpCode(200)
+  @RequirePermission('crew.trips', 'crew.track')
+  @ApiOperation({ summary: 'The crew app is open (foreground or a trip screen); feeds the supervisor-inactivity alert' })
+  heartbeat(@Req() req, @Body() dto: HeartbeatDto) {
+    return this.tracking.heartbeat(req.user, dto);
+  }
+
+  @Get('trips/:tripId/crew-status')
+  @RequirePermission('trips.view', 'trips.manage')
+  @ApiOperation({ summary: "Supervisors' app activity, position source, GPS device and watchdog alerts for one trip" })
+  crewStatus(@Param('tripId') tripId: string) {
+    return this.tracking.crewStatus(tripId);
+  }
+
   @Get('live')
   @RequirePermission('trips.view', 'trips.manage')
   @ApiOperation({ summary: 'Trips out now with their last bus position, for the operations map' })
@@ -521,8 +645,81 @@ class TrackingController {
   }
 }
 
+/** A bus's fixed GPS tracker: registered by its id, and given a token it sends with each fix. */
+@ApiTags('GPS devices')
+@Controller('gps-devices')
+@ApiBearerAuth()
+class GpsDevicesController {
+  constructor(private devices: GpsDeviceService) {}
+
+  @Get()
+  @RequirePermission('buses.view', 'trips.view')
+  @ApiOperation({ summary: 'Every bus GPS device with its last report' })
+  list() {
+    return this.devices.list();
+  }
+
+  @Get('buses/:busId')
+  @RequirePermission('buses.view')
+  @ApiOperation({ summary: "A bus's GPS device, or null" })
+  get(@Param('busId') busId: string) {
+    return this.devices.get(busId);
+  }
+
+  @Put('buses/:busId')
+  @RequirePermission('buses.manage')
+  @ApiOperation({ summary: "Register or edit a bus's GPS device" })
+  save(@Param('busId') busId: string, @Body() dto: GpsDeviceDto) {
+    return this.devices.save(busId, dto);
+  }
+
+  @Post('buses/:busId/token')
+  @RequirePermission('buses.manage')
+  @ApiOperation({ summary: 'Generate or rotate the device token; shown only in this answer' })
+  rotateToken(@Param('busId') busId: string) {
+    return this.devices.rotateToken(busId);
+  }
+
+  @Delete('buses/:busId')
+  @RequirePermission('buses.manage')
+  @ApiOperation({ summary: "Remove a bus's GPS device; the phone tracks the bus again" })
+  remove(@Param('busId') busId: string) {
+    return this.devices.remove(busId);
+  }
+}
+
+/**
+ * Where trackers send their fixes, with no sign-in: the device token is the credential. Speaks the OsmAnd/Traccar
+ * HTTP protocol (GET or POST with query parameters, or a form body) and JSON.
+ */
+@ApiTags('GPS devices')
+@Controller('gps')
+class GpsIngestController {
+  constructor(private devices: GpsDeviceService) {}
+
+  @Post('ingest')
+  @Public()
+  @SkipAudit()
+  @HttpCode(200)
+  @Throttle({ default: { limit: 120, ttl: 60_000 } })
+  @ApiOperation({ summary: 'A fix from a bus GPS device (OsmAnd/Traccar protocol or JSON), authenticated by its token' })
+  ingest(@Req() req) {
+    return this.devices.ingest(parseFix(req.query ?? {}, req.body, req.headers ?? {}));
+  }
+
+  /** OsmAnd and some trackers send each fix as a GET with query parameters. */
+  @Get('ingest')
+  @Public()
+  @Throttle({ default: { limit: 120, ttl: 60_000 } })
+  @ApiOperation({ summary: 'The same, as a GET with OsmAnd query parameters' })
+  ingestByGet(@Req() req) {
+    return this.devices.ingest(parseFix(req.query ?? {}, undefined, req.headers ?? {}));
+  }
+}
+
 @Module({
-  controllers: [TrackingController],
-  providers: [TrackingService],
+  controllers: [TrackingController, GpsDevicesController, GpsIngestController],
+  providers: [TrackingService, TripLocationService, GpsDeviceService, CrewWatchdogService],
+  exports: [TripLocationService, CrewWatchdogService, GpsDeviceService],
 })
 export class TrackingModule {}

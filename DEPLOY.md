@@ -362,6 +362,105 @@ New-Item -ItemType Directory -Force D:\Backups\durob
 scp "deploy@SERVER_IP:/var/backups/durob/*.dump" D:\Backups\durob\
 ```
 
+## 12. متابعة الأخطاء (Sentry)
+
+اختياري. من غيره مفيش أي حاجة بتتبعت لبره، والسيرفر شغال زي ما هو. اعمل حساب على sentry.io ومشروعين: واحد **Node.js** للباك إند وواحد **Next.js** للوحة، وخد الـ DSN بتاع كل واحد.
+
+**الباك إند:** ضيف السطور دي لملف الأسرار، وبعدين `sudo systemctl restart durob-api`:
+
+```bash
+sudo tee -a /etc/durob/backend.env >/dev/null <<'EOF'
+SENTRY_DSN=حط_DSN_مشروع_الباك_إند_هنا
+SENTRY_ENVIRONMENT=production
+EOF
+```
+
+- أي خطأ 500 أو شغلانة خلفية فشلت بيوصل Sentry برقم الحساب والمسار بس. هيدر الدخول والكوكيز والتوكنات وأرقام الجوالات والهويات بتتشال قبل ما يخرج.
+- أعطال تطبيق الجوال بتوصل برضه عن طريق السيرفر (`POST /api/v1/monitoring/client-errors`)، فالتطبيق مش محتاج DSN. يتفعل من التطبيق بـ `EXPO_PUBLIC_ERROR_REPORTING=true` في بناء جديد (OTA كفاية، مفيش مكتبة native جديدة).
+
+**اللوحة:** الـ DSN بيتقري وقت البناء، فابني بيه:
+
+```bash
+cd /opt/durob/durob-admin
+NEXT_PUBLIC_API_URL="https://$API_DOMAIN/api/v1" NEXT_PUBLIC_SENTRY_DSN="DSN_مشروع_اللوحة" npm run build
+sudo systemctl restart durob-admin
+```
+
+لو عايز الأخطاء تبان بأسماء الملفات الحقيقية، زوّد وقت البناء `SENTRY_AUTH_TOKEN` و`SENTRY_ORG` و`SENTRY_PROJECT` (من Settings ← Auth Tokens في Sentry). من غيرهم البناء زي ما هو.
+
+## 13. تنبيه لو السيرفر وقع
+
+**فحص الصحة:** `https://$API_DOMAIN/api/v1/health` مفتوح من غير دخول. بيرد `200` و`"status":"ok"` طول ما قاعدة البيانات (وRedis لو متظبط) شغالين، و`503` لو حاجة منهم واقعة. مفيهوش أي بيانات، بس حالة كل جزء وآخر مرة الشغلانات الخلفية اشتغلت.
+
+```bash
+curl -s "https://$API_DOMAIN/api/v1/health"
+```
+
+**مراقب من بره (الأهم):** لأن السيرفر لو وقع مش هيقدر يبلغ عن نفسه. اعمل حساب مجاني على [UptimeRobot](https://uptimerobot.com) أو [Better Stack](https://betterstack.com/uptime):
+
+1. New Monitor ← نوعه **HTTP(s)** (أو Keyword وكلمة `"ok"`).
+2. الرابط: `https://API_DOMAIN/api/v1/health`، كل 1 لـ 5 دقايق.
+3. ضيف إيميلك ورقمك (SMS أو واتساب أو تطبيقهم) في التنبيهات، ويفضل اتنين من الإدارة.
+4. ضيف مراقب تاني للوحة على `https://ADMIN_DOMAIN/`.
+
+**تنبيه من systemd لو الخدمة وقعت ومقدرتش تقوم:** الخدمة بتعيد التشغيل لوحدها (`Restart=on-failure`). لو فشلت أكتر من 5 مرات في 10 دقايق بتقف، والسطور دي بتشغّل سكربت تنبيه ساعتها. السكربت بيبعت لرابط Webhook (مثلًا Better Stack Heartbeat أو قناة Slack/Discord):
+
+```bash
+sudo tee /usr/local/sbin/durob-alert >/dev/null <<'EOF'
+#!/bin/bash
+# $1 = اسم الخدمة اللي وقعت
+URL=$(cat /etc/durob/alert-webhook 2>/dev/null)
+[ -n "$URL" ] && curl -fsS -m 10 -X POST -H 'Content-Type: application/json' \
+  -d "{\"text\":\"Durob: $1 stopped on $(hostname) at $(date -Is)\"}" "$URL" >/dev/null
+logger -t durob-alert "$1 failed"
+EOF
+sudo chmod 755 /usr/local/sbin/durob-alert
+echo 'https://رابط_الـWebhook' | sudo tee /etc/durob/alert-webhook >/dev/null
+sudo chmod 640 /etc/durob/alert-webhook
+
+sudo tee /etc/systemd/system/durob-alert@.service >/dev/null <<'EOF'
+[Unit]
+Description=Alert that %i failed
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/durob-alert %i
+EOF
+
+sudo mkdir -p /etc/systemd/system/durob-api.service.d
+sudo tee /etc/systemd/system/durob-api.service.d/alert.conf >/dev/null <<'EOF'
+[Unit]
+StartLimitIntervalSec=600
+StartLimitBurst=5
+OnFailure=durob-alert@%n.service
+EOF
+sudo systemctl daemon-reload
+```
+
+جرّب التنبيه: `sudo systemctl start durob-alert@test.service`. ولو حابب تشوف الأخطاء الأخيرة من السجل: `sudo journalctl -u durob-api -p err --since "1 hour ago" --no-pager`.
+
+**تنبيهات جوه النظام:** فيه شغلانة بتلف كل دقيقة على الرحلات، وبتبلغ المدير والمسؤولين عن الرحلات (إشعار في اللوحة وعلى الجوال) مرة واحدة لكل رحلة لو:
+
+- المشرف مافتحش التطبيق قبل الانطلاق بالمدة اللي في الإعدادات (افتراضيًا 60 دقيقة)، وبتبعت للمشرف تذكير.
+- موقع الباص انقطع أثناء الرحلة (لا من الجوال ولا من جهاز GPS) أكتر من المدة اللي في الإعدادات (افتراضيًا 15 دقيقة).
+
+المدد دي بتتغير من الإعدادات ← الحجز والتشغيل. وآخر مرة الشغلانة دي اشتغلت بتظهر في `workers` في رد `/health`؛ لو وقفت أكتر من كام دقيقة يبقى فيه مشكلة.
+
+## 14. جهاز GPS ثابت في الباص
+
+اختياري. من غيره الموقع بييجي من جوال المشرف زي الأول. ولو الاتنين شغالين، الخريطة بتعتمد الجهاز، ولو الجهاز سكت (افتراضيًا 3 دقايق) بترجع لجوال المشرف لوحدها.
+
+1. من اللوحة: الباصات ← زرار **جهاز GPS** جنب الباص ← اكتب رقم الجهاز (IMEI أو المعرّف) ← تسجيل ← **إصدار رمز الجهاز**. الرمز بيظهر **مرة واحدة بس**، انسخه على طول. لو ضاع اعمل رمز جديد، والقديم بيقف فورًا.
+2. على الجهاز (أو تطبيق Traccar Client على جوال ثابت في الباص): بروتوكول **OsmAnd**، والعنوان:
+   `https://API_DOMAIN/api/v1/gps/ingest?token=الرمز` ومعرّف الجهاز نفس الرقم اللي سجلته. الصفحة في اللوحة فيها الروابط جاهزة للنسخ.
+3. الأجهزة اللي بتتكلم بروتوكولات خاصة (GT06 وغيرها) شغّلها على سيرفر Traccar، وفعّل فيه `forward.url` بالقالب الموجود في نفس الصفحة.
+
+الموقع بيتقبل بس في ساعات تتبع رحلة الباص ده مسند ليها (نفس مواعيد بث الجوال). وصفحة التتبع بتوضح مصدر كل موقع (جهاز/جوال) وحالة الجهاز (متصل/غير متصل).
+
+## 15. الاختبارات التلقائية على GitHub
+
+الملف `.github/workflows/ci.yml` بيشغّل مع كل push وpull request: تثبيت المكتبات، الـ migrations على PostgreSQL مؤقت، فحص الأنواع، البناء، واختبارات e2e. مش محتاج أي secrets: القاعدة بتتعمل جوه GitHub وبتتمسح بعدها، والأسرار التجريبية موجودة في `test/setup-env.ts`. النتيجة بتظهر في تبويب **Actions** في الريبو. لو حابب تمنع الدمج لو فشلت: Settings ← Branches ← Branch protection ← Require status checks ← اختار `test`.
+
 ## تحديث السيرفر بعد أي تعديل
 
 ```bash

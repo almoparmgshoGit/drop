@@ -11,24 +11,55 @@ interface WalletEntry {
   createdById?: string;
   /** Marks the entry as promotional credit that lapses on this date. */
   expiresAt?: Date;
+  /**
+   * On a credit: how much of it pays for transport only. Compensations and promotional credit are wholly so by default;
+   * a refund passes the transport-only part the booking had spent; anything else is ordinary money unless given.
+   * On a debit: the most that may come from transport-only credit (it is used first). Defaults to the whole debit;
+   * paying for a stay passes only the tickets' part, so the rest must come from ordinary money.
+   */
+  transportAmount?: number;
 }
+
+/** Credit of these kinds is a gift from the company, so it buys tickets only, like loyalty points. */
+const TRANSPORT_ONLY_TYPES: WalletTransactionType[] = ['COMPENSATION', 'PROMO_CREDIT'];
+
+const round2 = (n: number) => Math.round(n * 100) / 100;
 
 @Injectable()
 export class WalletService {
   /** Must run inside a transaction so the balance change and its ledger entry commit together. */
   async apply(tx: Prisma.TransactionClient, entry: WalletEntry) {
+    return (await this.applyDetailed(tx, entry)).walletBalance;
+  }
+
+  /** Like apply, and also says how much of the change was transport-only credit. */
+  async applyDetailed(tx: Prisma.TransactionClient, entry: WalletEntry) {
     const { userId, amount } = entry;
+    let transportAmount = 0;
     if (amount < 0) {
-      const debited = await tx.user.updateMany({
-        where: { id: userId, walletBalance: { gte: -amount } },
-        data: { walletBalance: { decrement: -amount } },
-      });
-      if (debited.count === 0) {
-        throw new ConflictException('رصيد المحفظة غير كافٍ');
+      const debit = -amount;
+      // Locked so two payments at once cannot both spend the same transport-only credit.
+      const [row] = await tx.$queryRaw<{ walletBalance: Prisma.Decimal; walletTransportBalance: Prisma.Decimal }[]>`
+        SELECT "walletBalance", "walletTransportBalance" FROM "User" WHERE "id" = ${userId} FOR UPDATE`;
+      const balance = Number(row?.walletBalance ?? 0);
+      const transportBalance = Math.min(balance, Number(row?.walletTransportBalance ?? 0));
+      if (balance < debit) throw new ConflictException('رصيد المحفظة غير كافٍ');
+      transportAmount = round2(Math.max(0, Math.min(transportBalance, entry.transportAmount ?? debit, debit)));
+      if (round2(debit - transportAmount) > round2(balance - transportBalance)) {
+        throw new ConflictException('رصيد التعويضات والرصيد الترويجي للنقل فقط، ولا يكفي الرصيد الأساسي لباقي المبلغ');
       }
-      if (entry.type !== 'PROMO_EXPIRED') await this.consumePromo(tx, userId, -amount);
+      await tx.user.update({
+        where: { id: userId },
+        data: { walletBalance: { decrement: debit }, walletTransportBalance: round2(transportBalance - transportAmount) },
+      });
+      if (entry.type !== 'PROMO_EXPIRED') await this.consumePromo(tx, userId, debit);
     } else {
-      await tx.user.update({ where: { id: userId }, data: { walletBalance: { increment: amount } } });
+      const byDefault = TRANSPORT_ONLY_TYPES.includes(entry.type) ? amount : 0;
+      transportAmount = round2(Math.max(0, Math.min(amount, entry.transportAmount ?? byDefault)));
+      await tx.user.update({
+        where: { id: userId },
+        data: { walletBalance: { increment: amount }, ...(transportAmount > 0 && { walletTransportBalance: { increment: transportAmount } }) },
+      });
     }
 
     const user = await tx.user.findUniqueOrThrow({ where: { id: userId }, select: { walletBalance: true } });
@@ -41,10 +72,11 @@ export class WalletService {
         balanceAfter: user.walletBalance,
         bookingId: entry.bookingId,
         createdById: entry.createdById,
+        transportAmount,
         ...(entry.expiresAt && { expiresAt: entry.expiresAt, promoRemaining: amount }),
       },
     });
-    return user.walletBalance;
+    return { walletBalance: user.walletBalance, transportAmount };
   }
 
   /** Money leaving the wallet uses promotional credit first, the soonest to expire first, so the customer loses as little as possible. */

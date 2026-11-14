@@ -272,6 +272,26 @@ describe('Vehicles and weekly trips (e2e)', () => {
     await request(http()).get(`${API}/trips/admin/all?from=lastYear`).set(admin.auth).expect(400);
   });
 
+  it('lists from now nearest departure first, with each trip expected revenue, and a date range by Riyadh day', async () => {
+    const past = await createTrip();
+    await prisma.trip.update({ where: { id: past.id }, data: { departureTime: new Date(Date.now() - 2 * DAY), arrivalTime: new Date(Date.now() - 2 * DAY + 5 * 3_600_000) } });
+    const far = await createTrip();
+    const near = await createTrip();
+    await prisma.trip.update({ where: { id: far.id }, data: { departureTime: new Date(Date.now() + 300 * DAY), arrivalTime: new Date(Date.now() + 300 * DAY + 5 * 3_600_000) } });
+    await prisma.trip.update({ where: { id: near.id }, data: { departureTime: new Date(Date.now() + 3_600_000), arrivalTime: new Date(Date.now() + 6 * 3_600_000) } });
+
+    const upcoming = (await request(http()).get(`${API}/trips/admin/all?from=now`).set(admin.auth).expect(200)).body;
+    expect(upcoming.some((row: any) => row.id === past.id)).toBe(false);
+    expect(upcoming[0].id).toBe(near.id);
+    const times = upcoming.map((row: any) => new Date(row.departureTime).getTime());
+    expect(times).toEqual([...times].sort((a, b) => a - b));
+    expect(upcoming.every((row: any) => typeof row.expectedRevenue === 'number')).toBe(true);
+
+    await request(http()).get(`${API}/trips/admin/all?from=2026-02-02&to=2026-02-01`).set(admin.auth).expect(400);
+    const occupancy = (await request(http()).get(`${API}/trips/admin/occupancy`).set(admin.auth).expect(200)).body;
+    expect(occupancy).toMatchObject({ windowDays: 30, executed: expect.any(Object), next30: expect.any(Object), umrah: expect.any(Object), madinah: expect.any(Object) });
+  });
+
   it('copies a trip to a new date as a one-off draft with a new number and no bookings', async () => {
     const source = await createTrip({ tripStatus: 'PUBLISHED' });
     const departure = new Date(new Date(source.departureTime).getTime() + 10 * DAY + 2 * 3_600_000);

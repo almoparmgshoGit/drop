@@ -349,7 +349,9 @@ export class StationAlertsService {
           tx.booking.count({ where: { userId: heldByUserId, createdAt: { gte: new Date(heldUntil!.getTime() - HOLD_GRACE_MS) } } }),
           tx.trip.findUnique({ where: { id: tripId }, select: { tripCode: true, origin: true, destination: true, departureTime: true, hijriDate: true } }),
         ]);
-        if (user?.role === 'PASSENGER' && booked === 0 && trip && trip.departureTime.getTime() > now.getTime()) {
+        // Seats offered from the waiting list have their own message when the offer ends.
+        const offered = await tx.waitlistEntry.count({ where: { tripId, userId: heldByUserId, offeredAt: { gte: new Date(heldUntil!.getTime() - 24 * HOUR_MS) } } });
+        if (user?.role === 'PASSENGER' && booked === 0 && offered === 0 && trip && trip.departureTime.getTime() > now.getTime()) {
           await this.notifications.toUser(tx, 'PAYMENT_INCOMPLETE', heldByUserId, tripValues(trip));
         }
       }, TX_OPTIONS);

@@ -1,6 +1,7 @@
 import { INestApplication } from '@nestjs/common';
 import * as request from 'supertest';
 import { PrismaService } from '../src/common/services/prisma.service';
+import { SosEscalationService } from '../src/modules/trip-reports/sos-escalation.service';
 import { API, createStaff, createTestApp, loginPassenger, loginStaff, nextPhone, openBoarding, resetDatabase, tripPayload } from './helpers';
 
 const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0, 0, 0]);
@@ -407,7 +408,7 @@ describe('Bus position, ticket points and crew reports', () => {
       expect((await request(http()).get(`${API}/trip-reports?category=SOS`).set(admin.auth).expect(200)).body.items).toHaveLength(1);
       expect((await request(http()).get(`${API}/trip-reports?status=RESOLVED`).set(admin.auth).expect(200)).body.items[0].id).toBe(solved.id);
       expect((await request(http()).get(`${API}/trip-reports?search=${sos.code}`).set(admin.auth).expect(200)).body.items[0].id).toBe(sos.id);
-      expect((await request(http()).get(`${API}/trip-reports/counts`).set(admin.auth).expect(200)).body).toEqual({ open: 1, sos: 1 });
+      expect((await request(http()).get(`${API}/trip-reports/counts`).set(admin.auth).expect(200)).body).toEqual({ open: 1, sos: 1, unacknowledgedSos: 1 });
     });
 
     it('separates reading reports from handling them', async () => {
@@ -425,6 +426,58 @@ describe('Bus position, ticket points and crew reports', () => {
       const adminUser = await prisma.user.findFirstOrThrow({ where: { role: 'ADMIN' } });
       await prisma.tripReport.create({ data: { tripId: trip.id, type: 'OTHER', details: 'x', createdById: adminUser.id } });
       await expect(prisma.trip.delete({ where: { id: trip.id } })).rejects.toThrow();
+    });
+  });
+
+  describe('SOS acknowledgement, escalation and the bus maintenance log', () => {
+    const file = (session: any, tripId: string, body: object = {}) => request(http()).post(`${API}/tickets/trips/${tripId}/reports`).set(session.auth).send({ type: 'OTHER', details: 'x', ...body });
+
+    it('records who acknowledged an SOS once, tells the crew, and stops it from being escalated', async () => {
+      const { trip, crew, staff } = await setup();
+      const sos = (await file(crew, trip.id, { category: 'SOS', details: 'خطر' }).expect(201)).body;
+      const before = (await request(http()).get(`${API}/trip-reports/sos/active`).set(admin.auth).expect(200)).body;
+      expect(before.unacknowledged.map((row: any) => row.id)).toEqual([sos.id]);
+
+      const acked = (await request(http()).post(`${API}/trip-reports/${sos.id}/acknowledge`).set(admin.auth).expect(201)).body;
+      expect(acked.acknowledgedAt).toBeTruthy();
+      await request(http()).post(`${API}/trip-reports/${sos.id}/acknowledge`).set(admin.auth).expect(201);
+      expect(await prisma.tripReportUpdate.count({ where: { reportId: sos.id } })).toBe(1);
+      expect(await eventsFor(staff.id, 'CREW_SOS_ACKNOWLEDGED')).toHaveLength(1);
+      const seen = (await request(http()).get(`${API}/crew/reports/${sos.id}`).set(crew.auth).expect(200)).body;
+      expect(seen.acknowledgedAt).toBeTruthy();
+
+      const escalation = app.get(SosEscalationService);
+      expect(await escalation.sweep(new Date(Date.now() + 5 * 60_000))).toEqual([]);
+    });
+
+    it('escalates an unacknowledged SOS to the managers after two minutes, once', async () => {
+      const { trip, crew } = await setup();
+      const sos = (await file(crew, trip.id, { category: 'SOS' }).expect(201)).body;
+      const escalation = app.get(SosEscalationService);
+      expect(await escalation.sweep(new Date(Date.now() + 60_000))).toEqual([]);
+      expect(await escalation.sweep(new Date(Date.now() + 3 * 60_000))).toEqual([sos.id]);
+      expect(await escalation.sweep(new Date(Date.now() + 4 * 60_000))).toEqual([]);
+      const adminUser = await prisma.user.findFirstOrThrow({ where: { role: 'ADMIN' } });
+      expect(await eventsFor(adminUser.id, 'STAFF_SOS_ESCALATED')).toHaveLength(1);
+    });
+
+    it('opens a maintenance entry for the trip bus on a breakdown, and lets the office manage the log', async () => {
+      const { trip, crew } = await setup();
+      const bus = await prisma.bus.create({ data: { plateNumber: `T-${Date.now()}`, model: 'Test' } });
+      await prisma.trip.update({ where: { id: trip.id }, data: { busId: bus.id } });
+      const breakdown = (await file(crew, trip.id, { type: 'BREAKDOWN', details: 'عطل في المكابح' }).expect(201)).body;
+      await file(crew, trip.id, { type: 'DELAY', details: 'تأخير' }).expect(201);
+
+      const log = (await request(http()).get(`${API}/buses/${bus.id}/maintenance`).set(admin.auth).expect(200)).body;
+      expect(log.items).toHaveLength(1);
+      expect(log.items[0]).toMatchObject({ reportId: breakdown.id, tripCode: trip.tripCode, status: 'OPEN', type: 'BREAKDOWN' });
+
+      const added = (await request(http()).post(`${API}/buses/${bus.id}/maintenance`).set(admin.auth).send({ type: 'PREVENTIVE', description: 'تغيير زيت', cost: 250 }).expect(201)).body;
+      const done = (await request(http()).patch(`${API}/buses/maintenance/${added.id}`).set(admin.auth).send({ status: 'DONE' }).expect(200)).body;
+      expect(done.resolvedAt).toBeTruthy();
+      expect(done.cost).toBe(250);
+      await request(http()).delete(`${API}/buses/maintenance/${added.id}`).set(admin.auth).expect(200);
+      await request(http()).post(`${API}/buses/${bus.id}/maintenance`).set(crew.auth).send({ description: 'x' }).expect(403);
     });
   });
 });

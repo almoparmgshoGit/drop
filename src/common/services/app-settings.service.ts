@@ -10,6 +10,12 @@ export const NUMBER_SETTINGS = {
   trackingClosesAfterHours: 2,
   supervisorContactOpensBeforeHours: 24,
   arrivalRadiusMeters: 300,
+  /** From this many minutes before departure, a trip whose supervisor has not opened the app is raised to the office. */
+  supervisorAppCheckBeforeMinutes: 60,
+  /** A trip on the road with no position for this long is raised to the office. */
+  trackingSilentAlertMinutes: 15,
+  /** A bus's GPS device silent this long counts as offline, and the supervisor's phone takes over the map. */
+  gpsDeviceStaleMinutes: 3,
   defaultCrewOpensBeforeMinutes: 1440,
   defaultBoardingOpensBeforeMinutes: 120,
   defaultBoardingClosesAfterMinutes: 60,
@@ -58,6 +64,8 @@ export const NUMBER_SETTINGS = {
   scheduleGenerateDaysBefore: 10,
   /** With bookings opening some days before the month, how many. */
   scheduleOpenDaysBefore: 7,
+  /** How long seats offered to the next customer on a full trip's waiting list stay held for them. */
+  waitlistOfferMinutes: 30,
 } as const;
 
 /** When booking opens on a weekly trip's monthly draft: once published, on the 1st of its month, or some days before that. */
@@ -71,6 +79,8 @@ export const FLAG_SETTINGS = {
   registrationEnabled: true,
   /** Off by default: it moves money with nobody approving each payment. */
   ticketCompensationAutomatic: false,
+  /** Customers may join the waiting list of a full trip from the app. */
+  waitlistEnabled: true,
 } as const;
 
 export type NumberSetting = keyof typeof NUMBER_SETTINGS;

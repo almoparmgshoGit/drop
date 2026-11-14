@@ -36,10 +36,8 @@ export class DeliveryWorkerService implements OnModuleInit, OnModuleDestroy {
     this.every(DELIVERY_SWEEP_MS, 'campaigns', () => this.campaigns.sweep());
     this.every(STATION_SWEEP_MS, 'stations', () => this.stations.sweep());
     this.every(STATION_SWEEP_MS, 'passenger-reminders', () => this.stations.sweepPassengerReminders());
-    this.every(SLOW_SWEEP_MS, 'reminders', async () => {
-      await this.stations.sweepDayBeforeReminders();
-      await this.stations.sweepExpiredHolds();
-    });
+    // The day-before reminder is now sent per booking, with the 2-hour one, by TripRemindersService (trip-followup).
+    this.every(SLOW_SWEEP_MS, 'reminders', () => this.stations.sweepExpiredHolds());
   }
 
   onModuleDestroy() {

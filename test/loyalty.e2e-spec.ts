@@ -425,62 +425,78 @@ describe('Loyalty program (e2e)', () => {
     });
   });
 
-  describe('vouchers', () => {
+  describe('top-up vouchers', () => {
     const createVoucher = async (body = {}) =>
-      (await request(http()).post(`${API}/loyalty/vouchers`).set(admin.auth).send({ name: 'قسيمة 15', pointsCost: 500, value: 15, ...body }).expect(201)).body;
-    const redeem = (user: any, id: string) => request(http()).post(`${API}/users/profile/loyalty/vouchers/${id}/redeem`).set(user.auth);
+      (await request(http()).post(`${API}/loyalty/vouchers`).set(admin.auth).send({ name: 'شحن 100', pointsCost: 500, price: 95, value: 100, bonusPoints: 50, ...body }).expect(201)).body;
+    const purchase = (user: any, id: string, body: object) => request(http()).post(`${API}/vouchers/${id}/purchase`).set(user.auth).send(body);
+    const redeemCode = (user: any, code: string) => request(http()).post(`${API}/vouchers/redeem`).set(user.auth).send({ code });
+    const walletOf = async (user: any) => {
+      const row = await prisma.user.findUniqueOrThrow({ where: { id: user.user.id }, select: { walletBalance: true, walletTransportBalance: true } });
+      return { total: Number(row.walletBalance), transport: Number(row.walletTransportBalance) };
+    };
 
-    it('sells a voucher for points, usable once and only by its owner', async () => {
+    it('sells cards for points, each with its own code, redeemable once by whoever has it', async () => {
       const voucher = await createVoucher();
-      const user = await loginPassenger(app);
-      await givePoints(user, 600);
-      const { body } = await redeem(user, voucher.id).expect(201);
-      expect(await balance(user)).toBe(100);
-      expect((await summary(user)).myVouchers[0]).toMatchObject({ code: body.code, value: 15, isUsed: false });
+      const buyer = await loginPassenger(app);
+      await givePoints(buyer, 1200);
+      const { body } = await purchase(buyer, voucher.id, { quantity: 2, method: 'POINTS' }).expect(201);
+      expect(await balance(buyer)).toBe(200);
+      expect(body.cards).toHaveLength(2);
+      expect(body.cards[0].code).not.toBe(body.cards[1].code);
+      expect(body.cards[0].qr).toMatch(/^DUROB-TOPUP:/);
 
-      const trip = await createTrip({ price: 100 });
-      const stranger = await loginPassenger(app);
-      await quote(stranger, trip, ['5'], { couponCode: body.code }).expect(400);
+      // A friend scans the QR: they get the balance and the bonus points, the buyer gets nothing more.
+      const friend = await loginPassenger(app);
+      const redeemed = await redeemCode(friend, body.cards[0].qr).expect(201);
+      expect(redeemed.body).toMatchObject({ value: 100, bonusPoints: 50 });
+      expect(await walletOf(friend)).toEqual({ total: 100, transport: 0 });
+      expect(await balance(friend)).toBe(50);
+      await redeemCode(buyer, body.cards[0].code).expect(409);
 
-      // Fixed for the whole booking, not per seat.
-      const q = await quote(user, trip, ['1', '2'], { couponCode: body.code }).expect(201);
-      expect(q.body.couponDiscount).toBe(15);
-      await book(user, trip, ['1', '2'], { couponCode: body.code });
-      await bookRaw(user, trip, ['3'], { couponCode: body.code }).expect(400);
-      expect((await summary(user)).myVouchers[0].isUsed).toBe(true);
+      // Typed by hand without dashes works too.
+      await redeemCode(buyer, body.cards[1].code.replace(/-/g, '').toLowerCase()).expect(201);
+      const mine = (await request(http()).get(`${API}/vouchers/mine`).set(buyer.auth).expect(200)).body;
+      expect(mine.map((c: any) => c.status).sort()).toEqual(['REDEEMED', 'REDEEMED']);
     });
 
-    it('refuses without enough points, and stays out of the marketing coupon list', async () => {
-      const voucher = await createVoucher();
+    it('sells for money in simulated mode and adds transport-only balance when the voucher says so', async () => {
+      const voucher = await createVoucher({ pointsCost: null, creditTransportOnly: true });
       const user = await loginPassenger(app);
-      await givePoints(user, 100);
-      await redeem(user, voucher.id).expect(409);
-      expect(await balance(user)).toBe(100);
-      await givePoints(user, 500);
-      await redeem(user, voucher.id).expect(201);
-      const coupons = await request(http()).get(`${API}/coupons`).set(admin.auth).expect(200);
-      expect(coupons.body).toHaveLength(0);
+      const { body } = await purchase(user, voucher.id, { quantity: 1, method: 'MONEY', paymentMethod: 'mada' }).expect(201);
+      expect(body.amount).toBe(95);
+      await purchase(user, voucher.id, { quantity: 1, method: 'POINTS' }).expect(400);
+      await redeemCode(user, body.cards[0].code).expect(201);
+      expect(await walletOf(user)).toEqual({ total: 100, transport: 100 });
     });
 
-    it('gives the voucher back when the booking is cancelled', async () => {
-      const voucher = await createVoucher();
+    it('keeps to the stock and the most per order', async () => {
+      const voucher = await createVoucher({ stockTotal: 3, maxPerPurchase: 2 });
       const user = await loginPassenger(app);
-      await givePoints(user, 500);
-      const { body } = await redeem(user, voucher.id).expect(201);
-      const trip = await createTrip({ price: 100 });
-      const booking = await book(user, trip, ['1'], { couponCode: body.code });
-      await request(http()).post(`${API}/bookings/${booking.id}/admin-cancel`).set(admin.auth).send({ note: 'قرار إداري' }).expect(201);
-      expect((await summary(user)).myVouchers[0].isUsed).toBe(false);
-      await book(user, trip, ['2'], { couponCode: body.code });
+      await purchase(user, voucher.id, { quantity: 3, method: 'MONEY' }).expect(400);
+      await purchase(user, voucher.id, { quantity: 2, method: 'MONEY' }).expect(201);
+      await purchase(user, voucher.id, { quantity: 2, method: 'MONEY' }).expect(409);
+      await purchase(user, voucher.id, { quantity: 1, method: 'MONEY' }).expect(201);
+      const list = (await request(http()).get(`${API}/loyalty/vouchers`).set(admin.auth).expect(200)).body;
+      expect(list[0]).toMatchObject({ soldCount: 3, remaining: 0 });
+      await request(http()).patch(`${API}/loyalty/vouchers/${voucher.id}`).set(admin.auth).send({ stockTotal: 2 }).expect(400);
     });
 
-    it('hides an inactive voucher and refuses to sell it', async () => {
-      const voucher = await createVoucher({ isActive: false });
+    it('refuses expired or unknown codes and hides inactive vouchers', async () => {
+      const voucher = await createVoucher();
       const user = await loginPassenger(app);
-      await givePoints(user, 900);
-      expect((await summary(user)).vouchers).toEqual([]);
-      await redeem(user, voucher.id).expect(404);
-      expect(await balance(user)).toBe(900);
+      const { body } = await purchase(user, voucher.id, { quantity: 1, method: 'MONEY' }).expect(201);
+      await prisma.voucherCard.updateMany({ data: { expiresAt: new Date(Date.now() - 1000) } });
+      await redeemCode(user, body.cards[0].code).expect(409);
+      await redeemCode(user, 'AAAA-BBBB-CCCC-DDDD').expect(404);
+
+      await request(http()).patch(`${API}/loyalty/vouchers/${voucher.id}`).set(admin.auth).send({ isActive: false }).expect(200);
+      expect((await request(http()).get(`${API}/vouchers/catalog`).set(user.auth).expect(200)).body).toEqual([]);
+      await purchase(user, voucher.id, { quantity: 1, method: 'MONEY' }).expect(404);
+    });
+
+    it('needs a price and something to give', async () => {
+      await request(http()).post(`${API}/loyalty/vouchers`).set(admin.auth).send({ name: 'بلا سعر', value: 10 }).expect(400);
+      await request(http()).post(`${API}/loyalty/vouchers`).set(admin.auth).send({ name: 'فارغة', price: 10, value: 0 }).expect(400);
     });
   });
 });

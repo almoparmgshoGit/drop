@@ -26,6 +26,7 @@ import { GalleryImages } from '../../common/utils/gallery.util';
 const trimmed = () => Transform(({ value }) => (typeof value === 'string' ? value.trim() : value));
 const DATE_ONLY = /^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$/;
 const MONTH = /^\d{4}-(0[1-9]|1[0-2])$/;
+const DAY = /^\d{4}-\d{2}-\d{2}$/;
 
 export const PAYMENT_METHODS = ['CASH', 'TRANSFER', 'CHEQUE'] as const;
 
@@ -239,6 +240,15 @@ export class StatementQuery {
   @IsOptional()
   @Matches(MONTH)
   month?: string;
+
+  /** Riyadh days YYYY-MM-DD, both included; when both are given they replace the month. */
+  @IsOptional()
+  @Matches(DAY, { message: 'التاريخ غير صحيح' })
+  from?: string;
+
+  @IsOptional()
+  @Matches(DAY, { message: 'التاريخ غير صحيح' })
+  to?: string;
 }
 
 export class UpdateTripCostDto {

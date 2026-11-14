@@ -4,7 +4,7 @@ import { InvoiceLedgerService } from '../../common/services/invoice-ledger.servi
 import { PrismaService } from '../../common/services/prisma.service';
 import { vatInside } from '../../common/utils/invoice.util';
 import { halalas, hotelBookingCost, netBookingFigures } from '../../common/utils/payment.util';
-import { riyadhDate, riyadhDayRange, riyadhMonthRange } from '../../common/utils/time.util';
+import { riyadhDate, riyadhDayRange, riyadhDaysRange, riyadhMonthRange } from '../../common/utils/time.util';
 import { journeyCodeOf } from '../../common/utils/trip-code.util';
 import { readInvoiceFiles, UploadedInvoice } from '../cash/cash.service';
 import { AccountView, CreateCategoryDto, CreateEntryDto, TripAccountsQuery, UpdateCategoryDto, UpdateTaxFlagsDto } from './trip-accounts.dto';
@@ -21,6 +21,9 @@ const ACCOUNT_SELECT = {
   destination: true,
   departureTime: true,
   tripStatus: true,
+  executedAt: true,
+  financeClosedAt: true,
+  financeClosedByName: true,
   totalSeats: true,
   busRentalPrice: true,
   bookings: {
@@ -208,6 +211,35 @@ function legsOf(trip: AccountTrip & { reverseTrip: AccountTrip | null }) {
   return counts ? [trip, back] : [trip];
 }
 
+/** A leg is over once executed (an hour after departure), completed, or cancelled. */
+const legEnded = (leg: { executedAt: Date | null; tripStatus: TripStatus }) => !!leg.executedAt || leg.tripStatus === 'COMPLETED' || leg.tripStatus === 'CANCELLED';
+const ENDED_LEG: Prisma.TripWhereInput = { OR: [{ executedAt: { not: null } }, { tripStatus: { in: ['COMPLETED', 'CANCELLED'] } }] };
+
+export type ClosingState = 'OPEN' | 'AWAITING_CLOSE' | 'CLOSED';
+
+/** Where a DR journey is in its financial closing: still running, executed and waiting for the office to close it, or closed. */
+function closingOf(outbound: { financeClosedAt: Date | null }, legs: { executedAt: Date | null; tripStatus: TripStatus }[]): ClosingState {
+  if (outbound.financeClosedAt) return 'CLOSED';
+  return legs.every(legEnded) ? 'AWAITING_CLOSE' : 'OPEN';
+}
+
+/** The same as closingOf, as a query on the way there; a way back that never ran does not hold the journey open. */
+const CLOSING_WHERE: Record<ClosingState, Prisma.TripWhereInput> = {
+  CLOSED: { financeClosedAt: { not: null } },
+  AWAITING_CLOSE: { financeClosedAt: null, AND: [ENDED_LEG, { OR: [{ reverseTrip: null }, { reverseTrip: ENDED_LEG }] }] },
+  OPEN: { financeClosedAt: null, OR: [{ NOT: ENDED_LEG }, { reverseTrip: { NOT: ENDED_LEG } }] },
+};
+
+/** A cancelled trip only belongs on the accounts page if money was spent or kept on it, or its way back still runs. */
+const ON_ACCOUNTS_PAGE: Prisma.TripWhereInput = {
+  OR: [
+    { tripStatus: { in: ['PUBLISHED', 'COMPLETED'] } },
+    { tripStatus: 'CANCELLED', accountEntries: { some: { voidedAt: null } } },
+    { tripStatus: 'CANCELLED', custodies: { some: { status: 'SETTLED' } } },
+    { tripStatus: 'CANCELLED', reverseTrip: { tripStatus: { in: ['PUBLISHED', 'COMPLETED'] } } },
+  ],
+};
+
 const figuresInSar = (figures: Figures) => ({
   tickets: sar(figures.tickets),
   otherIncome: sar(figures.otherIncome),
@@ -235,6 +267,15 @@ function viewRange(view: Exclude<AccountView, 'trip'>, date: string) {
   return { gte: start, lt: new Date(start.getTime() + 7 * DAY_MS) };
 }
 
+/** A chosen period (from/to, both included) for the month view; capped so one request cannot sweep years of trips. */
+const MAX_PERIOD_DAYS = 366;
+function daysRange(from: string, to: string) {
+  const range = riyadhDaysRange(from, to);
+  if (!range) throw new BadRequestException('التاريخ غير صحيح');
+  if (range.lt.getTime() - range.gte.getTime() > MAX_PERIOD_DAYS * DAY_MS) throw new BadRequestException('الفترة أطول من سنة');
+  return range;
+}
+
 @Injectable()
 export class TripAccountsService {
   constructor(
@@ -245,7 +286,7 @@ export class TripAccountsService {
   async list(query: TripAccountsQuery) {
     const view = query.view ?? 'week';
     const date = query.date ?? riyadhDate(new Date());
-    const range = view === 'trip' ? null : viewRange(view, date);
+    const range = view === 'trip' ? null : view === 'month' && query.from && query.to ? daysRange(query.from, query.to) : viewRange(view, date);
 
     const where: Prisma.TripWhereInput = {
       // One row per DR journey: a way back is counted inside the trip it returns from.
@@ -253,22 +294,15 @@ export class TripAccountsService {
       ...(range && { departureTime: range }),
       ...(query.destination && { destination: query.destination }),
       AND: [
+        ...(query.closing ? [CLOSING_WHERE[query.closing]] : []),
         ...(query.q
           ? [{ OR: [{ tripCode: { contains: query.q, mode: 'insensitive' as const } }, { reverseTrip: { tripCode: { contains: query.q, mode: 'insensitive' as const } } }] }]
           : []),
-        {
-          // A cancelled trip only belongs here if money was spent or kept on it, or its way back still runs.
-          OR: [
-            { tripStatus: { in: ['PUBLISHED', 'COMPLETED'] } },
-            { tripStatus: 'CANCELLED', accountEntries: { some: { voidedAt: null } } },
-            { tripStatus: 'CANCELLED', custodies: { some: { status: 'SETTLED' } } },
-            { tripStatus: 'CANCELLED', reverseTrip: { tripStatus: { in: ['PUBLISHED', 'COMPLETED'] } } },
-          ],
-        },
+        ON_ACCOUNTS_PAGE,
       ],
     };
 
-    const [trips, total, destinations] = await Promise.all([
+    const [trips, total, destinations, awaitingClose] = await Promise.all([
       this.prisma.trip.findMany({
         where,
         orderBy: { departureTime: view === 'trip' ? 'desc' : 'asc' },
@@ -277,6 +311,8 @@ export class TripAccountsService {
       }),
       this.prisma.trip.count({ where }),
       this.prisma.trip.findMany({ where: { tripStatus: { not: 'DRAFT' } }, distinct: ['destination'], select: { destination: true }, orderBy: { destination: 'asc' } }),
+      // Whatever the period shown, the office sees how many executed trips still wait for their closing.
+      this.prisma.trip.count({ where: { reverseOfTripId: null, AND: [ON_ACCOUNTS_PAGE, CLOSING_WHERE.AWAITING_CLOSE] } }),
     ]);
 
     const rows = trips.map((trip) => ({ trip, legs: legsOf(trip), figures: journeyFigures(legsOf(trip)) }));
@@ -298,6 +334,7 @@ export class TripAccountsService {
         net: sar(revenue - expenses),
         unfinished: rows.filter((row) => row.trip.tripStatus === 'PUBLISHED' && row.trip.departureTime > now).length,
         best: best && { tripCode: best.trip.tripCode, net: sar(best.figures.net) },
+        awaitingClose,
       },
       items: rows.map(({ trip, legs, figures }) => ({
         id: trip.id,
@@ -306,6 +343,10 @@ export class TripAccountsService {
         destination: trip.destination,
         departureTime: trip.departureTime,
         tripStatus: trip.tripStatus,
+        executedAt: trip.executedAt,
+        closing: closingOf(trip, legs),
+        financeClosedAt: trip.financeClosedAt,
+        financeClosedByName: trip.financeClosedByName,
         rentMissing: legs.some((leg) => leg.tripStatus !== 'CANCELLED' && leg.busRentalPrice === null),
         // Each leg's own share, for the row that opens up into D and R.
         legs: legs.map((leg, index) => ({
@@ -389,11 +430,19 @@ export class TripAccountsService {
         destination: trip.destination,
         departureTime: trip.departureTime,
         tripStatus: trip.tripStatus,
+        executedAt: trip.executedAt,
         totalSeats: trip.totalSeats,
         busPlate: trip.bus?.plateNumber ?? null,
         officeName: trip.bus?.office?.name ?? null,
       },
       vatRate,
+      // The journey closes as one account, on its way there.
+      closing: {
+        state: closingOf(outbound, journeyLegs),
+        tripId: outbound.id,
+        closedAt: outbound.financeClosedAt,
+        closedByName: outbound.financeClosedByName,
+      },
       figures: figuresInSar(figures),
       journey:
         journeyLegs.length > 1
@@ -447,6 +496,7 @@ export class TripAccountsService {
     ]);
     if (!trip) throw new NotFoundException('الرحلة غير موجودة');
     if (trip.tripStatus === 'DRAFT') throw new ConflictException('هذه الرحلة ما زالت مسودة');
+    await this.assertAccountOpen(tripId);
     if (!category || !category.isActive) throw new BadRequestException('هذا البند غير متاح');
     if (AUTOMATIC_GROUPS.includes(category.group)) throw new BadRequestException('هذا البند يُحسب تلقائيًا من بيانات الرحلة، فلا يُسجّل يدويًا');
     const chargedTo = dto.chargedTo ?? 'OFFICE';
@@ -502,6 +552,8 @@ export class TripAccountsService {
   }
 
   async voidEntry(actor: { name?: string | null }, id: string, reason: string) {
+    const entry = await this.prisma.tripAccountEntry.findUnique({ where: { id }, select: { tripId: true } });
+    if (entry) await this.assertAccountOpen(entry.tripId);
     const voided = await this.prisma.tripAccountEntry.updateMany({
       where: { id, voidedAt: null },
       data: { voidedAt: new Date(), voidedByName: actor.name ?? null, voidReason: reason },
@@ -511,6 +563,48 @@ export class TripAccountsService {
       if (!exists) throw new NotFoundException('هذا القيد غير موجود');
       throw new ConflictException('هذا القيد ملغى مسبقًا');
     }
+    return { success: true };
+  }
+
+  /** A closed account is final: reopen it before changing its lines. */
+  private async assertAccountOpen(tripId: string) {
+    const trip = await this.prisma.trip.findUnique({ where: { id: tripId }, select: { financeClosedAt: true, reverseOf: { select: { financeClosedAt: true } } } });
+    if (trip?.financeClosedAt || trip?.reverseOf?.financeClosedAt) throw new ConflictException('تم الإغلاق المالي لهذه الرحلة، أعد فتح حسابها أولًا');
+  }
+
+  /** The journey's outbound with both legs, whichever leg was asked for. */
+  private async journeyOf(tripId: string) {
+    const trip = await this.prisma.trip.findUnique({
+      where: { id: tripId },
+      select: {
+        id: true,
+        executedAt: true,
+        tripStatus: true,
+        financeClosedAt: true,
+        reverseTrip: { select: { executedAt: true, tripStatus: true } },
+        reverseOf: { select: { id: true, executedAt: true, tripStatus: true, financeClosedAt: true, reverseTrip: { select: { executedAt: true, tripStatus: true } } } },
+      },
+    });
+    if (!trip) throw new NotFoundException('الرحلة غير موجودة');
+    const outbound = trip.reverseOf ?? trip;
+    return { outbound, legs: [outbound, ...(outbound.reverseTrip ? [outbound.reverseTrip] : [])] };
+  }
+
+  /** Financial closing: once the journey was executed, the office reviews its account and closes it. */
+  async close(actor: { name?: string | null }, tripId: string) {
+    const { outbound, legs } = await this.journeyOf(tripId);
+    if (outbound.tripStatus === 'DRAFT') throw new ConflictException('هذه الرحلة ما زالت مسودة');
+    if (outbound.financeClosedAt) throw new ConflictException('تم الإغلاق المالي لهذه الرحلة مسبقًا');
+    if (!legs.every(legEnded)) throw new ConflictException('لا يُغلق حساب الرحلة ماليًا قبل تنفيذها');
+    const closed = await this.prisma.trip.updateMany({ where: { id: outbound.id, financeClosedAt: null }, data: { financeClosedAt: new Date(), financeClosedByName: actor.name ?? null } });
+    if (closed.count === 0) throw new ConflictException('تم الإغلاق المالي لهذه الرحلة مسبقًا');
+    return { success: true };
+  }
+
+  async reopen(tripId: string) {
+    const { outbound } = await this.journeyOf(tripId);
+    const reopened = await this.prisma.trip.updateMany({ where: { id: outbound.id, financeClosedAt: { not: null } }, data: { financeClosedAt: null, financeClosedByName: null } });
+    if (reopened.count === 0) throw new ConflictException('حساب هذه الرحلة مفتوح');
     return { success: true };
   }
 

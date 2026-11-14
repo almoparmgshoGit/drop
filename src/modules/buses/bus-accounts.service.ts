@@ -1,7 +1,7 @@
 import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../common/services/prisma.service';
-import { riyadhMonth, riyadhMonthRange } from '../../common/utils/time.util';
+import { riyadhDaysRange, riyadhMonth, riyadhMonthRange } from '../../common/utils/time.util';
 import { toHalalas, toSar } from '../bookings/bookings.service';
 import { CreateBusOfficeDto, CreateOfficePaymentDto, UpdateBusOfficeDto, UpdateTripCostDto } from './buses.dto';
 
@@ -15,9 +15,22 @@ const assertDistinctRoutes = (rates: { origin: string; destination: string }[] =
 };
 
 /** Everything an office is owed for a month, in halalas so the totals add up exactly. */
-const fetchMonthTrips = (db: Prisma.TransactionClient, officeId: string, month: string) =>
+/** Every month YYYY-MM from `first` to `last`, both included. */
+const monthsBetween = (first: string, last: string) => {
+  const [year, month] = first.split('-').map(Number);
+  const months: string[] = [];
+  for (let index = 0; ; index += 1) {
+    const key = new Date(Date.UTC(year, month - 1 + index, 1)).toISOString().slice(0, 7);
+    if (key > last) return months;
+    months.push(key);
+  }
+};
+const MAX_PERIOD_DAYS = 366;
+
+const fetchMonthTrips = (db: Prisma.TransactionClient, officeId: string, month: string) => fetchTrips(db, officeId, riyadhMonthRange(month));
+const fetchTrips = (db: Prisma.TransactionClient, officeId: string, departureTime: { gte: Date; lt: Date }) =>
   db.trip.findMany({
-    where: { bus: { officeId }, departureTime: riyadhMonthRange(month), tripStatus: { in: ['PUBLISHED', 'COMPLETED'] } },
+    where: { bus: { officeId }, departureTime, tripStatus: { in: ['PUBLISHED', 'COMPLETED'] } },
     orderBy: { departureTime: 'asc' },
     select: {
       id: true,
@@ -76,14 +89,42 @@ export class BusAccountsService {
     }, TX_OPTIONS);
   }
 
-  async statement(id: string, month = riyadhMonth(new Date())) {
+  /**
+   * An office's statement for a month, or for a period from/to (Riyadh days, both included). Payments are recorded
+   * against a month, so a period lists the payments of every month it touches, and `monthly` gives each of those
+   * months' own due, paid and remaining, which is what a new payment is checked against.
+   */
+  async statement(id: string, query: { month?: string; from?: string; to?: string } = {}) {
     const office = await this.prisma.busOffice.findUnique({ where: { id }, include: { rates: { orderBy: { origin: 'asc' } } } });
     if (!office) throw new NotFoundException('مكتب الباصات غير موجود');
-    const [trips, payments, buses] = await Promise.all([
-      fetchMonthTrips(this.prisma, id, month),
-      this.prisma.busOfficePayment.findMany({ where: { officeId: id, month }, orderBy: { paidAt: 'asc' } }),
+    let period: { gte: Date; lt: Date };
+    let from: string;
+    let to: string;
+    if (query.from && query.to) {
+      const range = riyadhDaysRange(query.from, query.to);
+      if (!range) throw new BadRequestException('التاريخ غير صحيح');
+      if (range.lt.getTime() - range.gte.getTime() > MAX_PERIOD_DAYS * 24 * 60 * 60 * 1000) throw new BadRequestException('الفترة أطول من سنة');
+      period = range;
+      [from, to] = query.from <= query.to ? [query.from, query.to] : [query.to, query.from];
+    } else {
+      const month = query.month ?? riyadhMonth(new Date());
+      period = riyadhMonthRange(month);
+      from = `${month}-01`;
+      to = new Date(period.lt.getTime() - 1 + 3 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    }
+    const months = monthsBetween(from.slice(0, 7), to.slice(0, 7));
+    const month = months[months.length - 1];
+    const [monthTrips, payments, buses] = await Promise.all([
+      fetchTrips(this.prisma, id, { gte: riyadhMonthRange(months[0]).gte, lt: riyadhMonthRange(month).lt }),
+      this.prisma.busOfficePayment.findMany({ where: { officeId: id, month: { in: months } }, orderBy: { paidAt: 'asc' } }),
       this.prisma.bus.findMany({ where: { officeId: id }, select: { id: true, plateNumber: true }, orderBy: { plateNumber: 'asc' } }),
     ]);
+    const trips = monthTrips.filter((trip) => trip.departureTime >= period.gte && trip.departureTime < period.lt);
+    const monthly = months.map((key) => {
+      const due = monthTrips.filter((trip) => riyadhMonth(trip.departureTime) === key).reduce((sum, trip) => sum + dueOf(trip).due, 0);
+      const paidInMonth = payments.filter((p) => p.month === key && !p.voidedAt).reduce((sum, p) => sum + toHalalas(p.amount), 0);
+      return { month: key, due: toSar(due), paid: toSar(paidInMonth), remaining: toSar(due - paidInMonth) };
+    });
 
     const rateOf = new Map(office.rates.map((rate) => [routeKey(rate.origin, rate.destination), Number(rate.price)]));
     const totals = { rental: 0, driverExpense: 0, delegationExpense: 0, expenses: 0, due: 0 };
@@ -115,6 +156,9 @@ export class BusAccountsService {
 
     return {
       month,
+      from,
+      to,
+      monthly,
       office,
       buses: buses.map((bus) => ({ ...bus, driver: driverOfBus.get(bus.id) ?? null })),
       rows,

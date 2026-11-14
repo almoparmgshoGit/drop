@@ -1,10 +1,11 @@
-import { BookingKind, BookingLeg, CollectionMethod, Gender, IdType, RoomType } from '@prisma/client';
+import { BookingCategory, BookingKind, BookingLeg, CollectionMethod, Gender, IdType, RoomType } from '@prisma/client';
 import { Transform, Type } from 'class-transformer';
 import {
   ArrayMaxSize,
   ArrayMinSize,
   ArrayUnique,
   IsArray,
+  IsBoolean,
   IsDateString,
   IsEmail,
   IsEnum,
@@ -19,11 +20,12 @@ import {
   Max,
   MaxLength,
   Min,
+  NotEquals,
   ValidateIf,
   ValidateNested,
 } from 'class-validator';
 import { ALL_PERMISSIONS } from '../../common/permissions';
-import { GENDERS, NATIONALITIES } from '../../common/profile-options';
+import { CITY_MAX_LENGTH, GENDERS, NATIONALITIES, OTHER_CITY } from '../../common/profile-options';
 import { ID_TYPES } from '../../common/utils/identity.util';
 
 const trimmed = () => Transform(({ value }) => (typeof value === 'string' ? value.trim() : value));
@@ -221,6 +223,18 @@ export class JourneyQuoteDto {
   @Min(0.01, { message: 'السعر النهائي يجب أن يكون أكبر من صفر' })
   @Max(MAX_AMOUNT)
   finalTotal?: number;
+
+  /** Required with a final total that differs from the listed price, and kept on the booking with the employee's name. */
+  @IsOptional()
+  @trimmed()
+  @IsString()
+  @MaxLength(300, { message: 'سبب تعديل السعر 300 حرف على الأكثر' })
+  priceReason?: string;
+
+  /** Whether the customer joins the trip's sightseeing visits. Left out, a trip that offers visits includes them. */
+  @IsOptional()
+  @IsBoolean()
+  withVisits?: boolean;
 }
 
 export class CustomerDto {
@@ -232,6 +246,31 @@ export class CustomerDto {
   @IsString()
   @Length(9, 20, { message: 'رقم الجوال مطلوب' })
   phone: string;
+
+  // The customer's file is complete from the first counter booking; the app's own sign-up asks for these separately.
+  @IsIn(NATIONALITIES, { message: 'اختر جنسية العميل من القائمة' })
+  nationality: string;
+
+  /** A city from the list, or the one typed after choosing "أخرى". */
+  @trimmed()
+  @IsString({ message: 'اختر مدينة العميل' })
+  @Length(2, CITY_MAX_LENGTH, { message: 'اختر مدينة العميل أو اكتب اسمها' })
+  @NotEquals(OTHER_CITY, { message: 'اكتب اسم مدينة العميل' })
+  city: string;
+
+  @IsIn(GENDERS, { message: 'حدد جنس العميل' })
+  gender: Gender;
+
+  @Matches(/^\d{4}-\d{2}-\d{2}$/, { message: 'أدخل تاريخ ميلاد العميل' })
+  birthDate: string;
+
+  @IsIn(ID_TYPES, { message: 'اختر نوع هوية العميل: هوية وطنية أو إقامة أو جواز سفر' })
+  idType: IdType;
+
+  @trimmed()
+  @IsString()
+  @Length(5, 30, { message: 'أدخل رقم هوية العميل' })
+  idNumber: string;
 }
 
 export class JourneyPassengerDto {
@@ -276,6 +315,14 @@ export class JourneyPaymentDto {
 }
 
 export class CreateJourneyDto extends JourneyQuoteDto {
+  /**
+   * Who the seats are for: a family (the default) never sits in the singles section and singles sit only inside it, the
+   * same company rule the app keeps. Seats left for the server are chosen inside the right section.
+   */
+  @IsOptional()
+  @IsEnum(BookingCategory, { message: 'فئة الحجز عائلات أو عزّاب' })
+  category?: BookingCategory;
+
   @IsOptional()
   @IsString()
   @MaxLength(60)

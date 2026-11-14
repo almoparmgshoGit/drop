@@ -7,6 +7,7 @@ import { RoomAllocationService } from './room-allocation.service';
 import { WalletService } from './wallet.service';
 import { InvoiceLedgerService } from './invoice-ledger.service';
 import { PaymentLedgerService, refundMethodLabel } from './payment-ledger.service';
+import { WaitlistService } from './waitlist.service';
 import { lockTripsWithLinked, releaseLinkedSeats, retakeReturnSeats } from '../utils/linked-seats.util';
 import { halalas, paymentFigures, splitOriginalRefund } from '../utils/payment.util';
 
@@ -50,6 +51,7 @@ export class BookingCancellationService {
     private notifications: NotificationsService,
     private invoices: InvoiceLedgerService,
     private ledger: PaymentLedgerService,
+    private waitlist: WaitlistService,
   ) {}
 
   /** Frees the seats, refunds to the wallet and marks the booking cancelled. Run inside a transaction. */
@@ -99,11 +101,20 @@ export class BookingCancellationService {
     });
     await releaseLinkedSeats(tx, booking.tripId, seatNumbers);
     await this.returnHomeOnOwnTrip(tx, booking);
+    // The freed seats go first to whoever is waiting for this trip; a whole trip being cancelled has nothing to offer.
+    if (options.notifyAs !== 'TRIP_CANCELLED') await this.waitlist.offerFreedSeats(tx, booking.tripId);
 
     if (walletRefund > 0) {
+      // What the booking spent of transport-only credit goes back as transport-only, so a cancellation never turns
+      // a compensation or promotional credit into money that can pay for a stay.
+      const transportBack = Math.min(walletRefund, Number(booking.payment?.walletTransportAmount ?? 0));
+      if (transportBack > 0 && booking.payment) {
+        await tx.payment.update({ where: { id: booking.payment.id }, data: { walletTransportAmount: { decrement: transportBack } } });
+      }
       await this.wallet.apply(tx, {
         userId: booking.userId,
         amount: walletRefund,
+        transportAmount: transportBack,
         type: 'REFUND',
         description: `استرداد إلغاء الحجز ${booking.bookingReference}`,
         bookingId: booking.id,

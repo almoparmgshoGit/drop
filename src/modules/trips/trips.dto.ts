@@ -137,6 +137,96 @@ class AccommodationDto {
   checkOutDate?: string;
 }
 
+class OccupancyTierDto {
+  @IsNumber()
+  @Min(0)
+  @Max(100)
+  fromPercent: number;
+
+  @IsNumber({ maxDecimalPlaces: 2 })
+  @Min(-90)
+  @Max(300)
+  adjustPercent: number;
+}
+
+class EarlyBirdDto {
+  @IsInt()
+  @Min(1)
+  @Max(365)
+  minDays: number;
+
+  @IsNumber({ maxDecimalPlaces: 2 })
+  @Min(-90)
+  @Max(300)
+  adjustPercent: number;
+}
+
+class LastMinuteDto {
+  @IsInt()
+  @Min(1)
+  @Max(720)
+  withinHours: number;
+
+  @IsNumber({ maxDecimalPlaces: 2 })
+  @Min(-90)
+  @Max(300)
+  adjustPercent: number;
+}
+
+export class PricingRulesDto {
+  @IsBoolean()
+  enabled: boolean;
+
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(10)
+  @ValidateNested({ each: true })
+  @Type(() => OccupancyTierDto)
+  occupancyTiers?: OccupancyTierDto[];
+
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => EarlyBirdDto)
+  earlyBird?: EarlyBirdDto | null;
+
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => LastMinuteDto)
+  lastMinute?: LastMinuteDto | null;
+
+  @IsOptional()
+  @IsNumber({ maxDecimalPlaces: 2 })
+  @Min(-90)
+  @Max(300)
+  weekdayAdjustPercent?: number;
+
+  @IsOptional()
+  @IsNumber({ maxDecimalPlaces: 2 })
+  @Min(-90)
+  @Max(300)
+  weekendAdjustPercent?: number;
+
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(7)
+  @IsInt({ each: true })
+  @Min(0, { each: true })
+  @Max(6, { each: true })
+  weekendDays?: number[];
+
+  @IsOptional()
+  @IsNumber({ maxDecimalPlaces: 2 })
+  @Min(0)
+  @Max(1000000)
+  minPrice?: number | null;
+
+  @IsOptional()
+  @IsNumber({ maxDecimalPlaces: 2 })
+  @Min(1)
+  @Max(1000000)
+  maxPrice?: number | null;
+}
+
 export class CreateTripDto {
   /** Ignored: the system numbers trips per month (D001-11/2026). Still accepted so older dashboards keep working. */
   @IsOptional()
@@ -189,6 +279,12 @@ export class CreateTripDto {
   @Min(1, { message: 'سعر الرحلة يجب أن يكون أكبر من صفر' })
   @Max(1000000)
   price: number;
+
+  /** Flexible pricing on the seat price; null clears it. Off unless enabled is true. */
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => PricingRulesDto)
+  pricingRules?: PricingRulesDto | null;
 
 
   @IsOptional()
@@ -467,10 +563,37 @@ export class DuplicateTripDto {
 }
 
 export class AdminTripsQuery {
-  /** currentMonth: only trips leaving from the 1st of this Riyadh month. Left out, every trip, as reports and pickers need. */
+  /**
+   * now: trips leaving from this moment on (the trips page's default); currentMonth: from the 1st of this Riyadh month;
+   * YYYY-MM-DD: from that Riyadh day. With from or to the list runs nearest departure first.
+   * Left out with to, every trip newest first, as reports and pickers need.
+   */
   @IsOptional()
-  @IsIn(['currentMonth'])
-  from?: 'currentMonth';
+  @Matches(/^(now|currentMonth|\d{4}-\d{2}-\d{2})$/, { message: 'from: now أو currentMonth أو تاريخ YYYY-MM-DD' })
+  from?: string;
+
+  /** The last Riyadh day included, as YYYY-MM-DD. */
+  @IsOptional()
+  @Matches(/^\d{4}-\d{2}-\d{2}$/, { message: 'to: تاريخ YYYY-MM-DD' })
+  to?: string;
+}
+
+export class AdminOccupancyQuery {
+  /** The branch filter's city: trips leaving from it. */
+  @IsOptional()
+  @IsString()
+  @MaxLength(100)
+  origin?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(200)
+  destination?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(50)
+  bookingType?: string;
 }
 
 export class SeriesMonthDto {

@@ -80,6 +80,14 @@ export class OfficeReportsController {
     return this.reports.openCount();
   }
 
+  // Before ':id', so the path is not read as a report id.
+  @Get('sos/active')
+  @RequirePermission('reports.view')
+  @ApiOperation({ summary: 'Open SOS calls, split by acknowledged or not, for the dashboard alarm' })
+  activeSos() {
+    return this.reports.activeSos();
+  }
+
   @Get('attachments/:id')
   @RequirePermission('reports.view')
   @ApiOperation({ summary: 'Download a photo or video from a report' })
@@ -99,5 +107,13 @@ export class OfficeReportsController {
   @ApiOperation({ summary: 'Change the state of a report or reply to the crew' })
   addUpdate(@Req() req, @Param('id') id: string, @Body() dto: OfficeReportUpdateDto) {
     return this.reports.addOfficeUpdate(req.user, id, dto);
+  }
+
+  // Anyone who watches the reports may say an SOS was received; changing its state still needs reports.manage.
+  @Post(':id/acknowledge')
+  @RequirePermission('reports.view')
+  @ApiOperation({ summary: 'Acknowledge receiving a report (an SOS): stops the alarm and the escalation, and tells the crew who took it' })
+  acknowledge(@Req() req, @Param('id') id: string) {
+    return this.reports.acknowledge(req.user, id);
   }
 }

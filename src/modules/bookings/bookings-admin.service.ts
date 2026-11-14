@@ -18,7 +18,7 @@ import { CustomerLookupService, LOOKUP_RESULT_LIMIT } from '../../common/service
 import { signTicketToken } from '../../common/utils/ticket-token.util';
 import { AdminBookingsQuery, BoardingOverrideDto, ChangeBoardingPointDto, ChangeSeatDto, QUICK_SEARCH_FIELDS, QuickSearchField, UpdatePassengerDto } from './bookings.dto';
 import { cityTripWhere, tripInCity } from '../../common/utils/branch-city.util';
-import { startOfRiyadhMonth } from '../../common/utils/time.util';
+import { riyadhDayRange, startOfRiyadhMonth } from '../../common/utils/time.util';
 import { allocate, BookingsService, holdAvailableTo, randomCode, toHalalas, toSar } from './bookings.service';
 
 const EDIT_TX_OPTIONS = { maxWait: 10_000, timeout: 30_000 };
@@ -27,7 +27,7 @@ const SEARCH_LIMIT = 100;
 const PAID_STATUSES = ['COMPLETED', 'SIMULATED'];
 
 // Signed tokens are what a passenger scans to board, so they never leave through the panel endpoints.
-const TICKET_SELECT = { select: { id: true, ticketNumber: true, isBoarded: true, boardedAt: true, returnBoardedAt: true } };
+const TICKET_SELECT = { select: { id: true, ticketNumber: true, isBoarded: true, boardedAt: true, returnBoardedAt: true, noShowAt: true, returnNoShowAt: true } };
 
 export interface BookingsActor {
   userId: string;
@@ -43,7 +43,8 @@ const LIST_INCLUDE = {
   user: { select: { id: true, name: true, phone: true } },
 } satisfies Prisma.BookingInclude;
 
-const PAPER_CODE = /^([A-Za-z]+-\d+)\.[\w-]+$/;
+// DR-1028.sig before the shared numbering, DH-2611-0123.sig after it.
+const PAPER_CODE = /^([A-Za-z]+-\d+(?:-\d+)?)\.[\w-]+$/;
 
 /**
  * A search-only employee's search, matched whole: the customer's or a passenger's full phone or ID number, a name of
@@ -132,9 +133,19 @@ export class BookingsAdminService {
       ];
     }
     if (query.payment === 'PAID') where.payment = { status: { in: PAID_STATUSES } };
-    if (query.payment === 'PENDING') where.payment = { status: 'PENDING' };
+    if (query.payment === 'PENDING') {
+      where.payment = { status: 'PENDING' };
+      where.collections = { none: {} };
+    }
+    if (query.payment === 'PARTIAL') {
+      // As the list labels it: collected in part, not paid in full and nothing refunded.
+      where.collections = { some: {} };
+      where.NOT = [{ payment: { status: { in: PAID_STATUSES } } }, { refundAmount: { gt: 0 } }, { externalRefunded: { gt: 0 } }];
+    }
     if (query.payment === 'REFUNDED') where.paymentTransactions = { some: { type: 'REFUND', status: 'SUCCEEDED' } };
-    if (query.boarding === 'WAITING') where.tickets = { none: { isBoarded: true } };
+    // A passenger left behind once the trip was executed is a no-show (لم يحضر), no longer waiting.
+    if (query.boarding === 'WAITING') where.tickets = { none: { OR: [{ isBoarded: true }, { noShowAt: { not: null } }] } };
+    if (query.boarding === 'NO_SHOW') where.tickets = { some: { isBoarded: false, noShowAt: { not: null } } };
     if (query.boarding === 'BOARDED') where.AND = [{ tickets: { some: {} } }, { tickets: { none: { isBoarded: false } } }];
     if (query.boarding === 'PARTIAL') where.AND = [{ tickets: { some: { isBoarded: true } } }, { tickets: { some: { isBoarded: false } } }];
     if (query.month) {
@@ -148,6 +159,13 @@ export class BookingsAdminService {
       };
     } else if (query.from === 'currentMonth') {
       where.trip = { departureTime: { gte: startOfRiyadhMonth() } };
+    } else if (query.from) {
+      const first = riyadhDayRange(query.from);
+      const last = query.to ? riyadhDayRange(query.to) : null;
+      if (first) where.trip = { departureTime: { gte: first.start, ...(last && { lt: last.end }) } };
+    } else if (query.to) {
+      const last = riyadhDayRange(query.to);
+      if (last) where.trip = { departureTime: { lt: last.end } };
     }
     return where;
   }
@@ -178,7 +196,7 @@ export class BookingsAdminService {
         take: limit,
       }),
       this.prisma.booking.count({ where }),
-      this.prisma.booking.count({ where: { ...scope, payment: { status: 'PENDING' }, status: { not: 'CANCELLED' } } }),
+      this.prisma.booking.count({ where: { ...scope, payment: { status: 'PENDING' }, collections: { none: {} }, status: { not: 'CANCELLED' } } }),
       this.prisma.booking.count({ where: { ...scope, status: 'PENDING_CANCELLATION_REVIEW' } }),
     ]);
     const [{ bookingIds: goOnly }, reverse] = await Promise.all([
@@ -556,7 +574,7 @@ export class BookingsAdminService {
       if (!!passenger.ticket.returnBoardedAt === boarded) throw new ConflictException(boarded ? 'تم تسجيل صعود هذا المسافر مسبقًا' : 'هذا المسافر لم يصعد');
 
       const now = new Date();
-      await tx.ticket.update({ where: { id: passenger.ticket.id }, data: { returnBoardedAt: boarded ? now : null } });
+      await tx.ticket.update({ where: { id: passenger.ticket.id }, data: { returnBoardedAt: boarded ? now : null, returnNoShowAt: boarded ? null : ride.executedAt ?? null } });
       await tx.booking.update({ where: { id: bookingId }, data: { updatedAt: now } });
       await this.events.record(tx, {
         bookingId,
@@ -587,7 +605,7 @@ export class BookingsAdminService {
       if (passenger.ticket.isBoarded) throw new ConflictException('تم تسجيل صعود هذا المسافر مسبقًا');
 
       const now = new Date();
-      await tx.ticket.update({ where: { id: passenger.ticket.id }, data: { isBoarded: true, boardedAt: now } });
+      await tx.ticket.update({ where: { id: passenger.ticket.id }, data: { isBoarded: true, boardedAt: now, noShowAt: null } });
       const allBoarded = booking.passengers.every((p) => p.id === passengerId || p.ticket?.isBoarded);
       await tx.booking.update({ where: { id: bookingId }, data: allBoarded ? { status: 'BOARDED' } : { updatedAt: now } });
       await this.events.record(tx, {
@@ -610,7 +628,7 @@ export class BookingsAdminService {
       const passenger = this.findPassenger(booking, passengerId);
       if (!passenger.ticket?.isBoarded) throw new ConflictException('هذا المسافر لم يصعد');
 
-      await tx.ticket.update({ where: { id: passenger.ticket.id }, data: { isBoarded: false, boardedAt: null } });
+      await tx.ticket.update({ where: { id: passenger.ticket.id }, data: { isBoarded: false, boardedAt: null, noShowAt: booking.trip.executedAt ?? null } });
       await tx.booking.update({
         where: { id: bookingId },
         data: booking.status === 'BOARDED' ? { status: 'CONFIRMED' } : { updatedAt: new Date() },

@@ -10,6 +10,9 @@ export const CHAT_STAFF_ROOM = 'staff:chat';
 /** Staff who may see every trip follow every moving bus on the live map. */
 export const TRACKING_STAFF_ROOM = 'staff:tracking';
 export const TRACKING_PERMISSIONS = ['trips.view', 'trips.manage'] as const;
+/** Staff who handle crew reports hear every SOS as it happens, so the dashboard alarm can ring. */
+export const REPORTS_STAFF_ROOM = 'staff:reports';
+export const REPORTS_PERMISSIONS = ['reports.view', 'reports.manage'] as const;
 
 export const REALTIME_EVENTS = {
   NOTIFICATION: 'notification:new',
@@ -22,6 +25,10 @@ export const REALTIME_EVENTS = {
   /** The live map's own events, so a staff socket that also follows one booking's trip never mistakes them for that trip's. */
   TRACKING_LOCATION: 'tracking:location',
   TRACKING_CHANGED: 'tracking:changed',
+  /** An SOS was sent, acknowledged, escalated or closed; carries only ids, the office rereads over HTTP. */
+  SOS_CHANGED: 'sos:changed',
+  /** A report the crew filed changed (for example the office acknowledged an SOS). */
+  REPORT_CHANGED: 'report:changed',
 } as const;
 
 /** What every trip chat event carries besides the message: the unread counts let both sides draw read ticks and badges without asking. */
@@ -40,6 +47,8 @@ export interface LiveLocation {
   speed: number | null;
   recordedAt: Date;
   isLive: true;
+  /** PHONE (the supervisor's app) or DEVICE (the bus's GPS tracker). */
+  source?: 'PHONE' | 'DEVICE';
 }
 
 /**
@@ -105,6 +114,18 @@ export class RealtimeService {
       // Carries no content: the map reads the trip's new status over HTTP, behind its permission check.
       this.server?.to(TRACKING_STAFF_ROOM).emit(REALTIME_EVENTS.TRACKING_CHANGED, { tripId });
     });
+  }
+
+  /** Tells the office's open dashboards that the SOS list changed, so the alarm starts or stops at once. */
+  sosChanged(reportId: string, kind: 'created' | 'acknowledged' | 'escalated' | 'resolved') {
+    this.prisma.afterCommit(() => this.server?.to(REPORTS_STAFF_ROOM).emit(REALTIME_EVENTS.SOS_CHANGED, { reportId, kind }));
+  }
+
+  /** Tells the trip's crew that one of their reports changed, so the sender sees the acknowledgement without refreshing. */
+  reportChanged(crewIds: string[], event: { reportId: string; tripId: string; acknowledgedAt?: Date | null; acknowledgedByName?: string | null }) {
+    const rooms = [...new Set(crewIds)].map(userRoom);
+    if (rooms.length === 0) return;
+    this.prisma.afterCommit(() => this.server?.to(rooms).emit(REALTIME_EVENTS.REPORT_CHANGED, event));
   }
 
   disconnectSession(jti: string) {

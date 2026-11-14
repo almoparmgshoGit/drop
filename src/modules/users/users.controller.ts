@@ -2,14 +2,15 @@ import { Controller, Get, Header, Post, Put, Delete, Param, Body, Query, Req, St
 import { FileInterceptor } from '@nestjs/platform-express';
 import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
 import { Gender, IdType } from '@prisma/client';
-import { Type } from 'class-transformer';
-import { ArrayUnique, IsArray, IsBoolean, IsEmail, IsIn, IsInt, IsString, IsNotEmpty, IsNumber, IsOptional, Length, Matches, Max, MaxLength, Min, ValidateIf } from 'class-validator';
+import { Transform, Type } from 'class-transformer';
+import { ArrayUnique, IsArray, IsBoolean, IsEmail, IsIn, IsInt, IsString, IsNotEmpty, IsNumber, IsOptional, Length, Matches, Max, MaxLength, Min, NotEquals, ValidateIf } from 'class-validator';
 import { MAX_PHOTO_BYTES, UploadedPhoto, UsersService } from './users.service';
 import { StaffAchievementsService } from './staff-achievements.service';
-import { RequirePermission } from '../../common/decorators/auth.decorators';
+import { CustomerMergeService, DuplicateReason } from './customer-merge.service';
+import { RequirePermission, SkipAudit } from '../../common/decorators/auth.decorators';
 import { MESSAGE_LANGUAGES } from '../../common/notification-catalog';
 import { ALL_PERMISSIONS } from '../../common/permissions';
-import { CUSTOMER_CITIES, GENDERS, NATIONALITIES, NATIVE_LANGUAGE_KEYS, NATIVE_LANGUAGES } from '../../common/profile-options';
+import { CITY_MAX_LENGTH, CUSTOMER_CITIES, GENDERS, NATIONALITIES, NATIVE_LANGUAGE_KEYS, NATIVE_LANGUAGES, OTHER_CITY } from '../../common/profile-options';
 import { ID_TYPES, ID_TYPE_LABELS } from '../../common/utils/identity.util';
 
 /** Shown in place, never downloaded; only ever an image, since the bytes were checked on upload. */
@@ -23,8 +24,12 @@ class ProfileDetailsDto {
   @MaxLength(60)
   nationality?: string | null;
 
-  @ValidateIf((dto) => dto.city !== null && dto.city !== undefined)
-  @IsIn(CUSTOMER_CITIES, { message: 'اختر المدينة من القائمة' })
+  // A city from the list, or one typed after choosing "أخرى".
+  @ValidateIf((dto) => dto.city !== null && dto.city !== undefined && dto.city !== '')
+  @Transform(({ value }) => (typeof value === 'string' ? value.trim() : value))
+  @IsString()
+  @Length(2, CITY_MAX_LENGTH, { message: 'اكتب اسم المدينة' })
+  @NotEquals(OTHER_CITY, { message: 'اكتب اسم المدينة' })
   city?: string | null;
 
   @ValidateIf((dto) => dto.nativeLanguage !== null && dto.nativeLanguage !== undefined)
@@ -193,7 +198,11 @@ class UpdateUserAdminDto extends ProfileDetailsDto {
 }
 
 class UpdateCityDto {
-  @IsIn(CUSTOMER_CITIES, { message: 'اختر المدينة من القائمة' })
+  // A city from the list, or one the customer typed after choosing "أخرى".
+  @Transform(({ value }) => (typeof value === 'string' ? value.trim() : value))
+  @IsString()
+  @Length(2, CITY_MAX_LENGTH, { message: 'اختر المدينة من القائمة أو اكتب اسمها' })
+  @NotEquals(OTHER_CITY, { message: 'اكتب اسم المدينة' })
   city: string;
 }
 
@@ -301,6 +310,11 @@ class AdjustWalletDto {
   @IsString()
   @Length(3, 300)
   description: string;
+
+  /** On a credit: true makes it transport-only, like a compensation; false (default) is ordinary money for transport and housing. */
+  @IsOptional()
+  @IsBoolean()
+  transportOnly?: boolean;
 }
 
 class ReferralCodeDto {
@@ -385,6 +399,19 @@ class AchievementsQuery {
   limit?: number;
 }
 
+class DuplicatesQuery {
+  @IsOptional()
+  @IsIn(['idNumber', 'phone', 'name'])
+  reason?: DuplicateReason;
+}
+
+class MergeCustomerDto {
+  /** The account that goes away; everything it holds moves to the customer in the address. */
+  @IsString()
+  @IsNotEmpty({ message: 'اختر الحساب المكرر' })
+  duplicateId: string;
+}
+
 class ListUsersQuery {
   @IsOptional()
   @IsString()
@@ -443,6 +470,7 @@ export class UsersController {
   constructor(
     private usersService: UsersService,
     private achievements: StaffAchievementsService,
+    private merging: CustomerMergeService,
   ) {}
 
   @Get('profile')
@@ -519,12 +547,6 @@ export class UsersController {
     return this.usersService.applyReferralCode(req.user.userId, dto.code);
   }
 
-  @Post('profile/loyalty/vouchers/:id/redeem')
-  @ApiOperation({ summary: 'Buy a voucher with points' })
-  async redeemVoucher(@Req() req, @Param('id') id: string) {
-    return this.usersService.redeemVoucher(req.user.userId, id);
-  }
-
   @Get()
   @RequirePermission('customers.view')
   @ApiOperation({ summary: 'List customers; without customers.list only an exact search, counted and logged' })
@@ -574,6 +596,13 @@ export class UsersController {
     return this.usersService.getCandidates(query.search);
   }
 
+  @Get('duplicates')
+  @RequirePermission('customers.manage')
+  @ApiOperation({ summary: 'Groups of customer accounts that look like one person: same ID number, same mobile or same name' })
+  async getDuplicateGroups(@Query() query: DuplicatesQuery) {
+    return this.merging.duplicateGroups(query.reason);
+  }
+
   @Post()
   @RequirePermission('employees.manage')
   @ApiOperation({ summary: 'Create an employee account with a rank' })
@@ -593,6 +622,29 @@ export class UsersController {
   @ApiOperation({ summary: 'Get full user details with bookings and wallet history' })
   async getUserDetails(@Req() req, @Param('id') id: string) {
     return this.usersService.getUserDetails(req.user, id);
+  }
+
+  @Get(':id/duplicates')
+  @RequirePermission('customers.manage')
+  @ApiOperation({ summary: 'Customer accounts that may be the same person as this one' })
+  async getDuplicatesOf(@Param('id') id: string) {
+    return this.merging.duplicatesOf(id);
+  }
+
+  // The merge writes its own audit row in its transaction, with what moved, so the interceptor does not add a second.
+  @Post(':id/merge')
+  @SkipAudit()
+  @RequirePermission('customers.manage')
+  @ApiOperation({ summary: 'Merge a duplicate customer into this one: everything moves here and the duplicate is blocked' })
+  async mergeCustomer(@Req() req, @Param('id') id: string, @Body() dto: MergeCustomerDto) {
+    return this.merging.merge(req.user, id, dto.duplicateId, { ip: req.ip, userAgent: req.headers['user-agent'] });
+  }
+
+  @Get(':id/complaints')
+  @RequirePermission('complaints.view')
+  @ApiOperation({ summary: "A customer's complaints from the app and hotel complaints on their bookings" })
+  async getUserComplaints(@Param('id') id: string) {
+    return this.merging.complaintsOf(id);
   }
 
   @Get(':id/photo')
@@ -639,7 +691,7 @@ export class UsersController {
   @RequirePermission('wallet.adjust')
   @ApiOperation({ summary: 'Adjust user wallet balance' })
   async adjustWalletBalance(@Req() req, @Param('id') id: string, @Body() dto: AdjustWalletDto) {
-    return this.usersService.adjustWalletBalance(req.user, id, dto.amount, dto.description);
+    return this.usersService.adjustWalletBalance(req.user, id, dto.amount, dto.description, dto.transportOnly);
   }
 
   @Post(':id/wallet/promo')

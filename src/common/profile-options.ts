@@ -97,3 +97,12 @@ export const CUSTOMER_CITIES = [
   'سكاكا',
   'الباحة',
 ];
+
+/**
+ * The last choice under the city list: picking it opens a box to type a city the list does not have. The typed name is
+ * what is saved, never this word.
+ */
+export const OTHER_CITY = 'أخرى';
+
+/** A city from the list or one typed under "أخرى": trimmed, 2 to 60 letters. */
+export const CITY_MAX_LENGTH = 60;

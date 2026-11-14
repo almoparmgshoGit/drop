@@ -7,6 +7,7 @@ import { RedisThrottlerStorage } from './common/services/redis-throttler.storage
 import { CommonModule } from './common/common.module';
 import { JwtAuthGuard } from './common/guards/jwt-auth.guard';
 import { PermissionsGuard } from './common/guards/permissions.guard';
+import { BranchAccessGuard } from './common/guards/branch-access.guard';
 import { PrismaExceptionFilter } from './common/filters/prisma-exception.filter';
 import { AuditInterceptor } from './common/interceptors/audit.interceptor';
 import { validateEnv } from './config/env.validation';
@@ -26,6 +27,7 @@ import { ManifestsModule } from './modules/manifests/manifests.module';
 import { HotelsModule } from './modules/hotels/hotels.module';
 import { TrackingModule } from './modules/tracking/tracking.module';
 import { LoyaltyModule } from './modules/loyalty/loyalty.module';
+import { VouchersModule } from './modules/vouchers/vouchers.module';
 import { RanksModule } from './modules/ranks/ranks.module';
 import { NotificationsModule } from './modules/notifications/notifications.module';
 import { CashModule } from './modules/cash/cash.module';
@@ -42,6 +44,11 @@ import { CrewRequestsModule } from './modules/crew-requests/crew-requests.module
 import { HrModule } from './modules/hr/hr.module';
 import { ComplaintsModule } from './modules/complaints/complaints.module';
 import { TripChatModule } from './modules/trip-chat/trip-chat.module';
+import { TablePreferencesModule } from './modules/table-preferences/table-preferences.module';
+import { MonitoringModule } from './modules/monitoring/monitoring.module';
+import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
+import { WaitlistModule } from './modules/waitlist/waitlist.module';
+import { TripFollowupModule } from './modules/trip-followup/trip-followup.module';
 
 @Module({
   imports: [
@@ -72,6 +79,7 @@ import { TripChatModule } from './modules/trip-chat/trip-chat.module';
     HotelsModule,
     TrackingModule,
     LoyaltyModule,
+    VouchersModule,
     RanksModule,
     NotificationsModule,
     CashModule,
@@ -88,12 +96,19 @@ import { TripChatModule } from './modules/trip-chat/trip-chat.module';
     HrModule,
     ComplaintsModule,
     TripChatModule,
+    TablePreferencesModule,
+    MonitoringModule,
+    WaitlistModule,
+    TripFollowupModule,
   ],
   providers: [
     { provide: APP_GUARD, useClass: ThrottlerGuard },
     { provide: APP_GUARD, useClass: JwtAuthGuard },
     { provide: APP_GUARD, useClass: PermissionsGuard },
+    { provide: APP_GUARD, useClass: BranchAccessGuard },
     { provide: APP_INTERCEPTOR, useClass: AuditInterceptor },
+    // The catch-all comes first so Nest tries the database filter before it; it also hands database errors on to it.
+    { provide: APP_FILTER, useClass: AllExceptionsFilter },
     { provide: APP_FILTER, useClass: PrismaExceptionFilter },
   ],
 })

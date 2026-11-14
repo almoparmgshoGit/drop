@@ -9,3 +9,8 @@ export const includesHousing = (bookingType: string) => HOUSING_TYPES.includes(b
 /** A branch can sell a stay on a transport trip, or transport alone on a housing trip, so the booking decides and not only the trip. */
 export const bookingHasStay = (tripBookingType: string, booking: { kind: string | null; roomChoice: string | null; stayHotelId: string | null }) =>
   !!booking.stayHotelId || !!booking.roomChoice || (includesHousing(tripBookingType) && !booking.kind);
+
+const VISIT_TYPES = ['WITH_VISITS', 'WITH_HOTEL_VISITS'];
+
+/** Whether the trip's programme has sightseeing visits a booking may include. */
+export const includesVisits = (bookingType: string) => VISIT_TYPES.includes(bookingType);

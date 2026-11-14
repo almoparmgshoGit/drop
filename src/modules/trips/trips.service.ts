@@ -10,6 +10,7 @@ import {
 import { randomUUID } from 'crypto';
 import { Prisma, TripCalendar, TripScheduleType } from '@prisma/client';
 import { PrismaService } from '../../common/services/prisma.service';
+import { MADINAH_PLACES, TripMetricsService, UMRAH_PLACES, placeWhere } from '../../common/services/trip-metrics.service';
 import { BookingCancellationService } from '../../common/services/booking-cancellation.service';
 import { LoyaltyService } from '../../common/services/loyalty.service';
 import { NotificationsService, tripValues } from '../../common/services/notifications.service';
@@ -19,6 +20,7 @@ import { RoomAllocationService } from '../../common/services/room-allocation.ser
 import { BOOKING_TYPES, includesHousing } from '../../common/utils/booking-types.util';
 import { BOOKING_TYPE_LABELS } from '../../common/booking-type-labels';
 import { HousingTerms, startingSeatPrice } from '../../common/utils/housing-price.util';
+import { normalizePricingRules, PricedSeatTrip, seatPricingSar } from '../../common/utils/dynamic-pricing.util';
 import { CREW_WINDOW_SELECT, MAX_CREW_OPENS_BEFORE_MINUTES, crewWindow } from '../../common/utils/crew-window.util';
 import { seatLayoutFor, seatNumbersOf, storedSeatLayout, tripSeatLayout } from '../../common/utils/bus-layout.util';
 import { assertSinglesFitRange } from '../../common/utils/singles-seats.util';
@@ -39,6 +41,7 @@ import { PACKAGE_PRICE_SELECT, PackagePrices, packagePriceTiers } from '../../co
 import { cityTripWhere, servedCity } from '../../common/utils/branch-city.util';
 import { PublicService, SERVICE_SELECT, withHotelServices } from '../../common/utils/services.util';
 import { assignTripCode, journeyCodeOf, reverseCodeOf } from '../../common/utils/trip-code.util';
+import { approvedLeaveWhere, crewClashResources, scheduleOverlapWhere } from '../../common/utils/schedule-conflict.util';
 
 const DEFAULT_TRIP_DURATION_MS = 8 * 60 * 60 * 1000;
 const COMPLETION_SWEEP_MS = 5 * 60 * 1000;
@@ -132,6 +135,11 @@ const INTERNAL_TRIP_FIELDS = [
   'repeatUntil',
   'seriesId',
   'seatLayout',
+  'financeClosedAt',
+  'financeClosedByName',
+  // The rules are staff's; the customer sees the price they produce.
+  'pricingRules',
+  'priceAdjustments',
 ] as const;
 
 /** Costs and planning settings stay out of the customer-facing API. */
@@ -176,12 +184,16 @@ const housingOfferOf = (trip: PricedTrip) => {
 };
 
 /** Searching transport alone, a trip with housing is sold as its seat, so neither the stay nor its price shows. */
-const withSeatPrice = <T extends PricedTrip>(trip: T, transportOnly = false) => {
-  const pricePerSeat = Number(trip.package?.price ?? trip.price);
+const withSeatPrice = <T extends PricedTrip & PricedSeatTrip>(trip: T, transportOnly = false) => {
+  // Flexible pricing moves the seat price only; a package keeps its own price. Off, the current price is the listed one.
+  const dynamic = trip.package ? null : seatPricingSar(trip);
+  const pricePerSeat = Number(trip.package?.price ?? dynamic?.currentPrice ?? trip.price);
   const offer = transportOnly ? null : housingOfferOf(trip);
   return {
     ...trip,
     pricePerSeat,
+    basePricePerSeat: Number(trip.package?.price ?? trip.price),
+    priceAdjustments: dynamic?.adjustments ?? [],
     packagePriceTiers: tiersOf(trip.package),
     housingOffer: offer,
     startingPrice: offer ? startingSeatPrice(pricePerSeat, trip, trip.accommodations?.[0]?.nights ?? 1) : pricePerSeat,
@@ -266,6 +278,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
     private appSettings: AppSettingsService,
     private ticketAlerts: TicketAlertsService,
     private compensation: TicketCompensationService,
+    private metrics: TripMetricsService,
   ) {}
 
   onModuleInit() {
@@ -785,6 +798,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
         hijriDate: toHijriLabel(departure),
         busType: source.busType,
         price: source.price,
+        pricingRules: source.pricingRules === null ? undefined : (source.pricingRules as Prisma.InputJsonValue),
         totalSeats: seatNumbers.length,
         availableSeats: seatNumbers.length,
         seatLayout: storedSeatLayout(layout),
@@ -983,20 +997,65 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
     return { departureTime: trip?.departureTime ?? null };
   }
 
-  /** With from=currentMonth, only trips leaving from the 1st of this Riyadh month: the trips page's working view. Every other caller still gets past months. */
-  async getAllAdminTrips(actor: RentActor, from?: 'currentMonth') {
+  /**
+   * The trips list. With a from or a to it is the trips page's working view, nearest departure first: from=now (its
+   * default) starts at this moment, so the first row is always the next trip to leave; a date starts at that Riyadh day,
+   * and currentMonth at the 1st of this month. Without either, every trip, newest first, as reports and pickers need.
+   * Each row carries its expected revenue from the shared metrics, so the table and the cards above it read one figure.
+   */
+  async getAllAdminTrips(actor: RentActor, query: { from?: string; to?: string } = {}) {
     // An employee of a city's branch works with that city's trips.
     const city = actor.userId ? await servedCity(this.prisma, { userId: actor.userId, permissions: actor.permissions }) : null;
+    const departureTime = this.listWindow(query);
     const where: Prisma.TripWhereInput = {
       ...(city && cityTripWhere(city)),
-      ...(from === 'currentMonth' && { departureTime: { gte: startOfRiyadhMonth() } }),
+      ...(departureTime && { departureTime }),
     };
-    const trips = await this.prisma.trip.findMany({
-      where,
-      orderBy: { departureTime: 'desc' },
-      include: ADMIN_TRIP_INCLUDE,
-    });
-    return trips.map((trip) => withoutRentFor(actor, withSeatPrice(trip)));
+    const [trips, revenue] = await Promise.all([
+      this.prisma.trip.findMany({
+        where,
+        orderBy: { departureTime: departureTime ? 'asc' : 'desc' },
+        include: ADMIN_TRIP_INCLUDE,
+      }),
+      this.metrics.revenueByTrip(where),
+    ]);
+    return trips.map((trip) => ({ ...withoutRentFor(actor, withSeatPrice(trip)), expectedRevenue: (revenue.get(trip.id) ?? 0) / 100 }));
+  }
+
+  /** The departure window of the trips list; null for every trip. */
+  private listWindow(query: { from?: string; to?: string }): Prisma.DateTimeFilter | null {
+    if (!query.from && !query.to) return null;
+    const gte =
+      query.from === 'now' ? new Date()
+      : query.from === 'currentMonth' ? startOfRiyadhMonth()
+      : query.from ? riyadhDayRange(query.from)?.start
+      : undefined;
+    const lt = query.to ? riyadhDayRange(query.to)?.end : undefined;
+    if ((query.from && !gte) || (query.to && !lt)) throw new BadRequestException('التاريخ غير صحيح');
+    if (gte && lt && gte >= lt) throw new BadRequestException('تاريخ البداية بعد تاريخ النهاية');
+    return { ...(gte && { gte }), ...(lt && { lt }) };
+  }
+
+  /**
+   * The trips page's occupancy, from the shared metrics: executed trips of the last 30 days and the trips of the next
+   * 30 days, apart, overall and for Umrah and Madinah. The branch, destination and type narrow it as they narrow the table.
+   */
+  async getAdminOccupancy(actor: RentActor, query: { origin?: string; destination?: string; bookingType?: string }) {
+    const city = actor.userId ? await servedCity(this.prisma, { userId: actor.userId, permissions: actor.permissions }) : null;
+    const scope: Prisma.TripWhereInput = {
+      AND: [
+        city ? cityTripWhere(city) : {},
+        query.origin ? { origin: { contains: query.origin, mode: 'insensitive' } } : {},
+        query.destination ? { destination: query.destination } : {},
+        query.bookingType ? { bookingType: query.bookingType } : {},
+      ],
+    };
+    const [all, umrah, madinah] = await Promise.all([
+      this.metrics.occupancy(scope),
+      this.metrics.occupancy({ AND: [scope, placeWhere(UMRAH_PLACES)] }),
+      this.metrics.occupancy({ AND: [scope, placeWhere(MADINAH_PLACES)] }),
+    ]);
+    return { ...all, umrah, madinah };
   }
 
   /**
@@ -1067,20 +1126,14 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
     window: { busId?: string | null; driverIds: string[]; supervisorIds: string[]; start: Date; end: Date; excludeTripIds?: string[]; leaveCheckIds?: string[] },
   ) {
     const people = [...window.driverIds, ...window.supervisorIds];
-    const resources: Prisma.TripWhereInput[] = [];
-    if (window.busId) resources.push({ busId: window.busId });
-    // A supervisor may look after several trips at once, but a driver is behind one wheel: whoever drives a trip at
-    // that time cannot join another, and whoever is to drive this one cannot be on another trip.
-    if (people.length > 0) resources.push({ drivers: { some: { userId: { in: people } } } });
-    if (window.driverIds.length > 0) resources.push({ supervisors: { some: { userId: { in: window.driverIds } } } });
+    // A supervisor may look after several trips at once, but a driver is behind one wheel (see crewClashResources);
+    // the availability endpoint and the operations board read the same rules.
+    const resources = crewClashResources(window.busId, window.driverIds, window.supervisorIds);
     if (resources.length === 0) return;
 
     const clash = await db.trip.findFirst({
       where: {
-        id: window.excludeTripIds?.length ? { notIn: window.excludeTripIds } : undefined,
-        tripStatus: { in: ['DRAFT', 'PUBLISHED'] },
-        departureTime: { lt: window.end },
-        arrivalTime: { gt: window.start },
+        ...scheduleOverlapWhere(window.start, window.end, window.excludeTripIds),
         OR: resources,
       },
       select: { tripCode: true },
@@ -1093,7 +1146,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
     const checkLeave = window.leaveCheckIds ?? people;
     if (checkLeave.length > 0) {
       const away = await db.leaveRequest.findFirst({
-        where: { userId: { in: checkLeave }, status: 'APPROVED', startDate: { lte: new Date(`${riyadhDate(window.end)}T00:00:00.000Z`) }, endDate: { gte: new Date(`${riyadhDate(window.start)}T00:00:00.000Z`) } },
+        where: { userId: { in: checkLeave }, ...approvedLeaveWhere(window.start, window.end) },
         select: { user: { select: { name: true } }, startDate: true, endDate: true },
       });
       if (away) {
@@ -1267,6 +1320,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
           hijriDate: dto.hijriDate || toHijriLabel(departure),
           busType: dto.busType || 'VIP 2+1',
           price: dto.price,
+          pricingRules: dto.pricingRules ? normalizePricingRules(dto.pricingRules) : undefined,
           totalSeats: seatNumbers.length,
           availableSeats: seatNumbers.length,
           seatLayout: storedSeatLayout(layout),
@@ -1570,6 +1624,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
           hijriDate: dto.hijriDate ?? (dto.departureTime ? toHijriLabel(departure) : undefined),
           busType: dto.busType,
           price: dto.price,
+          pricingRules: dto.pricingRules === undefined ? undefined : normalizePricingRules(dto.pricingRules),
           maxSeatsPerBooking: dto.maxSeatsPerBooking,
           ...crewWindowSettings,
           ...(crewWindowMoved && { crewOpenAnnouncedAt: null, boardingOpenAnnouncedAt: null, boardingCloseAnnouncedAt: null }),

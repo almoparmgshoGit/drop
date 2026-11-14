@@ -293,8 +293,8 @@ export class NotificationsService {
   }
 
   /** For events tied to the account itself, such as the wallet and points. */
-  async toUser(db: Db, event: NotificationEvent, userId: string, values: NotificationValues) {
+  async toUser(db: Db, event: NotificationEvent, userId: string, values: NotificationValues, options: { tripId?: string } = {}) {
     const user = await db.user.findUnique({ where: { id: userId }, select: { id: true, name: true } });
-    if (user) await this.send(db, event, [{ user, values }]);
+    if (user) await this.send(db, event, [{ user, values, tripId: options.tripId }]);
   }
 }

@@ -1,7 +1,7 @@
 import { Controller, Get, Post, Param, Body, Req } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
-import { Transform } from 'class-transformer';
-import { IsBoolean, IsEnum, IsOptional, IsString, IsNotEmpty, MaxLength } from 'class-validator';
+import { Transform, Type } from 'class-transformer';
+import { ArrayMaxSize, IsArray, IsBoolean, IsDateString, IsEnum, IsOptional, IsString, IsNotEmpty, MaxLength, ValidateNested } from 'class-validator';
 import { TripLiveStatus } from '@prisma/client';
 import { TicketsService } from './tickets.service';
 import { CreateReportDto } from '../trip-reports/trip-reports.dto';
@@ -63,6 +63,46 @@ class BoardManuallyDto {
   @IsOptional()
   @IsBoolean()
   allowUnpaid?: boolean;
+}
+
+/** One boarding the app recorded without internet: the scanned QR, the printed barcode, or the ticket picked from the saved list. */
+class OfflineBoardingItemDto {
+  /** The phone's own id for this scan, so sending it again never boards twice. */
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(80)
+  clientId: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(1000)
+  signedToken?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(60)
+  code?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(60)
+  ticketNumber?: string;
+
+  @IsDateString()
+  scannedAt: string;
+
+  /** The crew saw what the passenger still owes and boarded them anyway, on a trip whose creator allows it. */
+  @IsOptional()
+  @IsBoolean()
+  allowUnpaid?: boolean;
+}
+
+class SyncOfflineBoardingsDto {
+  @IsArray()
+  @ArrayMaxSize(200)
+  @ValidateNested({ each: true })
+  @Type(() => OfflineBoardingItemDto)
+  items: OfflineBoardingItemDto[];
 }
 
 class UpdateLiveStatusDto {
@@ -188,6 +228,20 @@ export class TicketsController {
   @ApiOperation({ summary: 'Board everyone on a printed branch ticket from its barcode' })
   async boardFromPaper(@Req() req, @Body() dto: BoardFromPaperDto) {
     return this.ticketsService.boardFromPaper(req.user, dto.code, dto.tripId, dto);
+  }
+
+  @Get('trips/:tripId/offline-pack')
+  @RequirePermission('crew.board')
+  @ApiOperation({ summary: "What the crew's phone keeps to board passengers without internet: the list, and hashes of the ticket codes (never the codes or the signing secret)" })
+  async getOfflinePack(@Req() req, @Param('tripId') tripId: string) {
+    return this.ticketsService.getOfflinePack(req.user, tripId);
+  }
+
+  @Post('trips/:tripId/offline-boardings')
+  @RequirePermission('crew.board')
+  @ApiOperation({ summary: 'Send the boardings recorded without internet; each is checked as at the door at its scan time, and sending one again never boards twice' })
+  async syncOfflineBoardings(@Req() req, @Param('tripId') tripId: string, @Body() dto: SyncOfflineBoardingsDto) {
+    return this.ticketsService.syncOfflineBoardings(req.user, tripId, dto.items);
   }
 
   @Post(':ticketNumber/board')

@@ -300,21 +300,30 @@ export class AdminBookingsQuery {
   branchId?: string;
 
   @IsOptional()
-  @IsIn(['PAID', 'PENDING', 'REFUNDED'])
-  payment?: 'PAID' | 'PENDING' | 'REFUNDED';
+  /** PARTIAL: some money collected at a branch, not yet paid in full (the list's «مدفوع جزئيًا»). */
+  @IsIn(['PAID', 'PENDING', 'PARTIAL', 'REFUNDED'])
+  payment?: 'PAID' | 'PENDING' | 'PARTIAL' | 'REFUNDED';
 
   @IsOptional()
-  @IsIn(['WAITING', 'PARTIAL', 'BOARDED'])
-  boarding?: 'WAITING' | 'PARTIAL' | 'BOARDED';
+  @IsIn(['WAITING', 'PARTIAL', 'BOARDED', 'NO_SHOW'])
+  boarding?: 'WAITING' | 'PARTIAL' | 'BOARDED' | 'NO_SHOW';
 
   @IsOptional()
   @Matches(/^\d{4}-(0[1-9]|1[0-2])$/)
   month?: string;
 
-  /** currentMonth: bookings on trips leaving from the 1st of this Riyadh month, the bookings page's default. A month, when given, wins. */
+  /**
+   * currentMonth: bookings on trips leaving from the 1st of this Riyadh month, the bookings page's default.
+   * A YYYY-MM-DD day starts a range of trip departure days (Riyadh), ended by `to` when given. A month, when given, wins.
+   */
   @IsOptional()
-  @IsIn(['currentMonth'])
-  from?: 'currentMonth';
+  @Matches(/^(currentMonth|\d{4}-\d{2}-\d{2})$/)
+  from?: string;
+
+  /** The last trip departure day included, YYYY-MM-DD (Riyadh). */
+  @IsOptional()
+  @Matches(/^\d{4}-\d{2}-\d{2}$/)
+  to?: string;
 
   @IsOptional()
   @Type(() => Number)

@@ -17,7 +17,9 @@ import { InvoiceLedgerService } from '../../common/services/invoice-ledger.servi
 import { earnedPoints, LoyaltyService, transportShare } from '../../common/services/loyalty.service';
 import { NotificationsService } from '../../common/services/notifications.service';
 import { PaymentLedgerService } from '../../common/services/payment-ledger.service';
-import { includesHousing } from '../../common/utils/booking-types.util';
+import { includesHousing, includesVisits } from '../../common/utils/booking-types.util';
+import { serviceTypeOf } from '../../common/utils/booking-kinds.util';
+import { nextBookingNumber } from '../../common/utils/booking-number.util';
 import { GALLERY_SELECT } from '../../common/utils/gallery.util';
 import { housingCharge, HousingTerms, isRoomSellable } from '../../common/utils/housing-price.util';
 import { applicableRule, daysUntil, parseCancellationRules } from '../../common/utils/cancellation-policy.util';
@@ -35,6 +37,8 @@ import { BookingLegDto, CreateBookingDto, HoldSeatsDto, QuoteDto, ReviewCancella
 import { PublicService, SERVICE_SELECT, withHotelServices } from '../../common/utils/services.util';
 import { customPackageStay, loadCustomPackage } from '../../common/utils/custom-package.util';
 import { assertBookingOpened } from '../../common/utils/booking-opens.util';
+import { seatPricing } from '../../common/utils/dynamic-pricing.util';
+import { WaitlistService } from '../../common/services/waitlist.service';
 
 const DEFAULT_VAT_RATE = 15;
 const CANCELLATION_TX_OPTIONS = { maxWait: 10_000, timeout: 30_000 };
@@ -139,7 +143,8 @@ const SAFE_USER_SELECT = { select: { id: true, name: true, phone: true } };
 
 /** The internal reason, the reviewer's id and the retry key stay with staff; the app reads the customer's note as the review note. */
 function toCustomerBooking<T extends { cancelReviewNote: string | null; cancelCustomerNote: string | null }>(booking: T) {
-  const { cancelCustomerNote, cancelReviewedById: _reviewer, idempotencyKey: _key, loyaltyPlan: _plan, createdById: _creator, createdByName: _creatorName, ...rest } = booking as T & { cancelReviewedById?: unknown; idempotencyKey?: unknown; loyaltyPlan?: unknown; createdById?: unknown; createdByName?: unknown };
+  // A manual price shows to the customer as its amount; why and by whom stays with staff.
+  const { cancelCustomerNote, cancelReviewedById: _reviewer, idempotencyKey: _key, loyaltyPlan: _plan, createdById: _creator, createdByName: _creatorName, priceAdjustmentReason: _why, priceAdjustedById: _adjuster, priceAdjustedByName: _adjusterName, ...rest } = booking as T & { cancelReviewedById?: unknown; idempotencyKey?: unknown; loyaltyPlan?: unknown; createdById?: unknown; createdByName?: unknown; priceAdjustmentReason?: unknown; priceAdjustedById?: unknown; priceAdjustedByName?: unknown };
   return { ...rest, cancelReviewNote: cancelCustomerNote };
 }
 
@@ -185,6 +190,7 @@ export class BookingsService {
     private invoices: InvoiceLedgerService,
     private ledger: PaymentLedgerService,
     private appSettings: AppSettingsService,
+    private waitlist: WaitlistService,
   ) {}
 
   private assertBookable(
@@ -249,7 +255,9 @@ export class BookingsService {
       packagePriceTiers: trip.package ? packagePriceTiers(trip.package) : null,
       singlesFromSeat: singles.from,
       singlesToSeat: singles.to,
-      pricePerSeat: Number(trip.package?.price ?? trip.price),
+      // The same seat price the quote charges: flexible pricing when the trip has it on, the listed price otherwise.
+      pricePerSeat: trip.package ? Number(trip.package.price) : seatPricing(trip).price / 100,
+      basePricePerSeat: Number(trip.package?.price ?? trip.price),
       seats,
     };
   }
@@ -266,7 +274,10 @@ export class BookingsService {
       await this.assertSeatRules(trip, seats, dto.category);
 
       const now = new Date();
-      const heldUntil = new Date(now.getTime() + holdMinutes * 60 * 1000);
+      const usualHold = new Date(now.getTime() + holdMinutes * 60 * 1000);
+      // Seats offered from the waiting list stay the customer's until the offer ends, even while they pick them again at checkout.
+      const offerEnds = await this.waitlist.offerHoldUntil(tx, userId, dto.tripId, now);
+      const heldUntil = offerEnds && offerEnds > usualHold ? offerEnds : usualHold;
       await this.dropHolds(tx, userId, dto.tripId);
       const held = await tx.seat.updateMany({
         where: { tripId: dto.tripId, seatNumber: { in: seats }, ...holdAvailableTo(userId, now) },
@@ -346,8 +357,10 @@ export class BookingsService {
 
     const legs = seated.map(({ leg, trip, seats }, index) => {
       // A package charges its total for the group's size; an ordinary trip charges each seat.
-      const seatsSubtotal = trip.package ? packageGroupTotal(trip.package, seats.length) : toHalalas(trip.price) * seats.length;
-      const unitPrice = seats.length ? Math.round(seatsSubtotal / seats.length) : toHalalas(trip.price);
+      // One seat price for the quote and the booking alike; without flexible pricing it is the listed price.
+      const pricing = seatPricing(trip);
+      const seatsSubtotal = trip.package ? packageGroupTotal(trip.package, seats.length) : pricing.price * seats.length;
+      const unitPrice = seats.length ? Math.round(seatsSubtotal / seats.length) : pricing.price;
       // A package's price takes its stay with it, so only an ordinary trip can be booked as transport alone.
       if ((dto.transportOnly || leg.withoutHousing) && trip.package) throw new BadRequestException('الباقة تُحجز كاملة، ولا يمكن حجز النقل منها وحده');
       // Its seat price already pays for the stay, so selling it as transport would charge for a room the customer never gets.
@@ -356,44 +369,74 @@ export class BookingsService {
       }
       const stay = customStayLeg ? (index === 0 ? customStayLeg : null) : dto.transportOnly ? null : this.priceStay(trip, leg, seats.length);
       const housingAmount = stay?.amount ?? 0;
-      return { leg, trip, seats, unitPrice, stay, seatsSubtotal, housingAmount, subtotal: seatsSubtotal + housingAmount };
+      return { leg, trip, seats, unitPrice, pricing, stay, seatsSubtotal, housingAmount, subtotal: seatsSubtotal + housingAmount };
     });
 
     const subtotal = legs.reduce((sum, leg) => sum + leg.subtotal, 0);
     const seatCount = legs.reduce((sum, leg) => sum + leg.seats.length, 0);
+    // Points, the wallet and vouchers bought with points pay for transport only, never the stay: this is each leg's ticket part.
+    const legShares = legs.map((leg) =>
+      transportShare({ subtotal: leg.subtotal / 100, housingAmount: leg.housingAmount / 100, seats: leg.seats.length, trip: { price: leg.trip.price, packageId: leg.trip.packageId } }),
+    );
+    const legTransport = legs.map((leg, idx) => Math.round(leg.subtotal * legShares[idx]));
+    const transportSubtotal = legTransport.reduce((sum, amount) => sum + amount, 0);
 
     const coupon = dto.couponCode ? await this.resolveCoupon(db, userId, dto.couponCode) : null;
+    // A voucher bought with points is points spent, so like them it only comes off the tickets.
+    const transportOnlyCoupon = !!coupon?.ownerUserId;
     let discount = 0;
     if (coupon) {
+      const base = transportOnlyCoupon ? transportSubtotal : subtotal;
       discount =
         coupon.type === 'PERCENT'
-          ? Math.round((subtotal * Number(coupon.value)) / 100)
+          ? Math.round((base * Number(coupon.value)) / 100)
           : coupon.type === 'FIXED_TOTAL'
             ? toHalalas(coupon.value)
             : toHalalas(coupon.value) * seatCount;
-      discount = Math.min(discount, subtotal);
+      discount = Math.min(discount, base);
     }
     const afterCoupon = subtotal - discount;
 
-    const user = await db.user.findUniqueOrThrow({ where: { id: userId }, select: { walletBalance: true, loyaltyPoints: true } });
+    const weights = legs.map((leg) => leg.subtotal);
+    const legDiscounts = transportOnlyCoupon ? allocate(discount, legTransport) : allocate(discount, weights);
+    // The ticket part each leg still owes once the coupon is off; an ordinary coupon comes off tickets and stay in proportion.
+    const transportAfterCoupon = legTransport.map((amount, idx) =>
+      Math.max(0, amount - (transportOnlyCoupon ? legDiscounts[idx] : Math.round(legDiscounts[idx] * legShares[idx]))),
+    );
+
+    const user = await db.user.findUniqueOrThrow({ where: { id: userId }, select: { walletBalance: true, walletTransportBalance: true, loyaltyPoints: true } });
     const program = await this.loyalty.getProgram(db);
-    const redemption = this.loyalty.priceRedemption(program, user.loyaltyPoints, dto.pointsToRedeem ?? 0, afterCoupon);
+    const redeemable = Math.min(afterCoupon, transportAfterCoupon.reduce((sum, amount) => sum + amount, 0));
+    const redemption = this.loyalty.priceRedemption(program, user.loyaltyPoints, dto.pointsToRedeem ?? 0, redeemable);
     const total = afterCoupon - redemption.discount;
 
+    const legPointDiscounts = allocate(redemption.discount, transportAfterCoupon);
+    const legPoints = allocate(redemption.points, transportAfterCoupon);
+    // What each leg still owes, split into its tickets (after the coupon and points) and the rest, which is its stay.
+    const legOwed = legs.map((leg, idx) => Math.max(0, leg.subtotal - legDiscounts[idx] - legPointDiscounts[idx]));
+    const ticketRoom = legs.map((_, idx) => Math.max(0, Math.min(transportAfterCoupon[idx] - legPointDiscounts[idx], legOwed[idx])));
+    const stayRoom = legs.map((_, idx) => legOwed[idx] - ticketRoom[idx]);
+    const sum = (values: number[]) => values.reduce((acc, value) => acc + value, 0);
+
+    // Compensations and promotional credit pay for tickets only; ordinary money (refunds) pays for anything.
+    // Tickets take transport-only credit first, so ordinary money is left for the stay.
     const walletBalance = toHalalas(user.walletBalance);
-    const walletUsed = dto.useWallet ? Math.min(walletBalance, total) : 0;
+    const walletTransportBalance = Math.min(walletBalance, toHalalas(user.walletTransportBalance));
+    const walletOrdinary = walletBalance - walletTransportBalance;
+    const walletOnTickets = dto.useWallet ? Math.min(walletBalance, sum(ticketRoom)) : 0;
+    const walletFromTransport = Math.min(walletTransportBalance, walletOnTickets);
+    const walletOnStay = dto.useWallet ? Math.min(walletOrdinary - (walletOnTickets - walletFromTransport), sum(stayRoom)) : 0;
+    const walletUsed = walletOnTickets + walletOnStay;
     const payable = total - walletUsed;
 
     const vatSetting = await db.setting.findUnique({ where: { key: 'vatRate' } });
     const vatRate = vatSetting ? Number(vatSetting.value) : DEFAULT_VAT_RATE;
     const vat = Math.round((total * vatRate) / (100 + vatRate));
 
-    const weights = legs.map((leg) => leg.subtotal);
-    const legDiscounts = allocate(discount, weights);
-    const legPointDiscounts = allocate(redemption.discount, weights);
-    const legPoints = allocate(redemption.points, weights);
-    // Split by what each leg still owes: by subtotal, rounding could take a halala more than a leg owes and leave the other a halala short.
-    const legWallets = allocate(walletUsed, legs.map((leg, idx) => leg.subtotal - legDiscounts[idx] - legPointDiscounts[idx]));
+    const ticketWallets = allocate(walletOnTickets, ticketRoom);
+    const stayWallets = allocate(walletOnStay, stayRoom);
+    const legWallets = legs.map((_, idx) => ticketWallets[idx] + stayWallets[idx]);
+    const legWalletTransport = allocate(walletFromTransport, ticketWallets);
     const legVats = allocate(vat, weights);
 
     const pricedLegs = legs.map((leg, idx) => ({
@@ -402,6 +445,7 @@ export class BookingsService {
       pointsDiscount: legPointDiscounts[idx],
       points: legPoints[idx],
       wallet: legWallets[idx],
+      walletTransport: legWalletTransport[idx],
       vat: legVats[idx],
       total: leg.subtotal - legDiscounts[idx] - legPointDiscounts[idx],
       payable: leg.subtotal - legDiscounts[idx] - legPointDiscounts[idx] - legWallets[idx],
@@ -424,6 +468,7 @@ export class BookingsService {
       customStay,
       skipsCustomStay,
       walletUsed,
+      walletOnTickets,
       payable,
       pricedLegs,
       plans,
@@ -437,6 +482,8 @@ export class BookingsService {
           destination: leg.trip.destination,
           seats: leg.seats,
           pricePerSeat: toSar(leg.unitPrice),
+          // The listed seat price before flexible pricing, so the app can show what moved it; equal to pricePerSeat when it is off.
+          basePricePerSeat: leg.trip.package ? toSar(leg.unitPrice) : toSar(leg.pricing.base),
           // A package's seatsSubtotal is its total for the group's size, so the app shows it as such, not seats × price.
           isPackage: !!leg.trip.package,
           seatsSubtotal: toSar(leg.seatsSubtotal),
@@ -460,6 +507,8 @@ export class BookingsService {
         },
         total: toSar(total),
         walletBalance: toSar(walletBalance),
+        // Of the balance, what pays for transport only (compensations and promotional credit).
+        walletTransportBalance: toSar(walletTransportBalance),
         walletUsed: toSar(walletUsed),
         payable: toSar(payable),
         vatRate,
@@ -633,7 +682,10 @@ export class BookingsService {
             await takeLinkedSeats(tx, leg.trip.id, leg.seats, holdAvailableTo(userId, now), { returnsOnOtherLeg: quote.pricedLegs.length > 1 });
 
             const boardingPoint = await this.resolveBoardingPoint(tx, leg.leg, leg.trip.id);
-            const bookingReference = `DRB-${randomCode(8)}`;
+            // The same numbering as a branch's bookings; the plain client, so the counter is not held while this one saves.
+            const bookingReference = await nextBookingNumber(this.prisma);
+            // Stored on the booking, so every screen reads what was bought here rather than what the trip offers.
+            const hasStay = !asTransport[legIndex] && (!!quote.customStay || !!quote.housing[legIndex]?.choice);
             const paidOnline = leg.payable > 0;
 
             const booking = await tx.booking.create({
@@ -645,6 +697,7 @@ export class BookingsService {
                 status: 'CONFIRMED',
                 category,
                 roomChoice: quote.housing[legIndex]?.choice ?? null,
+                serviceType: serviceTypeOf(hasStay, includesVisits(leg.trip.bookingType)),
                 // The customer's own package: both legs carry it, and the stay sits on the outbound like a branch's journey.
                 ...(quote.customStay && {
                   kind: 'PACKAGE_ROUND_STAY' as const,
@@ -671,6 +724,8 @@ export class BookingsService {
                 walletAmount: toSar(leg.wallet),
                 vatAmount: toSar(leg.vat),
                 totalPrice: toSar(leg.total),
+                // The seat price as charged now, so a later change of rules or occupancy never rewrites what was sold.
+                ...(!leg.trip.package && { seatPrice: toSar(leg.pricing.price), seatBasePrice: toSar(leg.pricing.base) }),
                 couponId: quote.coupon?.id,
                 boardingPointId: boardingPoint?.id,
                 boardingPointName: boardingPoint?.name,
@@ -683,6 +738,7 @@ export class BookingsService {
                   create: {
                     amount: toSar(leg.payable),
                     walletAmount: toSar(leg.wallet),
+                    walletTransportAmount: toSar(leg.walletTransport),
                     currency: 'SAR',
                     method: paidOnline ? dto.paymentMethod ?? 'mada' : 'wallet_balance',
                     status: paidOnline ? 'SIMULATED' : 'COMPLETED',
@@ -734,11 +790,15 @@ export class BookingsService {
             await this.wallet.apply(tx, {
               userId,
               amount: -toSar(quote.walletUsed),
+              // Only the tickets' part may come from transport-only credit; the stay is paid from ordinary money.
+              transportAmount: toSar(quote.walletOnTickets),
               type: 'DEBIT_SPENT',
               description: `خصم حجز ${created.map((b) => b.reference).join(' و ')}`,
               bookingId: created[0].id,
             });
           }
+          // A customer who was waiting for these trips has their place in the queue closed: the seats are theirs now.
+          await this.waitlist.markBooked(tx, userId, quote.pricedLegs.map((leg) => leg.trip.id));
           await this.notifications.toBookingOwners(tx, 'BOOKING_CONFIRMED', created.map((booking) => booking.id));
           for (const booking of created) {
             await this.notifications.toStaffAboutBooking(tx, 'STAFF_NEW_BOOKING', ['bookings.view'], booking.id, { exceptUserId: userId });

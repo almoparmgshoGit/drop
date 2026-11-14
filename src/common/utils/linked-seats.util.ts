@@ -70,6 +70,7 @@ export async function returnRideOf(db: Pick<Prisma.TransactionClient, 'booking' 
           destination: true,
           departureTime: true,
           tripStatus: true,
+          executedAt: true,
           boardingPoints: { select: { name: true, time: true }, take: 1 },
         },
       },

@@ -90,6 +90,20 @@ export class TripAccountsController {
     return this.accounts.addEntry(req.user, id, dto, files);
   }
 
+  @Post(':id/close')
+  @RequirePermission('trip_accounts.manage')
+  @ApiOperation({ summary: "Close an executed trip's account (financial closing); its lines are then final until reopened" })
+  close(@Req() req, @Param('id') id: string) {
+    return this.accounts.close(req.user, id);
+  }
+
+  @Post(':id/reopen')
+  @RequirePermission('trip_accounts.manage')
+  @ApiOperation({ summary: 'Reopen a closed trip account' })
+  reopen(@Param('id') id: string) {
+    return this.accounts.reopen(id);
+  }
+
   @Patch(':id/tax-flags')
   @RequirePermission('trip_accounts.manage')
   @ApiOperation({ summary: 'Say whether the bus rent and hotel bills came with tax invoices' })

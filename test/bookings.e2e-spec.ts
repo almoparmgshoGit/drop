@@ -50,6 +50,17 @@ describe('Trips, bookings & tickets (e2e)', () => {
       expect(refreshed.body.availableSeats).toBe(46);
     });
 
+    it('numbers an app booking like a branch one and stores its source and type', async () => {
+      const trip = await createTrip();
+      const user = await loginPassenger(app);
+      const res = await book(user, { legs: legsFor(trip, ['20']), passengers: people(1) }).expect(201);
+      const [booking] = res.body.bookings;
+      expect(booking.bookingReference).toMatch(/^DH-\d{4}-\d{4,}$/);
+      expect(booking).toMatchObject({ source: 'APP', serviceType: 'TRANSPORT_ONLY' });
+      expect(Number(booking.priceAdjustment)).toBe(0);
+      expect(booking).not.toHaveProperty('priceAdjustedByName');
+    });
+
     it('exposes every seat of a large bus', async () => {
       const trip = await createTrip();
       const user = await loginPassenger(app);

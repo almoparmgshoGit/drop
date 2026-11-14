@@ -134,6 +134,17 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     return item?.expiry ? Math.max(0, item.expiry - Date.now()) : 0;
   }
 
+  /** For the health check: 'not_configured' without REDIS_HOST, else whether Redis answers. Never throws. */
+  async health(): Promise<'ok' | 'down' | 'not_configured'> {
+    if (!this.isShared) return 'not_configured';
+    if (!this.client || this.client.status !== 'ready') return 'down';
+    try {
+      return (await this.client.ping()) === 'PONG' ? 'ok' : 'down';
+    } catch {
+      return 'down';
+    }
+  }
+
   async setnx(key: string, value: string, ttlSeconds: number): Promise<boolean> {
     if (this.redis()) return (await this.run((client) => client.set(key, value, 'EX', ttlSeconds, 'NX'))) === 'OK';
     if (this.readMemory(key)) return false;

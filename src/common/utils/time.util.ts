@@ -14,6 +14,14 @@ export function riyadhDayRange(date: string): { start: Date; end: Date } | null 
   return { start, end: new Date(start.getTime() + DAY_MS) };
 }
 
+/** The instants from the start of Riyadh day `from` to the end of Riyadh day `to` (YYYY-MM-DD, both included); null when either is not a real date. */
+export function riyadhDaysRange(from: string, to: string): { gte: Date; lt: Date } | null {
+  const first = riyadhDayRange(from);
+  const last = riyadhDayRange(to);
+  if (!first || !last) return null;
+  return first.start <= last.start ? { gte: first.start, lt: last.end } : { gte: last.start, lt: first.end };
+}
+
 export function startOfRiyadhDay(now = new Date()): Date {
   const shifted = now.getTime() + RIYADH_OFFSET_MS;
   return new Date(shifted - (shifted % DAY_MS) - RIYADH_OFFSET_MS);

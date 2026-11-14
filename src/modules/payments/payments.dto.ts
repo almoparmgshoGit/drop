@@ -13,6 +13,15 @@ export class PaymentsQuery {
   @Matches(/^\d{4}-(0[1-9]|1[0-2])$/)
   month?: string;
 
+  /** A range of Riyadh days, both included; when both ends are given it replaces the month. */
+  @IsOptional()
+  @Matches(/^\d{4}-\d{2}-\d{2}$/)
+  from?: string;
+
+  @IsOptional()
+  @Matches(/^\d{4}-\d{2}-\d{2}$/)
+  to?: string;
+
   @IsOptional()
   @IsIn(PAYMENT_STATES)
   state?: PaymentState;

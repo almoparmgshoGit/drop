@@ -23,7 +23,7 @@ describe('Printed branch tickets and branch performance', () => {
         branchId,
         kind: 'TRANSPORT_OUTBOUND',
         legs: [{ leg: 'OUTBOUND', tripId: trip.id, seats }],
-        customer: { name: 'صاحب الحجز', phone: nextPhone().replace('+966', '0') },
+        customer: { name: 'صاحب الحجز', phone: nextPhone().replace('+966', '0'), nationality: 'مصري', city: 'جدة', gender: 'MALE', birthDate: '1990-01-01', idType: 'PASSPORT', idNumber: 'A1234567' },
         passengers: seats.map((_, index) => ({ fullName: names[index] ?? `مسافر ${index + 1}` })),
         payments: [],
         idempotencyKey: `paper-${seat}-${Math.random()}`,

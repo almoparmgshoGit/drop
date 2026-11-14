@@ -21,10 +21,24 @@ export class TripAccountsQuery {
   @Matches(DATE, { message: 'التاريخ غير صحيح' })
   date?: string;
 
+  /** Riyadh days YYYY-MM-DD, both included; when both are given they replace the month of `date` in the month (period) view. */
+  @IsOptional()
+  @Matches(DATE, { message: 'التاريخ غير صحيح' })
+  from?: string;
+
+  @IsOptional()
+  @Matches(DATE, { message: 'التاريخ غير صحيح' })
+  to?: string;
+
   @IsOptional()
   @IsString()
   @MaxLength(100)
   destination?: string;
+
+  /** Executed trips waiting for their financial closing, closed ones, or those still running. */
+  @IsOptional()
+  @IsIn(['OPEN', 'AWAITING_CLOSE', 'CLOSED'])
+  closing?: 'OPEN' | 'AWAITING_CLOSE' | 'CLOSED';
 
   /** Narrows the by-trip view by trip code. */
   @IsOptional()

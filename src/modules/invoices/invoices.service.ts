@@ -4,13 +4,13 @@ import { Injectable, NotFoundException } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { InvoiceLedgerService } from '../../common/services/invoice-ledger.service';
 import { PrismaService } from '../../common/services/prisma.service';
-import { BOOKING_KIND_LABELS } from '../../common/utils/booking-kinds.util';
-import { includesHousing } from '../../common/utils/booking-types.util';
+import { bookingTypeLabel, serviceHasStay } from '../../common/utils/booking-kinds.util';
 import { amountInWords, creditNoteNumber, invoiceNumber, vatInside, zatcaQr } from '../../common/utils/invoice.util';
 import { halalas, hotelBookingCost, netBookingFigures } from '../../common/utils/payment.util';
-import { riyadhMonth, riyadhMonthRange } from '../../common/utils/time.util';
+import { riyadhDaysRange, riyadhMonth, riyadhMonthRange } from '../../common/utils/time.util';
 import { CashActor } from '../cash/cash.service';
 import { CollectionsService } from '../cash/collections.service';
+import { ZatcaService } from '../zatca/zatca.service';
 import { InvoicesQuery, TaxReportQuery } from './invoices.dto';
 
 const PAGE_SIZE = 50;
@@ -26,7 +26,6 @@ const PAYMENT_LABELS: Record<string, string> = {
   mixed: 'طرق متعددة',
 };
 const ROOM_LABELS: Record<string, string> = { SHARED: 'غرفة مشتركة', PRIVATE: 'غرفة خاصة' };
-const TRANSPORT_LABELS: Record<string, string> = { TRANSPORT_ONLY: 'نقل', WITH_HOTEL: 'نقل مع سكن', WITH_VISITS: 'نقل مع زيارة معالم', WITH_HOTEL_VISITS: 'نقل مع سكن وزيارة معالم' };
 
 /** The three months of a quarter such as 2026-Q4. */
 const quarterMonths = (quarter: string) => {
@@ -57,12 +56,14 @@ export class InvoicesService {
     private prisma: PrismaService,
     private ledger: InvoiceLedgerService,
     private collections: CollectionsService,
+    private zatca: ZatcaService,
   ) {}
 
   async list(actor: CashActor, query: InvoicesQuery) {
     const month = query.month ?? riyadhMonth(new Date());
     const scope = await this.collections.branchScope(actor);
-    const inMonth: Prisma.InvoiceWhereInput = { issuedAt: riyadhMonthRange(month), booking: scope };
+    const days = query.from && query.to ? riyadhDaysRange(query.from, query.to) : null;
+    const inMonth: Prisma.InvoiceWhereInput = { issuedAt: days ?? riyadhMonthRange(month), booking: scope };
     const where: Prisma.InvoiceWhereInput = { ...inMonth, ...(query.tripId && { tripId: query.tripId }) };
 
     const [invoices, trips, vatRate] = await Promise.all([
@@ -88,6 +89,8 @@ export class InvoicesService {
       this.prisma.invoice.groupBy({ where: inMonth, by: ['tripId', 'tripCode'], orderBy: { tripCode: 'asc' } }),
       this.ledger.vatRate(this.prisma),
     ]);
+    // Phase 2 only: empty until e-invoicing has signed something, and then the register shows each invoice's reporting state.
+    const zatcaStatuses = await this.zatca.statusByInvoice(invoices.map((invoice) => invoice.id));
 
     const totals = { taxable: 0, vat: 0, total: 0, collected: 0, remaining: 0 };
     const rows = invoices.map((invoice) => {
@@ -115,6 +118,7 @@ export class InvoicesService {
         remaining: sar(remaining),
         isCancelled: invoice.booking.status === 'CANCELLED',
         credited: sar(invoice.creditNotes.reduce((sum, note) => sum + halalas(note.total), 0)),
+        zatcaStatus: zatcaStatuses.get(invoice.id) ?? null,
       };
     });
 
@@ -149,8 +153,9 @@ export class InvoicesService {
     const booking = await this.prisma.booking.findUnique({ where: { id: bookingId }, select: { userId: true } });
     if (!booking || booking.userId !== userId) throw new NotFoundException('لا توجد فاتورة لهذا الحجز');
     // The paper boarding code and the branch are for the counter's printout, not the customer's copy.
-    const { boardingCode: _code, branchName: _branch, ...invoice } = await this.buildPrintable(bookingId);
-    return invoice;
+    // The reason for a manual price is a staff note; the customer sees the amount.
+    const { boardingCode: _code, branchName: _branch, breakdown: { adjustmentReason: _why, ...breakdown }, ...invoice } = await this.buildPrintable(bookingId);
+    return { ...invoice, breakdown };
   }
 
   private async buildPrintable(bookingId: string) {
@@ -169,6 +174,13 @@ export class InvoicesService {
             tripId: true,
             roomChoice: true,
             kind: true,
+            serviceType: true,
+            subtotal: true,
+            housingAmount: true,
+            discountAmount: true,
+            pointsDiscount: true,
+            priceAdjustment: true,
+            priceAdjustmentReason: true,
             stayNights: true,
             stayHotel: { select: { name: true } },
             branch: { select: { name: true } },
@@ -211,13 +223,23 @@ export class InvoicesService {
       tripDate: invoice.tripDate,
       departureTime: booking.trip.departureTime,
       returnTime: await this.returnTime(booking),
-      bookingType: booking.kind ? BOOKING_KIND_LABELS[booking.kind] : TRANSPORT_LABELS[booking.trip.bookingType] ?? 'نقل',
+      // The booking's own type, the same words as every other screen.
+      bookingType: bookingTypeLabel(booking),
       housing: booking.stayHotel
         ? `${booking.stayHotel.name} · ${roomType ? ROOM_LABELS[roomType] : ''} · ${booking.stayNights} ليالٍ`
-        : includesHousing(booking.trip.bookingType) ? (roomType ? ROOM_LABELS[roomType] : 'يُحدد لاحقًا') : 'لا يوجد سكن',
+        : serviceHasStay(booking.serviceType) ? (roomType ? ROOM_LABELS[roomType] : 'يُحدد لاحقًا') : 'لا يوجد سكن',
       branchName: booking.branch?.name ?? null,
       // Only where it can board anyone. Everything else prints the plain reference, which only finds the booking.
       boardingCode: booking.source === 'BRANCH' && booking.status !== 'CANCELLED' ? signPaperCode(booking.bookingReference, this.config.getOrThrow('TICKET_SIGNING_SECRET')) : null,
+      // How the booking's price was reached, so two bookings of the same trip at different prices can be told apart.
+      breakdown: {
+        transport: sar(halalas(booking.subtotal) - halalas(booking.housingAmount)),
+        housing: Number(booking.housingAmount),
+        couponDiscount: Number(booking.discountAmount),
+        pointsDiscount: Number(booking.pointsDiscount),
+        adjustment: Number(booking.priceAdjustment),
+        adjustmentReason: booking.priceAdjustmentReason,
+      },
       subtotal: Number(invoice.subtotal),
       discount: sar(halalas(invoice.subtotal) - halalas(invoice.total)),
       taxable: Number(invoice.taxable),
@@ -238,7 +260,11 @@ export class InvoicesService {
       })),
       seller,
       // Without a VAT number the code would be invalid, so the page asks for the number instead.
-      qr: seller.vatNumber ? zatcaQr({ seller: seller.name, vatNumber: seller.vatNumber, issuedAt: invoice.issuedAt, total, vat }) : null,
+      // Once e-invoicing phase 2 has signed this invoice, its QR carries the hash, signature and key (tags 1–9); otherwise phase 1 as before.
+      ...(await this.zatca.printableQr(invoice.id).then((signedQr) => ({
+        qr: signedQr ?? (seller.vatNumber ? zatcaQr({ seller: seller.name, vatNumber: seller.vatNumber, issuedAt: invoice.issuedAt, total, vat }) : null),
+        qrPhase: signedQr ? 2 : 1,
+      }))),
       contacts: settings.invoiceContacts.split('\n').map((line) => line.trim()).filter(Boolean),
       notice: settings.invoiceTripNotice,
       footer: settings.invoiceFooter,

@@ -32,7 +32,7 @@ describe('Branches, their staff and counter bookings', () => {
   const single = (overrides: Record<string, unknown> = {}) => ({
     kind: 'TRANSPORT_OUTBOUND',
     legs: [{ leg: 'OUTBOUND', tripId: outbound.id, seats: [nextSeat()] }],
-    customer: { name: 'عبدالله العتيبي', phone: nextPhone().replace('+966', '0') },
+    customer: { name: 'عبدالله العتيبي', phone: nextPhone().replace('+966', '0'), nationality: 'مصري', city: 'جدة', gender: 'MALE', birthDate: '1990-01-01', idType: 'PASSPORT', idNumber: 'A1234567' },
     passengers: [{ fullName: 'عبدالله العتيبي', nationalId: '1087345291' }],
     ...overrides,
   });
@@ -40,6 +40,9 @@ describe('Branches, their staff and counter bookings', () => {
   beforeAll(async () => {
     ({ app, prisma } = await createTestApp());
     await resetDatabase(prisma);
+    // The counter keeps families out of the singles section. These tests seat families from seat 1 upward, so the
+    // singles section (used while a trip has no bus) is the back row only.
+    await prisma.setting.createMany({ data: [{ key: 'defaultSinglesFromSeat', value: '45' }, { key: 'defaultSinglesToSeat', value: '49' }] });
     const adminUser = await createStaff(prisma, 'ADMIN');
     admin = await loginStaff(app, adminUser.phone);
 
@@ -139,7 +142,7 @@ describe('Branches, their staff and counter bookings', () => {
       const body = single();
       const res = await request(http()).post(`${API}/branch-bookings`).set(clerk.auth).send(body).expect(201);
       expect(res.body).toMatchObject({ total: 110, paid: 0, remaining: 110 });
-      expect(res.body.legs[0].reference).toMatch(/^DR-\d+$/);
+      expect(res.body.legs[0].reference).toMatch(/^DH-\d{4}-\d{4,}$/);
 
       const booking = await prisma.booking.findUniqueOrThrow({ where: { id: res.body.legs[0].id }, include: { invoice: true, payment: true, passengers: { include: { ticket: true } }, user: true } });
       expect(booking).toMatchObject({ source: 'BRANCH', branchId, kind: 'TRANSPORT_OUTBOUND', leg: 'OUTBOUND', status: 'CONFIRMED' });
@@ -187,16 +190,81 @@ describe('Branches, their staff and counter bookings', () => {
       expect(again.body.groupReference).toBe(first.body.groupReference);
     });
 
-    it('needs its own permission to change a price, and records both figures', async () => {
-      await request(http()).post(`${API}/branch-bookings`).set(clerk.auth).send(single({ finalTotal: 90 })).expect(403);
-      const res = await request(http()).post(`${API}/branch-bookings`).set(manager.auth).send(single({ finalTotal: 90 })).expect(201);
+    it('needs its own permission to change a price, a reason for it, and records both figures', async () => {
+      await request(http()).post(`${API}/branch-bookings`).set(clerk.auth).send(single({ finalTotal: 90, priceReason: 'عميل دائم' })).expect(403);
+      const unexplained = await request(http()).post(`${API}/branch-bookings`).set(manager.auth).send(single({ finalTotal: 90 })).expect(400);
+      expect(JSON.stringify(unexplained.body)).toContain('سبب تعديل السعر');
+      const res = await request(http()).post(`${API}/branch-bookings`).set(manager.auth).send(single({ finalTotal: 90, priceReason: 'عميل دائم' })).expect(201);
       const booking = await prisma.booking.findUniqueOrThrow({ where: { id: res.body.legs[0].id }, include: { events: true, invoice: true } });
       expect(Number(booking.totalPrice)).toBe(90);
-      expect(Number(booking.discountAmount)).toBe(20);
+      // The typed price is the manual adjustment, kept apart from offers and coupons, with who changed it and why.
+      expect(Number(booking.subtotal)).toBe(110);
+      expect(Number(booking.discountAmount)).toBe(0);
+      expect(Number(booking.priceAdjustment)).toBe(-20);
+      expect(booking.priceAdjustmentReason).toBe('عميل دائم');
+      expect(booking.priceAdjustedById).toBe(managerUser.id);
       expect(Number(booking.vatAmount)).toBeCloseTo(11.74, 2);
       expect(Number(booking.invoice?.vat)).toBeCloseTo(11.74, 2);
       const event = booking.events.find((row) => row.action === 'PRICE_OVERRIDDEN');
-      expect(event).toMatchObject({ before: { total: 110 }, after: { total: 90 } });
+      expect(event).toMatchObject({ before: { total: 110 }, after: { total: 90 }, reason: 'عميل دائم', actorId: managerUser.id });
+
+      const printable = await request(http()).get(`${API}/invoices/bookings/${booking.id}`).set(manager.auth).expect(200);
+      {
+        expect(printable.body.breakdown).toMatchObject({ transport: 110, housing: 0, couponDiscount: 0, adjustment: -20, adjustmentReason: 'عميل دائم' });
+      }
+    });
+
+    it('gives app and branch bookings one numbering, one month counter, found by search', async () => {
+      const first = await request(http()).post(`${API}/branch-bookings`).set(clerk.auth).send(single()).expect(201);
+      const second = await request(http()).post(`${API}/branch-bookings`).set(clerk.auth).send(single()).expect(201);
+      const [a, b] = [first.body.legs[0].reference, second.body.legs[0].reference];
+      expect(a.slice(0, 8)).toBe(b.slice(0, 8));
+      expect(Number(b.split('-')[2])).toBe(Number(a.split('-')[2]) + 1);
+      const saved = await prisma.booking.findUniqueOrThrow({ where: { id: first.body.legs[0].id } });
+      expect(saved.source).toBe('BRANCH');
+
+      // Several bookings at the same moment never share a number.
+      const together = await Promise.all(Array.from({ length: 4 }, () => request(http()).post(`${API}/branch-bookings`).set(clerk.auth).send(single())));
+      const references = together.map((res) => res.body.legs[0].reference);
+      expect(new Set(references).size).toBe(4);
+
+      const found = await request(http()).get(`${API}/bookings/admin/search`).query({ q: a }).set(admin.auth).expect(200);
+      expect(found.body.items.map((row: any) => row.bookingReference)).toContain(a);
+    });
+
+    it('stores what was bought on the booking, so every screen shows one type', async () => {
+      // A trip that offers a stay, sold at the counter as transport alone: the booking says transport, not the trip's type.
+      await prisma.trip.update({ where: { id: outbound.id }, data: { bookingType: 'WITH_HOTEL' } });
+      try {
+        const res = await request(http()).post(`${API}/branch-bookings`).set(clerk.auth).send(single()).expect(201);
+        const booking = await prisma.booking.findUniqueOrThrow({ where: { id: res.body.legs[0].id } });
+        expect(booking.serviceType).toBe('TRANSPORT_ONLY');
+        expect(res.body.kindLabel).toBe('نقل فقط · ذهاب فقط');
+
+        const manifest = await request(http()).get(`${API}/manifests/${outbound.id}`).set(admin.auth).expect(200);
+        expect(manifest.body.passengers.find((p: any) => p.bookingId === booking.id).bookingKind).toBe('نقل فقط · ذهاب فقط');
+        const printable = await request(http()).get(`${API}/invoices/bookings/${booking.id}`).set(admin.auth).expect(200);
+        expect(printable.body.bookingType).toBe('نقل فقط · ذهاب فقط');
+        const listed = await request(http()).get(`${API}/bookings/admin/${booking.id}`).set(admin.auth).expect(200);
+        expect(listed.body).toMatchObject({ serviceType: 'TRANSPORT_ONLY', kind: 'TRANSPORT_OUTBOUND' });
+      } finally {
+        await prisma.trip.update({ where: { id: outbound.id }, data: { bookingType: 'TRANSPORT_ONLY' } });
+      }
+    });
+
+    it('offers visits only on a trip that has them, and saves them on the booking', async () => {
+      await request(http()).post(`${API}/branch-bookings/quote`).set(clerk.auth).send({ kind: 'TRANSPORT_OUTBOUND', withVisits: true, legs: [{ leg: 'OUTBOUND', tripId: outbound.id, seats: ['1'] }] }).expect(400);
+
+      const visiting = (await request(http()).post(`${API}/trips`).set(admin.auth).send(tripPayload({ price: 70 })).expect(201)).body;
+      await prisma.trip.update({ where: { id: visiting.id }, data: { bookingType: 'WITH_VISITS' } });
+      const quote = await request(http()).post(`${API}/branch-bookings/quote`).set(clerk.auth).send({ kind: 'TRANSPORT_OUTBOUND', withVisits: true, legs: [{ leg: 'OUTBOUND', tripId: visiting.id, seats: ['1'] }] }).expect(201);
+      expect(quote.body).toMatchObject({ serviceType: 'WITH_VISITS', offersVisits: true, kindLabel: 'نقل مع زيارة معالم · ذهاب فقط', total: 70 });
+
+      const withVisits = await request(http()).post(`${API}/branch-bookings`).set(clerk.auth).send(single({ withVisits: true, legs: [{ leg: 'OUTBOUND', tripId: visiting.id, seats: ['2'] }] })).expect(201);
+      const without = await request(http()).post(`${API}/branch-bookings`).set(clerk.auth).send(single({ withVisits: false, legs: [{ leg: 'OUTBOUND', tripId: visiting.id, seats: ['3'] }] })).expect(201);
+      const saved = await prisma.booking.findMany({ where: { id: { in: [withVisits.body.legs[0].id, without.body.legs[0].id] } }, select: { id: true, serviceType: true } });
+      expect(saved.find((row) => row.id === withVisits.body.legs[0].id)?.serviceType).toBe('WITH_VISITS');
+      expect(saved.find((row) => row.id === without.body.legs[0].id)?.serviceType).toBe('TRANSPORT_ONLY');
     });
 
     it('needs collection rights to take money', async () => {
@@ -213,11 +281,79 @@ describe('Branches, their staff and counter bookings', () => {
       await request(http()).post(`${API}/branch-bookings`).set(session.auth).send(single()).expect(400);
     });
 
+    it('shows a branch employee only their own branch on the dashboard', async () => {
+      await request(http()).post(`${API}/branch-bookings`).set(clerk.auth).send(single()).expect(201);
+      const withDashboard = async (branch: string) => {
+        const user = await createStaff(prisma, 'STAFF', nextPhone(), 'rank-branch-clerk');
+        await prisma.user.update({ where: { id: user.id }, data: { branchId: branch, extraPermissions: ['dashboard.view'] } });
+        return loginStaff(app, user.phone);
+      };
+      const mine = await request(http()).get(`${API}/dashboard/stats`).set((await withDashboard(branchId)).auth).expect(200);
+      const theirs = await request(http()).get(`${API}/dashboard/stats`).set((await withDashboard(otherBranchId)).auth).expect(200);
+      const all = await request(http()).get(`${API}/dashboard/stats`).set(admin.auth).expect(200);
+      expect(mine.body.bookings.total).toBeGreaterThan(0);
+      expect(theirs.body.bookings.total).toBe(0);
+      expect(theirs.body.registeredUsers.total).toBe(0);
+      expect(theirs.body.revenue.collected).toBe(0);
+      expect(all.body.bookings.total).toBeGreaterThanOrEqual(mine.body.bookings.total);
+      const trend = await request(http()).get(`${API}/dashboard/trend`).set((await withDashboard(otherBranchId)).auth).expect(200);
+      expect(trend.body.weeks.every((week: any) => week.bookings === 0 && week.revenue === 0)).toBe(true);
+    });
+
     it('does not sell a trip closed to branches', async () => {
       const closed = (await request(http()).post(`${API}/trips`).set(admin.auth).send(tripPayload({ channelBranch: false })).expect(201)).body;
       await request(http()).post(`${API}/branch-bookings`).set(clerk.auth).send(single({ legs: [{ leg: 'OUTBOUND', tripId: closed.id, seats: ['1'] }] })).expect(400);
       const found = await request(http()).get(`${API}/branch-bookings/trips`).set(clerk.auth).expect(200);
       expect(found.body.items.map((trip: any) => trip.id)).not.toContain(closed.id);
+    });
+
+    it('keeps families out of the singles seats and singles inside them, and shows each seat’s section and hold', async () => {
+      const trip = (await request(http()).post(`${API}/trips`).set(admin.auth).send(tripPayload()).expect(201)).body;
+      const seatMap = async () => (await request(http()).get(`${API}/branch-bookings/trips/${trip.id}/seats`).set(clerk.auth).expect(200)).body;
+      const book = (seats: string[], category?: 'FAMILY' | 'SINGLES') =>
+        request(http()).post(`${API}/branch-bookings`).set(clerk.auth).send({
+          kind: 'TRANSPORT_OUTBOUND',
+          ...(category && { category }),
+          legs: [{ leg: 'OUTBOUND', tripId: trip.id, seats }],
+          customer: { name: 'راكب الفرع', phone: nextPhone().replace('+966', '0'), nationality: 'مصري', city: 'جدة', gender: 'MALE', birthDate: '1990-01-01', idType: 'PASSPORT', idNumber: 'A1234567' },
+          passengers: seats.map((_, index) => ({ fullName: `راكب ${index + 1}` })),
+        });
+
+      const map = await seatMap();
+      expect(map).toMatchObject({ singlesFromSeat: 45, singlesToSeat: 49 });
+      expect(map.seats.find((seat: any) => seat.seatNumber === '46')).toMatchObject({ status: 'available', singles: true, heldUntil: null });
+      expect(map.seats.find((seat: any) => seat.seatNumber === '1')).toMatchObject({ status: 'available', singles: false });
+
+      // A family, which is what a booking is when no category is sent, may not take a singles seat.
+      const family = await book(['46']).expect(400);
+      expect(family.body.message).toContain('مقاعد العزّاب');
+      await book(['46'], 'FAMILY').expect(400);
+      // Singles may not take a family seat.
+      const singles = await book(['2'], 'SINGLES').expect(400);
+      expect(singles.body.message).toContain('خارج مقاعد العزّاب');
+
+      const singlesOk = await book(['46'], 'SINGLES').expect(201);
+      const familyOk = await book(['3']).expect(201);
+      const saved = await prisma.booking.findMany({ where: { id: { in: [singlesOk.body.legs[0].id, familyOk.body.legs[0].id] } }, select: { id: true, category: true } });
+      expect(saved.find((row) => row.id === singlesOk.body.legs[0].id)?.category).toBe('SINGLES');
+      expect(saved.find((row) => row.id === familyOk.body.legs[0].id)?.category).toBe('FAMILY');
+
+      // Seats left to the server are chosen inside the booking's own section.
+      const autoSingles = await book(['', ''], 'SINGLES').expect(201);
+      expect(autoSingles.body.legs[0].seats.every((seat: string) => Number(seat) >= 45 && Number(seat) <= 49)).toBe(true);
+      const autoFamily = await book(['', '']).expect(201);
+      expect(autoFamily.body.legs[0].seats.every((seat: string) => Number(seat) < 45)).toBe(true);
+      // Two singles seats are left (45-49 less three taken): three more singles do not fit, and no family seat is used for them.
+      await book(['', '', ''], 'SINGLES').expect(409);
+
+      // A seat held in the app for its payment window reads as held, with until when; a sold one reads as booked.
+      const heldUntil = new Date(Date.now() + 10 * 60_000);
+      await prisma.seat.updateMany({ where: { tripId: trip.id, seatNumber: '10' }, data: { heldUntil } });
+      const after = await seatMap();
+      expect(after.seats.find((seat: any) => seat.seatNumber === '10')).toMatchObject({ status: 'held', singles: false });
+      expect(new Date(after.seats.find((seat: any) => seat.seatNumber === '10').heldUntil).getTime()).toBe(heldUntil.getTime());
+      expect(after.seats.find((seat: any) => seat.seatNumber === '46')).toMatchObject({ status: 'booked', singles: true, heldUntil: null });
+      await book(['10']).expect(409);
     });
   });
 
@@ -270,9 +406,10 @@ describe('Branches, their staff and counter bookings', () => {
         kind: 'PACKAGE_ROUND_STAY',
         legs: [{ leg: 'OUTBOUND', tripId: outbound.id, seats }, { leg: 'RETURN', tripId: inbound.id, seats }],
         stay,
-        customer: { name: 'سالم الجهني', phone: nextPhone() },
+        customer: { name: 'سالم الجهني', phone: nextPhone(), nationality: 'مصري', city: 'جدة', gender: 'MALE', birthDate: '1990-01-01', idType: 'PASSPORT', idNumber: 'A1234567' },
         passengers: [{ fullName: 'سالم الجهني' }, { fullName: 'محمد الجهني' }],
         finalTotal: 500,
+        priceReason: 'سعر الباقة المتفق عليه',
         payments: [{ method: 'NETWORK', amount: 500 }],
       }).expect(201);
       expect(res.body).toMatchObject({ total: 500, paid: 500, remaining: 0 });
@@ -371,6 +508,86 @@ describe('Branches, their staff and counter bookings', () => {
       expect(row.kind).toBe('TRANSPORT_OUTBOUND');
       expect(row).not.toHaveProperty('createdById');
       expect(row).not.toHaveProperty('createdByName');
+    });
+  });
+
+  describe('the branch comes from the account and is checked on every request', () => {
+    let hadaiqId: string;
+    let arbaeenId: string;
+    let hadaiqUser: { id: string; phone: string };
+    let hadaiq: { auth: Record<string, string> };
+
+    const panelLogin = async (phone: string, extra: Record<string, unknown> = {}) => {
+      const first = await request(http()).post(`${API}/auth/panel/login`).send({ phone, password: STAFF_PASSWORD, ...extra });
+      if (first.status !== 201 || !first.body.needsVerification) return first;
+      return request(http()).post(`${API}/auth/panel/verify`).send({ challengeToken: first.body.challengeToken, code: first.body.devCode });
+    };
+
+    beforeAll(async () => {
+      hadaiqId = (await request(http()).post(`${API}/branches`).set(admin.auth).send({ name: 'الحدائق' }).expect(201)).body.id;
+      arbaeenId = (await request(http()).post(`${API}/branches`).set(admin.auth).send({ name: 'شارع الأربعين' }).expect(201)).body.id;
+      ({ user: hadaiqUser, session: hadaiq } = await inRank('rank-branch-manager', hadaiqId));
+    });
+
+    it('no longer lists branches to visitors of the sign-in page', async () => {
+      const res = await request(http()).get(`${API}/auth/login-branches`);
+      expect(res.status).not.toBe(200);
+      expect(JSON.stringify(res.body)).not.toContain(hadaiqId);
+      await request(http()).get(`${API}/auth/session-branches`).expect(401);
+    });
+
+    it('signs a branch employee in to their own branch, with no branch on the form', async () => {
+      const res = await panelLogin(hadaiqUser.phone);
+      expect(res.status).toBe(201);
+      expect(res.body.branch).toEqual({ id: hadaiqId, name: 'الحدائق' });
+      // A branch sent by the client is not accepted at all.
+      await request(http()).post(`${API}/auth/panel/login`).send({ phone: hadaiqUser.phone, password: STAFF_PASSWORD, branchId: arbaeenId }).expect(400);
+    });
+
+    it('signs the system admin in to all branches, switchable from inside the panel', async () => {
+      const adminUser = await createStaff(prisma, 'ADMIN');
+      const res = await panelLogin(adminUser.phone);
+      expect(res.status).toBe(201);
+      expect(res.body.branch).toBeNull();
+      const choices = await request(http()).get(`${API}/auth/session-branches`).set({ Authorization: `Bearer ${res.body.accessToken}` }).expect(200);
+      expect(choices.body.canSwitch).toBe(true);
+      expect(choices.body.branches.map((b: any) => b.id)).toEqual(expect.arrayContaining([hadaiqId, arbaeenId]));
+    });
+
+    it('offers a branch employee only their own branch', async () => {
+      const choices = await request(http()).get(`${API}/auth/session-branches`).set(hadaiq.auth).expect(200);
+      expect(choices.body).toEqual({ canSwitch: false, branches: [expect.objectContaining({ id: hadaiqId })] });
+    });
+
+    it('refuses with 403 when a الحدائق employee asks for شارع الأربعين data', async () => {
+      await request(http()).get(`${API}/branches/${arbaeenId}`).set(hadaiq.auth).expect(403);
+      await request(http()).get(`${API}/branches/${arbaeenId}/performance`).set(hadaiq.auth).expect(403);
+      await request(http()).get(`${API}/bookings/admin/all?branchId=${arbaeenId}`).set(hadaiq.auth).expect(403);
+      await request(http()).get(`${API}/branch-bookings/recent?branchId=${arbaeenId}`).set(hadaiq.auth).expect(403);
+      await request(http()).get(`${API}/cash/branches/${arbaeenId}/overview`).set(hadaiq.auth).expect(403);
+      await request(http()).get(`${API}/collections?branchId=${arbaeenId}`).set(hadaiq.auth).expect(403);
+      // Switching the session to another branch through the header is refused the same way.
+      await request(http()).get(`${API}/bookings/admin/all`).set({ ...hadaiq.auth, 'X-Branch-Id': arbaeenId }).expect(403);
+    });
+
+    it('still serves the employee’s own branch, with or without the header', async () => {
+      await request(http()).get(`${API}/branches/${hadaiqId}`).set(hadaiq.auth).expect(200);
+      await request(http()).get(`${API}/bookings/admin/all?branchId=${hadaiqId}`).set({ ...hadaiq.auth, 'X-Branch-Id': hadaiqId }).expect(200);
+    });
+
+    it('lets the system admin reach any branch', async () => {
+      await request(http()).get(`${API}/branches/${arbaeenId}`).set(admin.auth).expect(200);
+      await request(http()).get(`${API}/bookings/admin/all?branchId=${arbaeenId}`).set({ ...admin.auth, 'X-Branch-Id': arbaeenId }).expect(200);
+      await request(http()).get(`${API}/cash/branches/${arbaeenId}/overview`).set(admin.auth).expect(200);
+    });
+
+    it('follows a move between branches at once', async () => {
+      await prisma.user.update({ where: { id: hadaiqUser.id }, data: { branchId: arbaeenId } });
+      await request(http()).get(`${API}/branches/${arbaeenId}`).set(hadaiq.auth).expect(200);
+      await request(http()).get(`${API}/branches/${hadaiqId}`).set(hadaiq.auth).expect(403);
+      // The account routes still answer a stale branch header, so the panel can correct it.
+      await request(http()).get(`${API}/auth/session-branches`).set({ ...hadaiq.auth, 'X-Branch-Id': hadaiqId }).expect(200);
+      await prisma.user.update({ where: { id: hadaiqUser.id }, data: { branchId: hadaiqId } });
     });
   });
 });

@@ -1,11 +1,14 @@
-import { Controller, Get, Injectable, Module, Query } from '@nestjs/common';
+import { Controller, Get, Injectable, Module, Query, Req } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
+import { cityTripWhere } from '../../common/utils/branch-city.util';
 import { BOOKING_TYPE_LABELS } from '../../common/booking-type-labels';
-import { PAID_PAYMENT_STATUSES } from '../../common/utils/payment.util';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
 import { IsIn, IsInt, IsOptional, IsString, Max, MaxLength, Min } from 'class-validator';
 import { AUDIT_SECTIONS, HIDDEN_AUDIT_ACTIONS, auditActionsInSection, describeAuditAction, summarizeAuditDetails } from '../../common/audit-events';
+import { AUDIT_RECORD_TYPES, presentAuditChanges } from '../../common/audit-snapshots';
 import { PrismaService } from '../../common/services/prisma.service';
+import { TripMetricsService } from '../../common/services/trip-metrics.service';
 import { RequirePermission } from '../../common/decorators/auth.decorators';
 import { addDays, formatRiyadhTime, riyadhDate, startOfRiyadhDay, startOfRiyadhMonth } from '../../common/utils/time.util';
 
@@ -31,6 +34,17 @@ class AuditQuery {
   @IsString()
   @MaxLength(100)
   search?: string;
+
+  /** Only writes that compared values on this kind of record. */
+  @IsOptional()
+  @IsIn(Object.keys(AUDIT_RECORD_TYPES))
+  recordType?: string;
+
+  /** One record's history: its id, or a booking number, trip code, coupon code or employee phone. */
+  @IsOptional()
+  @IsString()
+  @MaxLength(100)
+  record?: string;
 }
 
 const TREND_WEEKS = [4, 8, 12, 26];
@@ -43,16 +57,58 @@ class TrendQuery {
   weeks?: number;
 }
 
+type DashboardActor = { userId: string; permissions?: string[] };
+
+/** What one employee's dashboard may count. `all` is true only for someone who sees every branch's bookings. */
+type DashboardScope = {
+  all: boolean;
+  bookings: Prisma.BookingWhereInput;
+  trips: Prisma.TripWhereInput;
+  /** The same booking limit for raw SQL, over a booking aliased b joined to its trip aliased t. */
+  sql: Prisma.Sql;
+};
+
 @Injectable()
 class DashboardService {
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    private metrics: TripMetricsService,
+  ) {}
+
+  /**
+   * The dashboard follows the bookings page's rule, read from the database on every request: someone without
+   * bookings.all_branches counts only their branch's bookings and the trips of their branch's city. An employee with
+   * no branch counts nothing, rather than every branch.
+   */
+  async scope(actor: DashboardActor): Promise<DashboardScope> {
+    if (actor.permissions?.includes('bookings.all_branches')) return { all: true, bookings: {}, trips: {}, sql: Prisma.sql`TRUE` };
+    const me = await this.prisma.user.findUnique({ where: { id: actor.userId }, select: { branchId: true, branch: { select: { city: true } } } });
+    if (!me?.branchId) return { all: false, bookings: { id: { in: [] } }, trips: { id: { in: [] } }, sql: Prisma.sql`FALSE` };
+    const city = me.branch?.city?.trim();
+    if (!city) {
+      return {
+        all: false,
+        bookings: { branchId: me.branchId },
+        trips: { bookings: { some: { branchId: me.branchId } } },
+        sql: Prisma.sql`b."branchId" = ${me.branchId}`,
+      };
+    }
+    const like = `%${city}%`;
+    return {
+      all: false,
+      bookings: { AND: [{ OR: [{ branchId: me.branchId }, { trip: cityTripWhere(city) }] }] },
+      trips: cityTripWhere(city),
+      sql: Prisma.sql`(b."branchId" = ${me.branchId} OR t.origin ILIKE ${like} OR t.destination ILIKE ${like})`,
+    };
+  }
 
   /**
    * Weeks run Sunday to Saturday in Riyadh, the last one still in progress. Money falls in the week it arrived, so every
    * collection counts on its own day and the rest of a paid booking on the day its payment was made. Over all time this
    * adds up to the collected figure in getStats, without simulated payments.
    */
-  async getTrend(weeks = 12) {
+  async getTrend(actor: DashboardActor, weeks = 12) {
+    const scope = await this.scope(actor);
     const today = startOfRiyadhDay();
     const weekday = new Date(riyadhDate(today)).getUTCDay();
     const firstWeek = addDays(today, -weekday - (weeks - 1) * 7);
@@ -67,13 +123,15 @@ class DashboardService {
           SELECT c."createdAt" AS "at", c.amount
           FROM "BookingCollection" c
           JOIN "Booking" b ON b.id = c."bookingId"
+          JOIN "Trip" t ON t.id = b."tripId"
           JOIN "Payment" p ON p."bookingId" = b.id
-          WHERE b.status <> 'CANCELLED' AND p.status <> 'SIMULATED'
+          WHERE b.status <> 'CANCELLED' AND p.status <> 'SIMULATED' AND ${scope.sql}
           UNION ALL
           SELECT p."createdAt", p.amount - COALESCE((SELECT SUM(c.amount) FROM "BookingCollection" c WHERE c."bookingId" = p."bookingId"), 0)
           FROM "Payment" p
           JOIN "Booking" b ON b.id = p."bookingId"
-          WHERE b.status <> 'CANCELLED' AND p.status = 'COMPLETED'
+          JOIN "Trip" t ON t.id = b."tripId"
+          WHERE b.status <> 'CANCELLED' AND p.status = 'COMPLETED' AND ${scope.sql}
         ) received
         WHERE EXTRACT(EPOCH FROM received."at") >= ${from}::double precision
         GROUP BY bucket`,
@@ -81,7 +139,8 @@ class DashboardService {
         SELECT FLOOR((EXTRACT(EPOCH FROM b."createdAt") - ${from}::double precision) / ${WEEK_SECONDS}::double precision)::int AS bucket,
                COUNT(*) AS count
         FROM "Booking" b
-        WHERE b.status <> 'CANCELLED' AND EXTRACT(EPOCH FROM b."createdAt") >= ${from}::double precision
+        JOIN "Trip" t ON t.id = b."tripId"
+        WHERE b.status <> 'CANCELLED' AND ${scope.sql} AND EXTRACT(EPOCH FROM b."createdAt") >= ${from}::double precision
         GROUP BY bucket`,
     ]);
 
@@ -96,14 +155,17 @@ class DashboardService {
     };
   }
 
-  async getStats() {
+  async getStats(actor: DashboardActor) {
+    const scope = await this.scope(actor);
     const now = new Date();
     const todayStart = startOfRiyadhDay(now);
     const tomorrow = addDays(todayStart, 1);
     const weekEnd = addDays(todayStart, 7);
     const monthStart = startOfRiyadhMonth(now);
 
-    const upcoming = { tripStatus: 'PUBLISHED' as const, departureTime: { gt: now } };
+    const upcoming = { tripStatus: 'PUBLISHED' as const, departureTime: { gt: now }, AND: [scope.trips] };
+    // A branch counts the customers who booked with it; every branch counts every registered customer.
+    const customers: Prisma.UserWhereInput = scope.all ? { role: 'PASSENGER' } : { role: 'PASSENGER', bookings: { some: scope.bookings } };
 
     const [
       usersTotal,
@@ -114,56 +176,36 @@ class DashboardService {
       unsupervised,
       bookingStatus,
       pendingCancellations,
-      payments,
+      revenue,
+      occupancy,
       tripsToday,
       bookingsByType,
     ] = await Promise.all([
-      this.prisma.user.count({ where: { role: 'PASSENGER' } }),
-      this.prisma.user.count({ where: { role: 'PASSENGER', createdAt: { gte: monthStart } } }),
+      this.prisma.user.count({ where: customers }),
+      this.prisma.user.count({ where: { ...customers, createdAt: { gte: monthStart } } }),
       this.prisma.trip.count({ where: upcoming }),
       this.prisma.trip.count({ where: { ...upcoming, departureTime: { gt: now, lt: tomorrow } } }),
       this.prisma.trip.count({ where: { ...upcoming, departureTime: { gt: now, lt: weekEnd } } }),
       this.prisma.trip.count({ where: { ...upcoming, supervisors: { none: {} } } }),
-      this.prisma.booking.groupBy({ by: ['status'], _count: true }),
-      this.prisma.booking.count({ where: { status: 'PENDING_CANCELLATION_REVIEW' } }),
-      this.prisma.payment.groupBy({
-        by: ['method', 'status'],
-        // Until a payment is marked paid its amount is only what is owed.
-        where: { status: { in: PAID_PAYMENT_STATUSES }, booking: { status: { not: 'CANCELLED' } } },
-        _sum: { amount: true, walletAmount: true },
-      }),
+      this.prisma.booking.groupBy({ by: ['status'], where: scope.bookings, _count: true }),
+      this.prisma.booking.count({ where: { AND: [scope.bookings, { status: 'PENDING_CANCELLATION_REVIEW' }] } }),
+      // Collected money and occupancy come from the shared metrics, the same functions the trips page and reports read.
+      this.metrics.collected(scope.bookings),
+      this.metrics.occupancy(scope.trips, undefined, now),
       this.prisma.trip.findMany({
-        where: { tripStatus: 'PUBLISHED', departureTime: { gte: todayStart, lt: tomorrow } },
+        where: { tripStatus: 'PUBLISHED', departureTime: { gte: todayStart, lt: tomorrow }, AND: [scope.trips] },
         orderBy: { departureTime: 'asc' },
         include: { supervisors: { include: { user: { select: { name: true } } } } },
       }),
+      // What each booking bought, stored on the booking: the trip only says what it offers.
       this.prisma.$queryRaw<{ bookingType: string; count: bigint }[]>`
-        SELECT t."bookingType", COUNT(*) AS count
+        SELECT b."serviceType"::text AS "bookingType", COUNT(*) AS count
         FROM "Booking" b JOIN "Trip" t ON t.id = b."tripId"
-        WHERE b.status <> 'CANCELLED'
-        GROUP BY t."bookingType"`,
+        WHERE b.status <> 'CANCELLED' AND ${scope.sql}
+        GROUP BY b."serviceType"`,
     ]);
 
     const statusCount = (status: string) => bookingStatus.find((row) => row.status === status)?._count ?? 0;
-    const partial = await this.prisma.bookingCollection.groupBy({
-      by: ['method'],
-      where: { booking: { status: { not: 'CANCELLED' }, payment: { status: { notIn: PAID_PAYMENT_STATUSES } } } },
-      _sum: { amount: true },
-    });
-    const collected = payments.reduce((sum, row) => sum + Number(row._sum.amount ?? 0), 0) + partial.reduce((sum, row) => sum + Number(row._sum.amount ?? 0), 0);
-    const walletUsed = payments.reduce((sum, row) => sum + Number(row._sum.walletAmount ?? 0), 0);
-    const simulated = payments
-      .filter((row) => row.status === 'SIMULATED')
-      .reduce((sum, row) => sum + Number(row._sum.amount ?? 0), 0);
-    const byMethod = new Map<string, number>();
-    for (const row of payments) {
-      byMethod.set(row.method ?? 'other', (byMethod.get(row.method ?? 'other') ?? 0) + Number(row._sum.amount ?? 0));
-    }
-
-    for (const row of partial) {
-      const method = row.method.toLowerCase();
-      byMethod.set(method, (byMethod.get(method) ?? 0) + Number(row._sum.amount ?? 0));
-    }
 
     const typeRows = bookingsByType.map((row) => ({ type: row.bookingType, count: Number(row.count) }));
     const typeTotal = typeRows.reduce((sum, row) => sum + row.count, 0);
@@ -172,12 +214,8 @@ class DashboardService {
       pendingCancellations,
       registeredUsers: { total: usersTotal, newThisMonth },
       upcomingTrips: { total: upcomingTotal, today: upcomingToday, thisWeek: upcomingWeek, unsupervised },
-      revenue: {
-        collected,
-        simulated,
-        walletUsed,
-        byMethod: Array.from(byMethod, ([method, amount]) => ({ method, amount })),
-      },
+      revenue,
+      occupancy,
       bookings: {
         total: bookingStatus.reduce((sum, row) => sum + row._count, 0),
         confirmed: statusCount('CONFIRMED'),
@@ -203,24 +241,44 @@ class DashboardService {
     };
   }
 
-  async getAuditLog({ limit = 100, skip = 0, section, search }: AuditQuery) {
+  async getAuditLog({ limit = 100, skip = 0, section, search, recordType, record }: AuditQuery) {
+    const recordIds = record ? await this.auditRecordIds(record.trim()) : null;
     const rows = await this.prisma.auditLog.findMany({
       where: {
         action: section ? { in: auditActionsInSection(section) } : { notIn: HIDDEN_AUDIT_ACTIONS },
         ...(search ? { user: { OR: [{ name: { contains: search, mode: 'insensitive' as const } }, { phone: { contains: search } }] } } : {}),
+        ...(recordType ? { recordType } : {}),
+        ...(recordIds ? { OR: [{ recordId: { in: recordIds } }, { entityId: { in: recordIds } }] } : {}),
       },
       orderBy: { createdAt: 'desc' },
       skip,
       take: limit,
       include: { user: { select: { name: true, phone: true } } },
     });
-    const targets = await this.auditTargets(rows.flatMap((row) => (row.entityId ? [row.entityId] : [])));
-    return rows.map(({ details, ...row }) => ({
-      ...row,
-      ...describeAuditAction(row.action),
-      target: row.entityId ? targets.get(row.entityId) ?? null : null,
-      summary: summarizeAuditDetails(row.action, details),
-    }));
+    const targets = await this.auditTargets(rows.flatMap((row) => [row.entityId, row.recordId].filter((id): id is string => !!id)));
+    return rows.map(({ details, changes, recordType: type, recordId, ...row }) => {
+      const presented = presentAuditChanges(type, recordId, changes);
+      return {
+        ...row,
+        ...describeAuditAction(row.action),
+        target: (recordId && targets.get(recordId)) || (row.entityId && targets.get(row.entityId)) || presented?.label || null,
+        summary: summarizeAuditDetails(row.action, details),
+        recordType: type,
+        recordId,
+        changes: presented,
+      };
+    });
+  }
+
+  /** What a typed record reference means: the id itself, plus whatever booking, trip, coupon or person it names. */
+  private async auditRecordIds(typed: string) {
+    const [bookings, trips, coupons, users] = await Promise.all([
+      this.prisma.booking.findMany({ where: { bookingReference: { equals: typed, mode: 'insensitive' } }, select: { id: true }, take: 5 }),
+      this.prisma.trip.findMany({ where: { tripCode: { equals: typed, mode: 'insensitive' } }, select: { id: true }, take: 5 }),
+      this.prisma.coupon.findMany({ where: { code: { equals: typed, mode: 'insensitive' } }, select: { id: true }, take: 5 }),
+      this.prisma.user.findMany({ where: { phone: typed }, select: { id: true }, take: 5 }),
+    ]);
+    return [typed, ...[...bookings, ...trips, ...coupons, ...users].map((row) => row.id)];
   }
 
   /** Names the record a row acted on. Ids are unique across tables, so the entity need not be read to find which one. */
@@ -248,15 +306,15 @@ class DashboardController {
   @Get('stats')
   @RequirePermission('dashboard.view')
   @ApiOperation({ summary: 'Live operational statistics' })
-  getStats() {
-    return this.dashboard.getStats();
+  getStats(@Req() req) {
+    return this.dashboard.getStats(req.user);
   }
 
   @Get('trend')
   @RequirePermission('dashboard.view')
   @ApiOperation({ summary: 'Collected revenue and new bookings for each recent week' })
-  getTrend(@Query() query: TrendQuery) {
-    return this.dashboard.getTrend(query.weeks);
+  getTrend(@Req() req, @Query() query: TrendQuery) {
+    return this.dashboard.getTrend(req.user, query.weeks);
   }
 
   @Get('audit-log')
@@ -272,10 +330,17 @@ class DashboardController {
   getAuditSections() {
     return AUDIT_SECTIONS;
   }
+
+  @Get('audit-log/record-types')
+  @RequirePermission('audit.view')
+  @ApiOperation({ summary: 'Kinds of records whose before and after values the audit log keeps' })
+  getAuditRecordTypes() {
+    return Object.entries(AUDIT_RECORD_TYPES).map(([key, label]) => ({ key, label }));
+  }
 }
 
 @Module({
   controllers: [DashboardController],
-  providers: [DashboardService],
+  providers: [DashboardService, TripMetricsService],
 })
 export class DashboardModule {}

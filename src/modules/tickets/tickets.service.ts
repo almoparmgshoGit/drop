@@ -1,5 +1,6 @@
 import { BadRequestException, ConflictException, ForbiddenException, HttpException, HttpStatus, Injectable, NotFoundException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import * as crypto from 'crypto';
 
 import { Prisma, TripLiveStatus } from '@prisma/client';
 import { PrismaService } from '../../common/services/prisma.service';
@@ -15,7 +16,7 @@ import { formatRiyadhDate, formatRiyadhTime } from '../../common/utils/time.util
 import { returningBookingIds } from '../../common/utils/linked-seats.util';
 import { paymentFigures } from '../../common/utils/payment.util';
 import { TICKET_BOARDING_TRIP_SELECT, ticketBoarding } from '../../common/utils/ticket-boarding.util';
-import { verifyPaperCode, verifyTicketToken } from '../../common/utils/ticket-token.util';
+import { signPaperCode, verifyPaperCode, verifyTicketToken } from '../../common/utils/ticket-token.util';
 import { PROFILE_ACCOUNT_SELECT, PROFILE_PASSENGER_SELECT, passengerProfiles } from '../../common/utils/passenger-profile.util';
 
 interface Actor {
@@ -25,6 +26,40 @@ interface Actor {
 }
 
 type ScanResult = 'BOARDED' | 'ALREADY_USED' | 'WRONG_TRIP' | 'INVALID' | 'CANCELLED' | 'NOT_PAID' | 'UNPAID_WARNING' | 'CANCELLATION_PENDING' | 'OUTSIDE_WINDOW' | 'WRONG_POINT' | 'TICKET_STOPPED';
+
+/** A boarding the crew's app recorded on the road without internet and sent later: it counts from the moment it was scanned. */
+interface OfflineScan {
+  scannedAt: Date;
+}
+
+/** One boarding queued on the crew's phone without internet: the scanned code (or the ticket picked from the saved list) and when. */
+export interface OfflineBoardingItem {
+  clientId: string;
+  signedToken?: string;
+  code?: string;
+  ticketNumber?: string;
+  scannedAt: string;
+  allowUnpaid?: boolean;
+}
+
+// The pack carries hashes of the codes, never the codes or the signing secret: 128 bits cannot be guessed or turned back into a ticket.
+const OFFLINE_HASH_LENGTH = 32;
+const offlineHash = (text: string) => crypto.createHash('sha256').update(text).digest('hex').slice(0, OFFLINE_HASH_LENGTH);
+// A queue left on a phone for days is better resolved by the office than boarded from an old scan.
+const MAX_OFFLINE_AGE_MS = 72 * 60 * 60 * 1000;
+
+/** Why the server did not take a boarding sent from the road, in the words the crew reads on the trip screen. */
+const OFFLINE_REJECT_REASONS: Record<string, string> = {
+  WRONG_TRIP: 'التذكرة لرحلة أخرى',
+  INVALID: 'التذكرة غير صالحة',
+  CANCELLED: 'الحجز ملغى',
+  NOT_PAID: 'الحجز غير مدفوع بالكامل',
+  UNPAID_WARNING: 'على الراكب مبلغ متبقٍ ولم يُؤكَّد صعوده رغم ذلك',
+  CANCELLATION_PENDING: 'طلب إلغاء الحجز قيد المراجعة',
+  OUTSIDE_WINDOW: 'وقت المسح خارج وقت الصعود لهذه الرحلة',
+  WRONG_POINT: 'نقطة صعود مختلفة',
+  TICKET_STOPPED: 'التذكرة موقوفة',
+};
 
 /** What the crew chose after a warning: board at another point, or board one who still owes money on a trip that allows it. */
 export interface BoardOverrides {
@@ -117,6 +152,19 @@ const RETURN_TICKET_INCLUDE = {
   passenger: true,
   booking: { select: { bookingReference: true, ...RIDE_STATE_SELECT } },
 } satisfies Prisma.TicketInclude;
+
+/** What the crew's phone keeps of each ticket for boarding without internet. */
+const OFFLINE_TICKET_SELECT = {
+  ticketNumber: true,
+  signedToken: true,
+  isBoarded: true,
+  boardedAt: true,
+  boardedOffline: true,
+  returnBoardedAt: true,
+  returnBoardedOffline: true,
+  passenger: { select: { fullName: true, seatNumber: true } },
+  booking: { select: { bookingReference: true, source: true, boardingPointName: true, boardingPointTime: true, ...RIDE_STATE_SELECT } },
+} satisfies Prisma.TicketSelect;
 
 @Injectable()
 export class TicketsService {
@@ -218,6 +266,7 @@ export class TicketsService {
         arrivalTime: true,
         busType: true,
         tripStatus: true,
+        executedAt: true,
         liveStatus: true,
         totalSeats: true,
         availableSeats: true,
@@ -228,7 +277,7 @@ export class TicketsService {
 
     const tickets = await this.prisma.ticket.findMany({
       where: { booking: { tripId: { in: trips.map((trip) => trip.id) }, status: { in: [...TRAVELING_STATUSES] } }, ...STILL_EXPECTED },
-      select: { isBoarded: true, booking: { select: { tripId: true } } },
+      select: { isBoarded: true, noShowAt: true, booking: { select: { tripId: true } } },
     });
     return Promise.all(trips.map(async (trip) => {
       const ofTrip = tickets.filter((ticket) => ticket.booking.tripId === trip.id);
@@ -238,6 +287,7 @@ export class TicketsService {
         access: crewWindow(trip),
         passengerCount: ofTrip.length + returning.filter(isExpectedBack).length,
         boardedCount: ofTrip.filter((ticket) => ticket.isBoarded).length + returning.filter((ticket) => ticket.returnBoardedAt).length,
+        noShowCount: ofTrip.filter((ticket) => ticket.noShowAt && !ticket.isBoarded).length + returning.filter((ticket) => ticket.returnNoShowAt && !ticket.returnBoardedAt).length,
       };
     }));
   }
@@ -259,6 +309,7 @@ export class TicketsService {
         busType: true,
         miqat: true,
         tripStatus: true,
+        executedAt: true,
         ...CREW_WINDOW_SELECT,
         bus: { select: { plateNumber: true, model: true, color: true } },
         boardingPoints: { select: { id: true, name: true, time: true, address: true, lat: true, lng: true } },
@@ -276,7 +327,7 @@ export class TicketsService {
 
     const tickets = await this.prisma.ticket.findMany({
       where: { booking: { tripId, status: { in: [...TRAVELING_STATUSES] } }, ...STILL_EXPECTED },
-      select: { isBoarded: true },
+      select: { isBoarded: true, noShowAt: true },
     });
     const returning = await this.returningTickets(tripId);
     const toMember = ({ isPrimary, user }: { isPrimary: boolean; user: { id: string; name: string | null } }) => ({ id: user.id, name: user.name, isPrimary });
@@ -289,6 +340,7 @@ export class TicketsService {
       access: crewWindow(trip),
       passengerCount: tickets.length + returning.filter(isExpectedBack).length,
       boardedCount: tickets.filter((ticket) => ticket.isBoarded).length + returning.filter((ticket) => ticket.returnBoardedAt).length,
+      noShowCount: tickets.filter((ticket) => ticket.noShowAt && !ticket.isBoarded).length + returning.filter((ticket) => ticket.returnNoShowAt && !ticket.returnBoardedAt).length,
     };
   }
 
@@ -501,6 +553,10 @@ export class TicketsService {
         boardingPointTime: ticket.booking.boardingPointTime,
         isBoarded: ticket.isBoarded,
         boardedAt: ticket.boardedAt,
+        /** Recorded on the road without internet and sent later (سُجل بدون إنترنت). */
+        boardedOffline: ticket.boardedOffline,
+        /** The trip was executed without this passenger aboard (لم يحضر). */
+        isNoShow: !!ticket.noShowAt && !ticket.isBoarded,
         isReturning: false,
         passengerId: ticket.passengerId as string | null,
         needsRoom: bookingHasStay(trip.bookingType, ticket.booking),
@@ -522,6 +578,8 @@ export class TicketsService {
           boardingPointTime: null,
           isBoarded: !!ticket.returnBoardedAt,
           boardedAt: ticket.returnBoardedAt,
+          boardedOffline: ticket.returnBoardedOffline,
+          isNoShow: !!ticket.returnNoShowAt && !ticket.returnBoardedAt,
           isReturning: true,
           // Their stay belongs to the outbound trip, so this sheet does not place them.
           passengerId: null,
@@ -544,6 +602,7 @@ export class TicketsService {
       trip,
       total: riding.length,
       boarded: riding.filter((p) => p.isBoarded).length,
+      noShow: riding.filter((p) => p.isNoShow).length,
       passengersHidden,
       passengers: passengersHidden ? [] : passengers,
     };
@@ -560,7 +619,7 @@ export class TicketsService {
    * The barcode printed on a branch ticket, for customers without the app. It works only for an assigned crew member during
    * boarding, and each passenger still boards once. One ticket can carry several travellers, so one scan boards all of them.
    */
-  async boardFromPaper(actor: Actor, code: string, tripId: string, overrides: BoardOverrides = {}): Promise<{ result: ScanResult; ticket?: any; boardedCount?: number }> {
+  async boardFromPaper(actor: Actor, code: string, tripId: string, overrides: BoardOverrides = {}, offline: OfflineScan | null = null): Promise<{ result: ScanResult; ticket?: any; boardedCount?: number }> {
     await this.assertAssigned(actor, tripId);
     const reference = verifyPaperCode(code, this.config.getOrThrow('TICKET_SIGNING_SECRET'));
     if (!reference) return { result: 'INVALID' };
@@ -575,7 +634,7 @@ export class TicketsService {
     let last: { result: ScanResult; ticket?: any } | null = null;
     let boardedCount = 0;
     for (const { ticketNumber } of booking.tickets) {
-      last = await this.boardByNumber(actor, ticketNumber, tripId, overrides);
+      last = await this.boardByNumber(actor, ticketNumber, tripId, overrides, offline);
       if (last.result === 'BOARDED') {
         boardedCount += 1;
         boarded ??= last;
@@ -592,7 +651,164 @@ export class TicketsService {
     return this.boardByNumber(actor, ticketNumber, tripId, overrides);
   }
 
-  private async boardByNumber(actor: Actor, ticketNumber: string, tripId: string, { allowOtherPoint = false, allowUnpaid = false }: BoardOverrides): Promise<{ result: ScanResult; ticket?: any }> {
+  /**
+   * What the crew's phone keeps to board passengers on the road without internet. The signing secret never leaves the server:
+   * each ticket comes with a hash of its QR code (and of the printed barcode for a branch ticket), which the app compares with
+   * what it scans. A hash cannot be turned back into a code, so the pack cannot be used to make a ticket.
+   */
+  async getOfflinePack(actor: Actor, tripId: string) {
+    await this.assertAssigned(actor, tripId);
+    const trip = await this.prisma.trip.findFirst({
+      where: { id: tripId, tripStatus: { in: ['PUBLISHED', 'COMPLETED'] } },
+      select: {
+        id: true,
+        tripCode: true,
+        origin: true,
+        destination: true,
+        arrivalTime: true,
+        busType: true,
+        bookingType: true,
+        tripStatus: true,
+        unpaidBoarding: true,
+        liveStatus: true,
+        manifestSentAt: true,
+        currentBoardingPoint: { select: { id: true, name: true } },
+        ...CREW_WINDOW_SELECT,
+      },
+    });
+    if (!trip) throw new NotFoundException('Trip not found');
+    // The same rule as the passenger list: once the office has sent it, the crew may keep it before the trip opens.
+    if (!trip.manifestSentAt) this.assertTripOpen(actor, trip);
+
+    const secret = this.config.getOrThrow<string>('TICKET_SIGNING_SECRET');
+    const own = await this.prisma.ticket.findMany({ where: { booking: { tripId, status: { in: [...TRAVELING_STATUSES] } } }, select: OFFLINE_TICKET_SELECT });
+    const returningIds = await this.returningOn(this.prisma, tripId);
+    const returning = returningIds.length ? await this.prisma.ticket.findMany({ where: { bookingId: { in: returningIds } }, select: OFFLINE_TICKET_SELECT }) : [];
+
+    const toEntry = (ticket: (typeof own)[number], isReturning: boolean) => {
+      const { hold } = rideHold(ticket.booking);
+      return {
+        ticketNumber: ticket.ticketNumber,
+        bookingReference: ticket.booking.bookingReference,
+        fullName: ticket.passenger.fullName,
+        seatNumber: ticket.passenger.seatNumber,
+        boardingPointName: isReturning ? null : ticket.booking.boardingPointName,
+        boardingPointTime: isReturning ? null : ticket.booking.boardingPointTime,
+        isReturning,
+        isBoarded: isReturning ? !!ticket.returnBoardedAt : ticket.isBoarded,
+        boardedAt: isReturning ? ticket.returnBoardedAt : ticket.boardedAt,
+        boardedOffline: isReturning ? ticket.returnBoardedOffline : ticket.boardedOffline,
+        bookingStatus: ticket.booking.status,
+        hold,
+        // Riyals, as on the manifest.
+        remaining: paymentFigures(ticket.booking.payment, ticket.booking.collections).remaining / 100,
+        tokenHash: offlineHash(ticket.signedToken),
+        // One printed barcode boards everyone on a branch ticket.
+        paperHash: ticket.booking.source === 'BRANCH' ? offlineHash(signPaperCode(ticket.booking.bookingReference, secret)) : null,
+      };
+    };
+
+    const passengersHidden = actor.role !== 'ADMIN' && Date.now() > trip.arrivalTime.getTime() + MANIFEST_CLOSES_AFTER_MS;
+    const passengers = [...own.map((ticket) => toEntry(ticket, false)), ...returning.map((ticket) => toEntry(ticket, true))].sort((a, b) => Number(a.seatNumber) - Number(b.seatNumber));
+    const { manifestSentAt: _sent, ...tripFacts } = trip;
+    return {
+      version: 1,
+      generatedAt: new Date(),
+      hash: { algorithm: 'SHA-256', length: OFFLINE_HASH_LENGTH },
+      trip: { ...tripFacts, access: crewWindow(trip) },
+      passengersHidden,
+      passengers: passengersHidden ? [] : passengers,
+    };
+  }
+
+  /**
+   * Boardings the crew recorded on the road without internet, sent once the phone is back online. Each one goes through the same
+   * checks as a scan at the door, read at the moment it was scanned. Sending the same scan again (a lost reply, a retry) answers
+   * the same way and never boards twice.
+   */
+  async syncOfflineBoardings(actor: Actor, tripId: string, items: OfflineBoardingItem[]) {
+    await this.assertAssigned(actor, tripId);
+    const results: Awaited<ReturnType<TicketsService['syncOfflineItem']>>[] = [];
+    // One at a time: two scans of one booking's tickets share its lock.
+    for (const item of items) results.push(await this.syncOfflineItem(actor, tripId, item));
+    return {
+      results,
+      accepted: results.filter((row) => row.status === 'ACCEPTED').length,
+      alreadyBoarded: results.filter((row) => row.status === 'ALREADY_BOARDED').length,
+      rejected: results.filter((row) => row.status === 'REJECTED').length,
+      failed: results.filter((row) => row.status === 'ERROR').length,
+    };
+  }
+
+  private async syncOfflineItem(actor: Actor, tripId: string, item: OfflineBoardingItem) {
+    const key = { actorId_clientId: { actorId: actor.userId, clientId: item.clientId } };
+    const stored = await this.prisma.offlineBoardingSync.findUnique({ where: key });
+    if (stored) return { ...(stored.response as Record<string, any>), clientId: item.clientId, status: stored.status, repeated: true };
+
+    const now = Date.now();
+    // A phone clock running ahead of the server must not board anyone in the future.
+    const scannedAt = new Date(Math.min(new Date(item.scannedAt).getTime() || now, now));
+    let outcome: { result: ScanResult; ticket?: any; boardedCount?: number };
+    let reason: string | undefined;
+    if (now - scannedAt.getTime() > MAX_OFFLINE_AGE_MS) {
+      outcome = { result: 'OUTSIDE_WINDOW' };
+      reason = 'مضى وقت طويل على هذا المسح، راجع الإدارة لتسجيل الصعود';
+    } else {
+      try {
+        const offline = { scannedAt };
+        const overrides = { allowUnpaid: !!item.allowUnpaid };
+        if (item.signedToken) {
+          const payload = verifyTicketToken(item.signedToken, this.config.getOrThrow('TICKET_SIGNING_SECRET'));
+          outcome = payload ? await this.boardByNumber(actor, payload.ticketNumber, tripId, overrides, offline) : { result: 'INVALID' };
+        } else if (item.code) {
+          outcome = await this.boardFromPaper(actor, item.code, tripId, overrides, offline);
+        } else if (item.ticketNumber) {
+          outcome = await this.boardByNumber(actor, item.ticketNumber, tripId, overrides, offline);
+        } else {
+          outcome = { result: 'INVALID' };
+        }
+      } catch {
+        // Not kept: the app sends it again with the next sync.
+        return { clientId: item.clientId, status: 'ERROR' as const, result: null, reason: 'تعذر حفظ هذا الصعود الآن، سيُعاد إرساله تلقائيًا', ticket: null, repeated: false };
+      }
+    }
+
+    const status = outcome.result === 'BOARDED' ? 'ACCEPTED' : outcome.result === 'ALREADY_USED' ? 'ALREADY_BOARDED' : 'REJECTED';
+    const ticket = outcome.ticket
+      ? {
+          ticketNumber: outcome.ticket.ticketNumber as string,
+          bookingReference: outcome.ticket.bookingReference as string,
+          passengerName: outcome.ticket.passengerName as string,
+          seatNumber: outcome.ticket.seatNumber as string,
+          boardedAt: outcome.ticket.boardedAt ?? null,
+          boardedBy: outcome.ticket.boardedBy ?? null,
+          remaining: outcome.ticket.remaining ?? null,
+        }
+      : null;
+    if (status === 'ALREADY_BOARDED') reason = ticket?.boardedBy ? `سبق تسجيل صعوده بواسطة ${ticket.boardedBy}` : 'سبق تسجيل صعوده';
+    if (status === 'REJECTED') reason ??= OFFLINE_REJECT_REASONS[outcome.result] ?? OFFLINE_REJECT_REASONS.INVALID;
+    const response = { clientId: item.clientId, status, result: outcome.result, reason: reason ?? null, ticket, boardedCount: outcome.boardedCount ?? (status === 'ACCEPTED' ? 1 : 0) };
+
+    try {
+      await this.prisma.offlineBoardingSync.create({
+        data: { actorId: actor.userId, clientId: item.clientId, tripId, ticketNumber: ticket?.ticketNumber ?? item.ticketNumber ?? null, scannedAt, status, response: response as unknown as Prisma.InputJsonValue },
+      });
+    } catch (error) {
+      // The same scan sent twice at once: the first one's answer is the one the app keeps.
+      if (!(error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002')) throw error;
+      const first = await this.prisma.offlineBoardingSync.findUnique({ where: key });
+      if (first) return { ...(first.response as Record<string, any>), clientId: item.clientId, status: first.status, repeated: true };
+    }
+    return { ...response, repeated: false };
+  }
+
+  private async boardByNumber(
+    actor: Actor,
+    ticketNumber: string,
+    tripId: string,
+    { allowOtherPoint = false, allowUnpaid = false }: BoardOverrides,
+    offline: OfflineScan | null = null,
+  ): Promise<{ result: ScanResult; ticket?: any }> {
     return this.prisma.$transaction(async (tx) => {
       const found = await tx.ticket.findUnique({ where: { ticketNumber }, select: { bookingId: true } });
       if (!found) return { result: 'INVALID' as const };
@@ -619,9 +835,10 @@ export class TicketsService {
       }
       // A pending cancellation could still refund the seat, so it is settled before anyone boards on it.
       if (ticket.booking.status !== 'CONFIRMED' && ticket.booking.status !== 'BOARDED') return { result: 'CANCELLATION_PENDING' as const, ticket: details };
-      if (isReturning) return this.boardReturn(tx, actor, ticket, tripId);
+      if (isReturning) return this.boardReturn(tx, actor, ticket, tripId, offline);
 
-      const boardedAt = new Date();
+      // A boarding sent later from the road keeps the moment it was scanned, so the window is read at that moment.
+      const boardedAt = offline?.scannedAt ?? new Date();
       const window = crewWindow(ticket.booking.trip, boardedAt.getTime());
       // A used ticket still reports who boarded it, so only a fresh boarding is refused here.
       if (!ticket.isBoarded && !window.isBoardingOpen) {
@@ -630,17 +847,19 @@ export class TicketsService {
 
       // The bus has left every point, so this is support's to resolve. If it is still taking passengers, the crew setting its point again lifts this.
       // A compensated ticket stays stopped whatever the bus does: it has been settled and paid for.
-      if (!ticket.isBoarded && (ticket.booking.compensation || ticketBoarding(ticket.booking, ticket.booking.trip, boardedAt.getTime()).state === 'STOPPED')) {
+      // Sent later, the bus has moved on since the scan, so only a compensation stops it (the time was checked above at the scan's moment).
+      if (!ticket.isBoarded && (ticket.booking.compensation || (!offline && ticketBoarding(ticket.booking, ticket.booking.trip, boardedAt.getTime()).state === 'STOPPED'))) {
         return { result: 'TICKET_STOPPED' as const, ticket: details };
       }
 
       // A warning rather than a refusal: the crew can see the passenger standing there and decides.
-      const atPoint = isAtTicketPoint(ticket.booking, ticket.booking.trip.currentBoardingPoint);
+      // Without internet the crew saw the passenger at the door and let them on; where the bus stands now says nothing about then.
+      const atPoint = !!offline || isAtTicketPoint(ticket.booking, ticket.booking.trip.currentBoardingPoint);
       if (!ticket.isBoarded && !atPoint && !allowOtherPoint) return { result: 'WRONG_POINT' as const, ticket: details };
 
       const claimed = await tx.ticket.updateMany({
         where: { id: ticket.id, isBoarded: false },
-        data: { isBoarded: true, boardedAt },
+        data: { isBoarded: true, boardedAt, noShowAt: null, boardedOffline: !!offline },
       });
       if (claimed.count === 0) {
         const boardings = await tx.bookingEvent.findMany({
@@ -661,6 +880,7 @@ export class TicketsService {
           seat: ticket.passenger.seatNumber,
           ticketNumber,
           ...(!atPoint && { otherPoint: { ticket: ticket.booking.boardingPointName, bus: ticket.booking.trip.currentBoardingPoint?.name ?? null } }),
+          ...(offline && { offline: true, scannedAt: boardedAt.toISOString() }),
         },
       });
       const remaining = await tx.ticket.count({ where: { bookingId: ticket.bookingId, isBoarded: false } });
@@ -674,7 +894,7 @@ export class TicketsService {
   }
 
   /** The same ticket a second time, for the way back: the window and route are the reverse's, and the bus's position is not checked because the reverse has no other point to send them to. */
-  private async boardReturn(tx: Prisma.TransactionClient, actor: Actor, ticket: TicketWithBooking, tripId: string): Promise<{ result: ScanResult; ticket?: any }> {
+  private async boardReturn(tx: Prisma.TransactionClient, actor: Actor, ticket: TicketWithBooking, tripId: string, offline: OfflineScan | null = null): Promise<{ result: ScanResult; ticket?: any }> {
     const reverse = await tx.trip.findUniqueOrThrow({
       where: { id: tripId },
       select: {
@@ -700,7 +920,7 @@ export class TicketsService {
       trip: { id: reverse.id, tripCode: reverse.tripCode, origin: reverse.origin, destination: reverse.destination, departureTime: reverse.departureTime },
     };
 
-    const boardedAt = new Date();
+    const boardedAt = offline?.scannedAt ?? new Date();
     const window = crewWindow(reverse, boardedAt.getTime());
     if (!ticket.returnBoardedAt && !window.isBoardingOpen) {
       return { result: 'OUTSIDE_WINDOW', ticket: { ...details, boardingOpensAt: window.boardingOpensAt, boardingClosesAt: window.boardingClosesAt } };
@@ -708,7 +928,7 @@ export class TicketsService {
     // Compensation paid for the journey not taken, so the way back is not owed on top of it.
     if (!ticket.returnBoardedAt && ticket.booking.compensation) return { result: 'TICKET_STOPPED', ticket: details };
 
-    const claimed = await tx.ticket.updateMany({ where: { id: ticket.id, returnBoardedAt: null }, data: { returnBoardedAt: boardedAt } });
+    const claimed = await tx.ticket.updateMany({ where: { id: ticket.id, returnBoardedAt: null }, data: { returnBoardedAt: boardedAt, returnNoShowAt: null, returnBoardedOffline: !!offline } });
     if (claimed.count === 0) {
       const boardings = await tx.bookingEvent.findMany({
         where: { bookingId: ticket.bookingId, action: 'RETURN_BOARDED' },
@@ -723,7 +943,13 @@ export class TicketsService {
       bookingId: ticket.bookingId,
       action: 'RETURN_BOARDED',
       actorId: actor.userId,
-      after: { passenger: ticket.passenger.fullName, seat: ticket.passenger.seatNumber, ticketNumber: ticket.ticketNumber, tripCode: reverse.tripCode },
+      after: {
+        passenger: ticket.passenger.fullName,
+        seat: ticket.passenger.seatNumber,
+        ticketNumber: ticket.ticketNumber,
+        tripCode: reverse.tripCode,
+        ...(offline && { offline: true, scannedAt: boardedAt.toISOString() }),
+      },
     });
     await tx.booking.update({ where: { id: ticket.bookingId }, data: { updatedAt: boardedAt } });
     await this.notifications.toBookingOwners(tx, 'PASSENGER_BOARDED', [ticket.bookingId], {

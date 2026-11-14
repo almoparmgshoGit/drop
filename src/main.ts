@@ -1,3 +1,5 @@
+// First, so error reporting (Sentry, when SENTRY_DSN is set) is ready before anything else loads.
+import './instrument';
 import { NestFactory } from '@nestjs/core';
 import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
 import { AppModule } from './app.module';

@@ -75,6 +75,8 @@ const toHalalas = (sar: number) => Math.round(sar * 100);
 export function earnedPoints(keptHalalas: number, share: number, plan: Pick<EarnPlan, 'rate' | 'bonus'>) {
   if (!(keptHalalas > 0)) return 0;
   const transport = Math.round(keptHalalas * share);
+  // Points come from transport purchases only: a booking that bought no tickets (a stay alone) earns no bonus either.
+  if (!(transport > 0)) return 0;
   const base = plan.rate > 0 ? Math.floor((transport * plan.rate) / 100 + 1e-9) : 0;
   return Math.max(0, base + Math.floor(plan.bonus));
 }
@@ -543,7 +545,7 @@ export class LoyaltyService {
   /** Everything the customer's points screen shows. */
   async customerSummary(userId: string) {
     const program = await this.getProgram();
-    const [user, transactions, tier, vouchers, myVouchers] = await Promise.all([
+    const [user, transactions, tier, myVouchers] = await Promise.all([
       this.prisma.user.findUnique({ where: { id: userId }, select: { loyaltyPoints: true, loyaltyActivityAt: true, referredById: true } }),
       this.prisma.loyaltyTransaction.findMany({
         where: { userId },
@@ -560,7 +562,6 @@ export class LoyaltyService {
         },
       }),
       this.tierOf(this.prisma, userId, program),
-      program.enabled ? this.prisma.loyaltyVoucher.findMany({ where: { isActive: true }, orderBy: { pointsCost: 'asc' } }) : Promise.resolve([]),
       this.prisma.coupon.findMany({
         where: { ownerUserId: userId },
         orderBy: { createdAt: 'desc' },
@@ -605,7 +606,6 @@ export class LoyaltyService {
       tier: tier.key ? tier : null,
       challenge,
       referral,
-      vouchers: vouchers.map((v) => ({ id: v.id, name: v.name, pointsCost: v.pointsCost, value: Number(v.value), validDays: v.validDays })),
       myVouchers: myVouchers.map((c) => ({
         id: c.id,
         code: c.code,
@@ -638,33 +638,4 @@ export class LoyaltyService {
     });
   }
 
-  async redeemVoucher(userId: string, voucherId: string) {
-    const program = await this.getProgram();
-    if (!program.enabled) throw new ConflictException('برنامج النقاط غير متاح حاليًا');
-    return this.prisma.$transaction(async (tx) => {
-      const voucher = await tx.loyaltyVoucher.findUnique({ where: { id: voucherId } });
-      if (!voucher || !voucher.isActive) throw new NotFoundException('القسيمة غير متاحة');
-      await this.spend(tx, { userId, points: voucher.pointsCost, type: 'VOUCHER', description: `قسيمة ${voucher.name}` });
-      const code = `LY${crypto.randomBytes(5).toString('hex').toUpperCase()}`;
-      const coupon = await tx.coupon.create({
-        data: {
-          code,
-          type: 'FIXED_TOTAL',
-          value: voucher.value,
-          maxUses: 1,
-          perUserLimit: 1,
-          ownerUserId: userId,
-          validUntil: new Date(Date.now() + voucher.validDays * DAY_MS),
-        },
-        select: { code: true, value: true, validUntil: true },
-      });
-      await this.notifications.toUser(tx, 'VOUCHER_REDEEMED', userId, {
-        points: voucher.pointsCost,
-        voucherName: voucher.name,
-        voucherValue: formatSar(voucher.value),
-        voucherCode: coupon.code,
-      });
-      return { code: coupon.code, value: Number(coupon.value), validUntil: coupon.validUntil };
-    }, TX_OPTIONS);
-  }
 }

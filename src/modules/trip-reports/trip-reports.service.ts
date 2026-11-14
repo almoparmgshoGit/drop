@@ -2,6 +2,7 @@ import { BadRequestException, ConflictException, ForbiddenException, Injectable,
 import { Prisma, TripReportCategory, TripReportStatus, TripReportType } from '@prisma/client';
 import { NotificationsService } from '../../common/services/notifications.service';
 import { PrismaService } from '../../common/services/prisma.service';
+import { RealtimeService } from '../../common/services/realtime.service';
 import { CREW_WINDOW_SELECT, crewWindow } from '../../common/utils/crew-window.util';
 import { cleanFileName } from '../cash/cash.service';
 import { CreateReportDto, CrewReportUpdateDto, OfficeReportUpdateDto, ReportsQuery } from './trip-reports.dto';
@@ -63,6 +64,7 @@ export class TripReportsService {
   constructor(
     private prisma: PrismaService,
     private notifications: NotificationsService,
+    private realtime: RealtimeService,
   ) {}
 
   private async assertAssigned(actor: ReportActor, tripId: string) {
@@ -93,7 +95,7 @@ export class TripReportsService {
 
     const trip = await this.prisma.trip.findUnique({
       where: { id: tripId },
-      select: { liveStatus: true, currentBoardingPoint: { select: { name: true } }, ...CREW_WINDOW_SELECT },
+      select: { liveStatus: true, busId: true, tripCode: true, currentBoardingPoint: { select: { name: true } }, ...CREW_WINDOW_SELECT },
     });
     if (!trip) throw new NotFoundException('Trip not found');
     // Someone in danger is never told to wait for the trip's opening time.
@@ -126,6 +128,23 @@ export class TripReportsService {
       };
       await this.notifications.toStaff(tx, category === 'SOS' ? 'STAFF_TRIP_SOS' : 'STAFF_TRIP_REPORT', ['manifests.view', 'reports.view'], values, { exceptUserId: actor.userId, tripId, reportId: created.id });
       await this.notifications.toTripCrew(tx, 'CREW_COLLEAGUE_REPORT', tripId, { exceptUserId: actor.userId, reportId: created.id, extra: values });
+      // A breakdown opens an entry in the bus's maintenance log, so the repair is followed after the trip too.
+      if (dto.type === 'BREAKDOWN' && trip.busId) {
+        await tx.busMaintenanceLog.create({
+          data: {
+            busId: trip.busId,
+            tripId,
+            tripCode: trip.tripCode,
+            reportId: created.id,
+            type: 'BREAKDOWN',
+            description: dto.details,
+            reportedAt: created.createdAt,
+            createdById: actor.userId,
+            createdByName: reporterName,
+          },
+        });
+      }
+      if (category === 'SOS') this.realtime.sosChanged(created.id, 'created');
       return created;
     }, TX_OPTIONS);
     return { ...report, code: reportCode(report.number) };
@@ -148,6 +167,7 @@ export class TripReportsService {
         attachments: { select: ATTACHMENT_FIELDS, orderBy: { createdAt: 'asc' } },
         updates: { orderBy: { createdAt: 'asc' } },
         trip: { select: { id: true, tripCode: true, origin: true, destination: true, departureTime: true } },
+        maintenanceLog: { select: { id: true, busId: true, status: true } },
       },
     });
     if (!report) throw new NotFoundException('البلاغ غير موجود');
@@ -223,7 +243,7 @@ export class TripReportsService {
         ...(number ? [{ number: Number(number) }] : []),
       ];
     }
-    const [items, total, groups] = await Promise.all([
+    const [items, total, groups, unacknowledgedSos] = await Promise.all([
       this.prisma.tripReport.findMany({
         where,
         // Enum order puts what still needs someone first; among those, the newest.
@@ -237,6 +257,7 @@ export class TripReportsService {
       }),
       this.prisma.tripReport.count({ where }),
       this.prisma.tripReport.groupBy({ by: ['status', 'category'], _count: true }),
+      this.prisma.tripReport.count({ where: { category: 'SOS', status: { not: 'RESOLVED' }, acknowledgedAt: null } }),
     ]);
     const count = (match: (row: (typeof groups)[number]) => boolean) => groups.filter(match).reduce((sum, row) => sum + row._count, 0);
     return {
@@ -245,6 +266,7 @@ export class TripReportsService {
         inProgress: count((row) => row.status === 'IN_PROGRESS'),
         resolved: count((row) => row.status === 'RESOLVED'),
         activeSos: count((row) => row.category === 'SOS' && row.status !== 'RESOLVED'),
+        unacknowledgedSos,
       },
       items: items.map(({ _count, idempotencyKey: _unused, ...report }) => ({ ...report, code: reportCode(report.number), attachmentCount: _count.attachments, updateCount: _count.updates })),
       total,
@@ -286,7 +308,7 @@ export class TripReportsService {
       }),
       this.prisma.ticket.findMany({
         where: { booking: { tripId: report.tripId, status: { in: [...TRAVELING_STATUSES] } } },
-        select: { isBoarded: true, booking: { select: { boardingPointId: true, boardingPointName: true } } },
+        select: { isBoarded: true, noShowAt: true, booking: { select: { boardingPointId: true, boardingPointName: true } } },
       }),
       this.prisma.tripStatusUpdate.findMany({ where: { tripId: report.tripId }, orderBy: { createdAt: 'desc' }, take: 30 }),
       this.prisma.tripReport.findMany({
@@ -331,6 +353,7 @@ export class TripReportsService {
         location: location && { ...location, isLive: Date.now() - location.recordedAt.getTime() <= LIVE_FOR_MS },
         passengerCount: tickets.length,
         boardedCount: tickets.filter((ticket) => ticket.isBoarded).length,
+        noShowCount: tickets.filter((ticket) => ticket.noShowAt && !ticket.isBoarded).length,
         points: [...boardingPoints]
           .sort((a, b) => a.time.localeCompare(b.time))
           .map((point) => {
@@ -346,18 +369,76 @@ export class TripReportsService {
 
   async addOfficeUpdate(actor: ReportActor, reportId: string, dto: OfficeReportUpdateDto) {
     const note = dto.note || null;
-    const report = await this.prisma.tripReport.findUnique({ where: { id: reportId }, select: { id: true, tripId: true, number: true, status: true } });
+    const report = await this.prisma.tripReport.findUnique({ where: { id: reportId }, select: { id: true, tripId: true, number: true, status: true, category: true, acknowledgedAt: true } });
     if (!report) throw new NotFoundException('البلاغ غير موجود');
     const changed = dto.status && dto.status !== report.status ? dto.status : null;
     if (!changed && !note) throw new BadRequestException('غيّر الحالة أو اكتب ملاحظة');
 
     const actorName = await this.nameOf(actor);
     await this.prisma.$transaction(async (tx) => {
+      // Answering a report shows it was received, so the alarm stops and nobody is escalated for it.
+      if (!report.acknowledgedAt) await this.acknowledgeIn(tx, report, actor.userId, actorName);
       await tx.tripReportUpdate.create({ data: { reportId, status: changed, note, actorId: actor.userId, actorName, fromOffice: true } });
       await tx.tripReport.update({ where: { id: reportId }, data: { updatedAt: new Date(), ...(changed && { status: changed }) } });
       await this.notifyUpdate(tx, report, actor.userId, { reportStatus: changed && STATUS_LABELS[changed], updateNote: note, senderName: actorName });
+      if (report.category === 'SOS' && changed === 'RESOLVED') this.realtime.sosChanged(reportId, 'resolved');
     }, TX_OPTIONS);
     return this.detailsForOffice(reportId);
+  }
+
+  /** Someone in the office says "we have it": the crew sees who, and the alarm and the escalation stop. Repeating it changes nothing. */
+  async acknowledge(actor: ReportActor, reportId: string) {
+    const report = await this.prisma.tripReport.findUnique({ where: { id: reportId }, select: { id: true, tripId: true, number: true, category: true, acknowledgedAt: true } });
+    if (!report) throw new NotFoundException('البلاغ غير موجود');
+    if (!report.acknowledgedAt) {
+      const actorName = await this.nameOf(actor);
+      await this.prisma.$transaction((tx) => this.acknowledgeIn(tx, report, actor.userId, actorName), TX_OPTIONS);
+    }
+    return this.detailsForOffice(reportId);
+  }
+
+  /** The claim on acknowledgedAt makes two people pressing at once record one acknowledgement. */
+  private async acknowledgeIn(tx: Prisma.TransactionClient, report: { id: string; tripId: string; number: number; category: TripReportCategory }, actorId: string, actorName: string | null) {
+    const now = new Date();
+    const claimed = await tx.tripReport.updateMany({
+      where: { id: report.id, acknowledgedAt: null },
+      data: { acknowledgedAt: now, acknowledgedById: actorId, acknowledgedByName: actorName, updatedAt: now },
+    });
+    if (claimed.count === 0) return false;
+    const senderName = actorName ?? 'المكتب';
+    await tx.tripReportUpdate.create({ data: { reportId: report.id, note: `تم استلام البلاغ من المكتب (${senderName})`, actorId, actorName, fromOffice: true } });
+    if (report.category === 'SOS') {
+      await this.notifications.toTripCrew(tx, 'CREW_SOS_ACKNOWLEDGED', report.tripId, { exceptUserId: actorId, reportId: report.id, extra: { reportCode: reportCode(report.number), senderName } });
+      this.realtime.sosChanged(report.id, 'acknowledged');
+    }
+    const crew = await tx.trip.findUnique({ where: { id: report.tripId }, select: { drivers: { select: { userId: true } }, supervisors: { select: { userId: true } } } });
+    const crewIds = crew ? [...crew.drivers, ...crew.supervisors].map((member) => member.userId) : [];
+    this.realtime.reportChanged(crewIds, { reportId: report.id, tripId: report.tripId, acknowledgedAt: now, acknowledgedByName: actorName });
+    return true;
+  }
+
+  /** Every SOS still open, for the dashboard's alarm and banner, split by whether someone acknowledged it. */
+  async activeSos() {
+    const rows = await this.prisma.tripReport.findMany({
+      where: { category: 'SOS', status: { not: 'RESOLVED' } },
+      orderBy: { createdAt: 'desc' },
+      take: 50,
+      select: {
+        id: true,
+        number: true,
+        type: true,
+        status: true,
+        details: true,
+        createdByName: true,
+        createdAt: true,
+        acknowledgedAt: true,
+        acknowledgedByName: true,
+        escalatedAt: true,
+        trip: { select: { id: true, tripCode: true, origin: true, destination: true } },
+      },
+    });
+    const items = rows.map((row) => ({ ...row, code: reportCode(row.number) }));
+    return { unacknowledged: items.filter((row) => !row.acknowledgedAt), acknowledged: items.filter((row) => row.acknowledgedAt) };
   }
 
   async attachmentForOffice(id: string) {
@@ -367,11 +448,12 @@ export class TripReportsService {
   }
 
   async openCount() {
-    const [open, sos] = await Promise.all([
+    const [open, sos, unacknowledgedSos] = await Promise.all([
       this.prisma.tripReport.count({ where: { status: 'OPEN' } }),
       this.prisma.tripReport.count({ where: { category: 'SOS', status: { not: 'RESOLVED' } } }),
+      this.prisma.tripReport.count({ where: { category: 'SOS', status: { not: 'RESOLVED' }, acknowledgedAt: null } }),
     ]);
-    return { open, sos };
+    return { open, sos, unacknowledgedSos };
   }
 
   /** Whoever filed it and the rest of the trip's crew hear about every change. */

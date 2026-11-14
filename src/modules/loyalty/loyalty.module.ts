@@ -81,16 +81,6 @@ class CreateRuleDto {
 
 class UpdateRuleDto extends PartialType(CreateRuleDto) {}
 
-class CreateVoucherDto {
-  @trimmed() @IsString() @Length(2, 100) name: string;
-  @IsInt() @Min(1) @Max(1000000) pointsCost: number;
-  @IsNumber({ maxDecimalPlaces: 2 }) @Min(1) @Max(100000) value: number;
-  @IsOptional() @IsInt() @Min(1) @Max(730) validDays?: number;
-  @IsOptional() @IsBoolean() isActive?: boolean;
-}
-
-class UpdateVoucherDto extends PartialType(CreateVoucherDto) {}
-
 class AdjustPointsDto {
   @IsInt() @Min(-1000000) @Max(1000000) points: number;
   @trimmed() @IsString() @Length(3, 300, { message: 'سبب التعديل إلزامي' }) reason: string;
@@ -160,20 +150,6 @@ class LoyaltyAdminService {
     const { count } = await this.prisma.loyaltyRule.deleteMany({ where: { id } });
     if (count === 0) throw new NotFoundException('القاعدة غير موجودة');
     return { success: true };
-  }
-
-  listVouchers() {
-    return this.prisma.loyaltyVoucher.findMany({ orderBy: [{ isActive: 'desc' }, { pointsCost: 'asc' }] });
-  }
-
-  createVoucher(dto: CreateVoucherDto) {
-    return this.prisma.loyaltyVoucher.create({ data: dto });
-  }
-
-  async updateVoucher(id: string, dto: UpdateVoucherDto) {
-    const exists = await this.prisma.loyaltyVoucher.count({ where: { id } });
-    if (exists === 0) throw new NotFoundException('القسيمة غير موجودة');
-    return this.prisma.loyaltyVoucher.update({ where: { id }, data: dto });
   }
 
   async customers(search?: string) {
@@ -332,27 +308,6 @@ class LoyaltyController {
   @ApiOperation({ summary: 'Delete an earning rule; bookings keep the terms they were made under' })
   removeRule(@Param('id') id: string) {
     return this.admin.removeRule(id);
-  }
-
-  @Get('vouchers')
-  @RequirePermission('loyalty.view')
-  @ApiOperation({ summary: 'Voucher catalogue' })
-  listVouchers() {
-    return this.admin.listVouchers();
-  }
-
-  @Post('vouchers')
-  @RequirePermission('loyalty.manage')
-  @ApiOperation({ summary: 'Add a voucher to the catalogue' })
-  createVoucher(@Body() dto: CreateVoucherDto) {
-    return this.admin.createVoucher(dto);
-  }
-
-  @Patch('vouchers/:id')
-  @RequirePermission('loyalty.manage')
-  @ApiOperation({ summary: 'Edit a catalogue voucher' })
-  updateVoucher(@Param('id') id: string, @Body() dto: UpdateVoucherDto) {
-    return this.admin.updateVoucher(id, dto);
   }
 
   @Get('customers')

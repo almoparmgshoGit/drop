@@ -514,4 +514,13 @@ export class HotelsOverviewQuery {
   @IsOptional()
   @Matches(/^\d{4}-(0[1-9]|1[0-2])$/)
   month?: string;
+
+  /** Trip departure days YYYY-MM-DD (Riyadh), both included; when both are given they replace the month. */
+  @IsOptional()
+  @Matches(/^\d{4}-\d{2}-\d{2}$/)
+  from?: string;
+
+  @IsOptional()
+  @Matches(/^\d{4}-\d{2}-\d{2}$/)
+  to?: string;
 }

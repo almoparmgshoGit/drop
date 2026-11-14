@@ -53,7 +53,7 @@ class HotelsController {
   @RequirePermission('hotels.rates')
   @ApiOperation({ summary: 'Monthly hotel bookings with cost, sales and profit (Admin only)' })
   overview(@Query() query: HotelsOverviewQuery) {
-    return this.hotels.overview(query.month);
+    return this.hotels.overview(query.month, query.from, query.to);
   }
 
   @Get('trips/:tripId')

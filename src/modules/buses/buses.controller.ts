@@ -14,6 +14,8 @@ import {
   VoidOfficePaymentDto,
 } from './buses.dto';
 import { BusesService } from './buses.service';
+import { CreateMaintenanceDto, UpdateMaintenanceDto } from './bus-maintenance.dto';
+import { BusMaintenanceService } from './bus-maintenance.service';
 import { DriversService } from './drivers.service';
 import { RequirePermission } from '../../common/decorators/auth.decorators';
 
@@ -21,13 +23,44 @@ import { RequirePermission } from '../../common/decorators/auth.decorators';
 @Controller('buses')
 @ApiBearerAuth()
 export class BusesController {
-  constructor(private busesService: BusesService) {}
+  constructor(
+    private busesService: BusesService,
+    private maintenanceService: BusMaintenanceService,
+  ) {}
 
   @Get()
   @RequirePermission('buses.view', 'trips.manage')
   @ApiOperation({ summary: 'Get all buses' })
   async getAllBuses() {
     return this.busesService.getAllBuses();
+  }
+
+  @Get(':id/maintenance')
+  @RequirePermission('buses.view')
+  @ApiOperation({ summary: "The bus's maintenance log, breakdown reports included" })
+  async maintenance(@Param('id') id: string) {
+    return this.maintenanceService.list(id);
+  }
+
+  @Post(':id/maintenance')
+  @RequirePermission('buses.manage')
+  @ApiOperation({ summary: 'Add a maintenance entry to a bus' })
+  async addMaintenance(@Req() req, @Param('id') id: string, @Body() dto: CreateMaintenanceDto) {
+    return this.maintenanceService.create(id, req.user.userId, dto);
+  }
+
+  @Patch('maintenance/:logId')
+  @RequirePermission('buses.manage')
+  @ApiOperation({ summary: 'Edit a maintenance entry (status, cost, description, dates)' })
+  async updateMaintenance(@Param('logId') logId: string, @Body() dto: UpdateMaintenanceDto) {
+    return this.maintenanceService.update(logId, dto);
+  }
+
+  @Delete('maintenance/:logId')
+  @RequirePermission('buses.manage')
+  @ApiOperation({ summary: 'Delete a maintenance entry' })
+  async deleteMaintenance(@Param('logId') logId: string) {
+    return this.maintenanceService.remove(logId);
   }
 
   @Get(':id')
@@ -132,7 +165,7 @@ export class BusOfficesController {
   @RequirePermission('buses.rates')
   @ApiOperation({ summary: "An office's monthly statement: rent minus expenses, payments and balance" })
   statement(@Param('id') id: string, @Query() query: StatementQuery) {
-    return this.accounts.statement(id, query.month);
+    return this.accounts.statement(id, query);
   }
 
   @Post(':id/payments')

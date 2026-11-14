@@ -1,7 +1,7 @@
 import { Controller, Post, Body, Req, Get } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
-import { IsString, IsNotEmpty, IsOptional, Matches, MaxLength, IsUUID, IsBoolean, Length } from 'class-validator';
+import { IsString, IsNotEmpty, IsOptional, Matches, MaxLength, IsBoolean, Length } from 'class-validator';
 import { AuthService } from './auth.service';
 import { Public } from '../../common/decorators/auth.decorators';
 
@@ -38,11 +38,8 @@ class StaffLoginDto {
   password: string;
 }
 
+/** No branch here on purpose: the session's branch comes from the employee's account on the server. */
 class PanelLoginDto extends StaffLoginDto {
-  @IsOptional()
-  @IsUUID('4', { message: 'الفرع المختار غير صحيح' })
-  branchId?: string;
-
   @IsOptional()
   @Matches(/^[a-f0-9]{64}$/)
   deviceToken?: string;
@@ -172,20 +169,20 @@ export class AuthController {
     return this.authService.staffLogin(dto.phone, dto.password, ip, userAgent);
   }
 
-  @Public()
-  @Throttle({ default: { limit: 30, ttl: 60_000 } })
-  @Get('login-branches')
-  @ApiOperation({ summary: 'Active branches for the panel sign-in form' })
-  async loginBranches() {
-    return this.authService.loginBranches();
+  // Signed-in only: branch names and ids are not shown to visitors of the sign-in page.
+  @Get('session-branches')
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Branches the signed-in employee may switch the panel to' })
+  async sessionBranches(@Req() req) {
+    return this.authService.sessionBranches(req.user.userId);
   }
 
   @Public()
   @Throttle({ default: { limit: 10, ttl: 60_000 } })
   @Post('panel/login')
-  @ApiOperation({ summary: 'Panel sign-in: password and branch, then a WhatsApp code on a device not remembered' })
+  @ApiOperation({ summary: "Panel sign-in: password, then a WhatsApp code on a device not remembered; the branch is the account's" })
   async panelLogin(@Body() dto: PanelLoginDto, @Req() req) {
-    return this.authService.panelLogin(dto.phone, dto.password, { branchId: dto.branchId, deviceToken: dto.deviceToken }, req.ip, req.headers['user-agent']);
+    return this.authService.panelLogin(dto.phone, dto.password, { deviceToken: dto.deviceToken }, req.ip, req.headers['user-agent']);
   }
 
   @Public()

@@ -3,8 +3,10 @@ import { FilesInterceptor } from '@nestjs/platform-express';
 import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
 import { IsBoolean, IsOptional, IsString, MaxLength } from 'class-validator';
 import { MAX_PUBLIC_IMAGE_BYTES, MAX_PUBLIC_IMAGES_PER_UPLOAD, TripsService, UploadedImage } from './trips.service';
-import { AdminTripsQuery, CreateTripDto, DuplicateTripDto, OpenReverseTripDto, ReverseTripsQuery, SeriesMonthDto, StopSeriesDto, UpdateTripDto } from './trips.dto';
+import { AdminOccupancyQuery, AdminTripsQuery, CreateTripDto, DuplicateTripDto, OpenReverseTripDto, ReverseTripsQuery, SeriesMonthDto, StopSeriesDto, UpdateTripDto } from './trips.dto';
 import { Public, RequirePermission } from '../../common/decorators/auth.decorators';
+import { OperationsBoardService } from './operations-board.service';
+import { OperationsBoardQuery, TripAvailabilityQuery } from './operations-board.dto';
 
 class TripSearchQuery {
   @IsOptional() @IsString() @MaxLength(100) origin?: string;
@@ -34,7 +36,10 @@ class CancelTripDto {
 @ApiTags('Trips')
 @Controller('trips')
 export class TripsController {
-  constructor(private tripsService: TripsService) {}
+  constructor(
+    private tripsService: TripsService,
+    private operationsBoard: OperationsBoardService,
+  ) {}
 
   @Public()
   @Get('search')
@@ -62,7 +67,15 @@ export class TripsController {
   @ApiBearerAuth()
   @ApiOperation({ summary: 'Get all trips for admin management' })
   async getAllAdminTrips(@Req() req, @Query() query: AdminTripsQuery) {
-    return this.tripsService.getAllAdminTrips(req.user, query.from);
+    return this.tripsService.getAllAdminTrips(req.user, query);
+  }
+
+  @Get('admin/occupancy')
+  @RequirePermission('trips.view', 'trips.manage')
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Occupancy of executed trips (last 30 days) and of the next 30 days, from the shared metrics' })
+  async getAdminOccupancy(@Req() req, @Query() query: AdminOccupancyQuery) {
+    return this.tripsService.getAdminOccupancy(req.user, query);
   }
 
   @Get('admin/reverse')
@@ -71,6 +84,22 @@ export class TripsController {
   @ApiOperation({ summary: 'Upcoming trips with a reverse trip on their remaining seats' })
   async getReverseTrips(@Req() req, @Query() query: ReverseTripsQuery) {
     return this.tripsService.getReverseTrips(query.range, req.user);
+  }
+
+  @Get('admin/availability')
+  @RequirePermission('trips.view', 'trips.manage')
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Buses and crew already on another trip, or on approved leave, between start and end' })
+  async getAvailability(@Query() query: TripAvailabilityQuery) {
+    return this.operationsBoard.availability(query);
+  }
+
+  @Get('admin/board')
+  @RequirePermission('trips.view', 'trips.manage')
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Operations board: trips of the given Riyadh days per bus, driver and supervisor, with their clashes' })
+  async getOperationsBoard(@Req() req, @Query() query: OperationsBoardQuery) {
+    return this.operationsBoard.board(req.user, query);
   }
 
   @Get('admin/branch-filter')
@@ -132,7 +161,7 @@ export class TripsController {
   }
 
   @Post('images')
-  @RequirePermission('trips.manage', 'buses.manage', 'hotels.manage', 'offers.manage')
+  @RequirePermission('trips.manage', 'buses.manage', 'hotels.manage', 'offers.manage', 'loyalty.manage')
   @UseInterceptors(FilesInterceptor('images', MAX_PUBLIC_IMAGES_PER_UPLOAD, { limits: { fileSize: MAX_PUBLIC_IMAGE_BYTES } }))
   @ApiBearerAuth()
   @ApiOperation({ summary: 'Store photos for trips, buses and hotels; the returned URLs go on the trip, bus or hotel' })
