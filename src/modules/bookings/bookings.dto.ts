@@ -19,6 +19,7 @@ import {
   ValidateNested,
 } from 'class-validator';
 import { BookingCategory, BookingStatus, Gender, RefundDestination, RoomType } from '@prisma/client';
+import { NATIONALITIES } from '../../common/profile-options';
 
 const SEAT_NUMBER = /^\d{1,3}$/;
 const trimmed = () => Transform(({ value }) => (typeof value === 'string' ? value.trim() : value));
@@ -67,6 +68,11 @@ export class PassengerDto {
   @IsOptional()
   @IsEnum(Gender)
   gender?: Gender;
+
+  /** From NATIONALITIES; housing groups and filters travellers by it. Optional for the same reason as gender. */
+  @IsOptional()
+  @IsIn(NATIONALITIES, { message: 'اختر الجنسية من القائمة' })
+  nationality?: string;
 }
 
 export class QuoteDto {
@@ -221,6 +227,15 @@ export class UpdatePassengerDto extends AdminEditDto {
   @IsString()
   @MaxLength(300)
   notes?: string | null;
+
+  /** Null clears it. Housing reads it to place people together; the seat section is not re-checked here. */
+  @IsOptional()
+  @IsEnum(Gender)
+  gender?: Gender | null;
+
+  @IsOptional()
+  @IsIn(NATIONALITIES, { message: 'اختر الجنسية من القائمة' })
+  nationality?: string | null;
 }
 
 export class ChangeSeatDto extends AdminEditDto {

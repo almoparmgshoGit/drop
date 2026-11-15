@@ -576,6 +576,14 @@ export class AdminTripsQuery {
   @IsOptional()
   @Matches(/^\d{4}-\d{2}-\d{2}$/, { message: 'to: تاريخ YYYY-MM-DD' })
   to?: string;
+
+  /**
+   * active: trips not over yet (arrival still ahead), nearest departure first, as the pickers across the system show them.
+   * ended: trips whose arrival has passed, latest first; these live in the reports. Left out, every trip.
+   */
+  @IsOptional()
+  @IsIn(['active', 'ended'])
+  scope?: 'active' | 'ended';
 }
 
 export class AdminOccupancyQuery {

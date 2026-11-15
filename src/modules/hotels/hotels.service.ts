@@ -15,6 +15,7 @@ import { suggestServiceIcon } from '../../common/service-icons';
 import { NATIONALITIES } from '../../common/profile-options';
 import { riyadhDaysRange } from '../../common/utils/time.util';
 import { PROFILE_ACCOUNT_SELECT, PROFILE_PASSENGER_SELECT, passengerProfiles } from '../../common/utils/passenger-profile.util';
+import { compareSeats } from '../../common/utils/seat-label.util';
 import {
   AssignBookingRoomDto,
   AssignRoomDto,
@@ -158,7 +159,16 @@ export class HotelsService {
                     phone: true,
                     seatNumber: true,
                     roomNote: true,
-                    booking: { select: { id: true, bookingReference: true, user: { select: { phone: true } }, passengers: { take: 1, select: { id: true } } } },
+                    gender: true,
+                    nationality: true,
+                    booking: {
+                      select: {
+                        id: true,
+                        bookingReference: true,
+                        user: { select: { phone: true, ...PROFILE_ACCOUNT_SELECT } },
+                        passengers: { orderBy: { position: 'asc' }, take: 1, select: { id: true } },
+                      },
+                    },
                   },
                 },
               },
@@ -206,6 +216,9 @@ export class HotelsService {
               phone: o.phone ?? (o.booking.passengers[0]?.id === o.id ? o.booking.user.phone : null),
               seatNumber: o.seatNumber,
               roomNote: o.roomNote,
+              // The owner's account stands in for what their row lacks, as on the rooming screen.
+              gender: o.gender ?? (o.booking.passengers[0]?.id === o.id ? o.booking.user.gender : null),
+              nationality: o.nationality ?? (o.booking.passengers[0]?.id === o.id ? o.booking.user.nationality : null),
               bookingId: o.booking.id,
               bookingReference: o.booking.bookingReference,
             })),
@@ -681,7 +694,7 @@ export class HotelsService {
           room: p.hotelRoom,
         }));
       })
-      .sort((a, b) => Number(a.seatNumber) - Number(b.seatNumber));
+      .sort((a, b) => compareSeats(a.seatNumber, b.seatNumber));
 
     return {
       trip: {

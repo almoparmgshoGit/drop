@@ -7,6 +7,7 @@ import { formatRiyadhDate, formatRiyadhTime } from '../utils/time.util';
 import { randomUUID } from 'crypto';
 import { PushService } from './push.service';
 import { RealtimeService } from './realtime.service';
+import { compareSeats, seatLabel } from '../utils/seat-label.util';
 
 type Db = Prisma.TransactionClient;
 
@@ -55,7 +56,7 @@ export const tripValues = (trip: TripContext): NotificationValues => ({
 const bookingValues = (booking: BookingContext): NotificationValues => ({
   ...tripValues(booking.trip),
   bookingReference: booking.bookingReference,
-  seats: booking.passengers.map((p) => p.seatNumber).sort((a, b) => Number(a) - Number(b)).join('، '),
+  seats: booking.passengers.map((p) => p.seatNumber).sort(compareSeats).map(seatLabel).join('، '),
   passengerCount: booking.passengers.length,
   boardingPoint: booking.boardingPointName,
   boardingTime: booking.boardingPointTime,

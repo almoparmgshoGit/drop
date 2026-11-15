@@ -28,8 +28,8 @@ import { normalizeSaudiPhone } from '../../common/utils/phone.util';
 import { signTicketToken } from '../../common/utils/ticket-token.util';
 import { AppSettingsService } from '../../common/services/app-settings.service';
 import { tripSeatLayout } from '../../common/utils/bus-layout.util';
-import { assertSoloTravelerAllowed, describeSinglesRange, isSinglesSeat } from '../../common/utils/singles-seats.util';
-import { holdLinkedSeats, lockTripsWithLinked, releaseLinkedHolds, returnRideOf, takeLinkedSeats } from '../../common/utils/linked-seats.util';
+import { assertCategoryMatchesGenders, categoryForGenders, describeSinglesRange, isSinglesSeat } from '../../common/utils/singles-seats.util';
+import { holdLinkedSeats, lockTripsWithLinked, releaseLinkedHolds, returnRideOf, takeLinkedSeats, takeTripCapacity } from '../../common/utils/linked-seats.util';
 import { boardingOfBookings } from '../../common/utils/ticket-boarding.util';
 import { tripDayWindow } from '../../common/utils/trip-day.util';
 import { PACKAGE_MAX_PERSONS, PACKAGE_PRICE_SELECT, packageGroupTotal, packagePriceTiers } from '../../common/utils/package-price.util';
@@ -205,16 +205,18 @@ export class BookingsService {
   }
 
   /**
-   * The same seat rules everywhere; the branch screen and the customer's app differ only in who may buy. Singles sit in the
-   * singles range and families everywhere else. With `solo`, the whole booking is being checked, so a booking of one traveller
-   * is kept out of the family section as the bus says; leaving it out checks the seats alone, as when one seat is changed.
+   * The same seat rules everywhere; the branch screen and the customer's app differ only in who may buy. Individuals sit in the
+   * singles range and families everywhere else. With `genders`, the whole booking is being checked, so a booking with a woman
+   * in it must be a family one and one of men only an individuals one; leaving it out checks the seats alone, as when one seat
+   * is changed or held before the passenger details.
    */
   async assertSeatRules(
     trip: { maxSeatsPerBooking: number; busId: string | null; packageId?: string | null; package?: unknown },
     seats: string[],
     category: BookingCategory = 'FAMILY',
-    solo?: { travellers: number; gender?: Gender | null },
+    genders?: (Gender | null)[],
   ) {
+    if (genders) assertCategoryMatchesGenders(category, genders);
     if (new Set(seats).size !== seats.length) throw new BadRequestException('يوجد مقعد مكرر في الطلب');
     if ((trip.packageId || trip.package) && seats.length > PACKAGE_MAX_PERSONS) {
       throw new BadRequestException(`الباقة تُحجز من شخص واحد إلى ${PACKAGE_MAX_PERSONS} أشخاص`);
@@ -222,18 +224,17 @@ export class BookingsService {
     if (seats.length > trip.maxSeatsPerBooking) {
       throw new BadRequestException(`الحد الأقصى ${trip.maxSeatsPerBooking} مقاعد في الحجز الواحد`);
     }
-    const { range, soloPolicy } = await this.appSettings.seatRules(trip.busId);
+    const range = await this.appSettings.singlesRange(trip.busId);
     if (category === 'SINGLES') {
       if (seats.some((seat) => !isSinglesSeat(seat, range))) {
-        throw new BadRequestException(`مقاعد العزّاب ${describeSinglesRange(range)}`);
+        throw new BadRequestException(`مقاعد الأفراد ${describeSinglesRange(range)}`);
       }
       return;
     }
     const inSingles = seats.filter((seat) => isSinglesSeat(seat, range));
     if (inSingles.length > 0) {
-      throw new BadRequestException(`المقعد ${inSingles.join('، ')} من مقاعد العزّاب (${describeSinglesRange(range)}) ولا يُحجز لعائلة`);
+      throw new BadRequestException(`المقعد ${inSingles.join('، ')} من مقاعد الأفراد (${describeSinglesRange(range)}) ولا يُحجز لعائلة`);
     }
-    if (solo) assertSoloTravelerAllowed(soloPolicy, solo.travellers, solo.gender);
   }
 
   async getSeatMap(userId: string, tripId: string) {
@@ -284,7 +285,7 @@ export class BookingsService {
       await lockTripsWithLinked(tx, [dto.tripId]);
       const trip = await tx.trip.findUnique({ where: { id: dto.tripId }, include: { package: { select: { status: true } } } });
       this.assertBookable(trip);
-      await this.assertSeatRules(trip, seats, dto.category, { travellers: seats.length });
+      await this.assertSeatRules(trip, seats, dto.category);
 
       const now = new Date();
       const usualHold = new Date(now.getTime() + holdMinutes * 60 * 1000);
@@ -659,11 +660,17 @@ export class BookingsService {
       fullName: p.fullName.trim(),
       phone: this.normalizePassengerPhone(p.phone),
       gender: p.gender ?? null,
+      nationality: p.nationality ?? null,
     }));
-    const category = dto.category ?? 'FAMILY';
-    // A traveller booking alone with no gender entered is taken to be the account holder.
-    const soloGender =
-      passengers.length === 1 ? passengers[0].gender ?? (await this.prisma.user.findUnique({ where: { id: userId }, select: { gender: true } }))?.gender ?? null : undefined;
+    // A traveller booking alone with no gender or nationality entered is taken to be the account holder.
+    if (passengers.length === 1 && (!passengers[0].gender || !passengers[0].nationality)) {
+      const account = await this.prisma.user.findUnique({ where: { id: userId }, select: { gender: true, nationality: true } });
+      passengers[0].gender ??= account?.gender ?? null;
+      passengers[0].nationality ??= account?.nationality ?? null;
+    }
+    const genders = passengers.map((passenger) => passenger.gender);
+    // A woman in the booking makes it a family one and men alone an individuals one; the section picked is checked against that.
+    const category = dto.category ?? categoryForGenders(genders) ?? 'FAMILY';
     const ticketSecret = this.config.getOrThrow<string>('TICKET_SIGNING_SECRET');
 
     try {
@@ -701,7 +708,7 @@ export class BookingsService {
           const created: { id: string; reference: string }[] = [];
 
           for (const [legIndex, leg] of quote.pricedLegs.entries()) {
-            await this.assertSeatRules(leg.trip, leg.seats, category, { travellers: passengers.length, gender: soloGender });
+            await this.assertSeatRules(leg.trip, leg.seats, category, genders);
 
             const claimed = await tx.seat.updateMany({
               where: { tripId: leg.trip.id, seatNumber: { in: leg.seats }, ...holdAvailableTo(userId, now) },
@@ -710,10 +717,8 @@ export class BookingsService {
             if (claimed.count !== leg.seats.length) {
               throw new ConflictException('بعض المقاعد المختارة لم تعد متاحة، يرجى اختيار مقاعد أخرى');
             }
-            await tx.trip.update({
-              where: { id: leg.trip.id },
-              data: { availableSeats: { decrement: leg.seats.length } },
-            });
+            // Passengers a counter booked without a seat hold places too, so the count is checked and not only the plan.
+            await takeTripCapacity(tx, leg.trip.id, leg.trip.tripCode, leg.seats.length);
             await takeLinkedSeats(tx, leg.trip.id, leg.seats, holdAvailableTo(userId, now), { returnsOnOtherLeg: quote.pricedLegs.length > 1 });
 
             const boardingPoint = await this.resolveBoardingPoint(tx, leg.leg, leg.trip.id);

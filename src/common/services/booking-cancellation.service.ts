@@ -89,7 +89,8 @@ export class BookingCancellationService {
     const split = toOriginal ? splitOriginalRefund(halalas(refund), received, booking.collections) : { wallet: halalas(refund), cash: 0, external: 0 };
     const walletRefund = split.wallet / 100;
 
-    const seatNumbers = booking.passengers.map((p) => p.seatNumber);
+    // A passenger saved without a seat holds a place on the trip but no seat on the plan.
+    const seatNumbers = booking.passengers.map((p) => p.seatNumber).filter((seat): seat is string => !!seat);
     await lockTripsWithLinked(tx, [booking.tripId]);
     await tx.seat.updateMany({
       where: { tripId: booking.tripId, seatNumber: { in: seatNumbers } },
@@ -97,7 +98,7 @@ export class BookingCancellationService {
     });
     await tx.trip.update({
       where: { id: booking.tripId },
-      data: { availableSeats: { increment: seatNumbers.length } },
+      data: { availableSeats: { increment: booking.passengers.length } },
     });
     await releaseLinkedSeats(tx, booking.tripId, seatNumbers);
     await this.returnHomeOnOwnTrip(tx, booking);
@@ -196,7 +197,7 @@ export class BookingCancellationService {
     const [outbound] = legs;
     if (outbound.trip.direction !== 'ROUND_TRIP' || outbound.trip.reverseOfTripId) return;
     await lockTripsWithLinked(tx, [outbound.tripId]);
-    await retakeReturnSeats(tx, outbound.tripId, outbound.passengers.map((passenger) => passenger.seatNumber));
+    await retakeReturnSeats(tx, outbound.tripId, outbound.passengers.map((passenger) => passenger.seatNumber).filter((seat): seat is string => !!seat));
   }
 
   private async releaseVoucher(tx: Prisma.TransactionClient, booking: { id: string; couponId: string | null; groupReference: string | null }) {

@@ -320,7 +320,7 @@ export class CreateJourneyDto extends JourneyQuoteDto {
    * same company rule the app keeps. Seats left for the server are chosen inside the right section.
    */
   @IsOptional()
-  @IsEnum(BookingCategory, { message: 'فئة الحجز عائلات أو عزّاب' })
+  @IsEnum(BookingCategory, { message: 'فئة الحجز عائلات أو أفراد' })
   category?: BookingCategory;
 
   @IsOptional()

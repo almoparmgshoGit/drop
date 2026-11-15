@@ -165,6 +165,26 @@ describe('Booking administration (e2e)', () => {
       expect(verify.body.result).toBe('INVALID');
     });
 
+    it('gives a seat to a passenger saved without one, without counting them twice', async () => {
+      const { trip, booking } = await bookOne();
+      const passenger = booking.passengers[0];
+      // As a counter booking saved without a seat leaves it: the place is taken on the trip, no seat on the plan.
+      await prisma.seat.updateMany({ where: { tripId: trip.id, seatNumber: passenger.seatNumber }, data: { isBooked: false } });
+      await prisma.bookingPassenger.update({ where: { id: passenger.id }, data: { seatNumber: null } });
+      const before = (await prisma.trip.findUniqueOrThrow({ where: { id: trip.id } })).availableSeats;
+      const fresh = await details(booking.id);
+      expect(fresh.passengers[0].seatNumber).toBeNull();
+
+      const res = await request(http())
+        .post(`${API}/bookings/admin/${booking.id}/passengers/${passenger.id}/seat`)
+        .set(staff.auth)
+        .send({ seatNumber: '33', reason: 'تخصيص مقعد', expectedUpdatedAt: fresh.updatedAt })
+        .expect(201);
+      expect(res.body.passengers[0].seatNumber).toBe('33');
+      expect(await seatFree(trip.id, '33')).toBe(false);
+      expect((await prisma.trip.findUniqueOrThrow({ where: { id: trip.id } })).availableSeats).toBe(before);
+    });
+
     it('refuses taken, missing, held and rule-breaking seats', async () => {
       const { trip, booking } = await bookOne({}, ['5', '6']);
       const url = `${API}/bookings/admin/${booking.id}/passengers/${booking.passengers[0].id}/seat`;

@@ -131,6 +131,16 @@ export async function lockTripsWithLinked(tx: Prisma.TransactionClient, tripIds:
 }
 
 /**
+ * Takes places on the trip, seated or not. A counter booking may leave passengers without a seat number, so the free seats on
+ * the plan are not the trip's whole story: the count is what stops a trip from being sold past its capacity.
+ */
+export async function takeTripCapacity(tx: Prisma.TransactionClient, tripId: string, tripCode: string, count: number) {
+  if (count <= 0) return;
+  const taken = await tx.trip.updateMany({ where: { id: tripId, availableSeats: { gte: count } }, data: { availableSeats: { decrement: count } } });
+  if (taken.count !== 1) throw new ConflictException(`لا توجد أماكن كافية في الرحلة ${tripCode}`);
+}
+
+/**
  * Takes the same seat numbers on the linked trip. A number it never had, because it was sold before the reverse opened, needs nothing.
  * A round-trip booking that comes back on another date (its group has a return leg elsewhere) leaves its seat on this trip's
  * reverse free to sell, which is how one DR trip can carry more passengers than the bus has seats.

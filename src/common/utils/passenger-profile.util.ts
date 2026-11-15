@@ -1,6 +1,7 @@
 import { Gender } from '@prisma/client';
+import { compareSeats } from './seat-label.util';
 
-type ProfileRow = { id: string; position: number; seatNumber: string; gender: Gender | null; nationality: string | null };
+type ProfileRow = { id: string; position: number; seatNumber: string | null; gender: Gender | null; nationality: string | null };
 type Account = { gender: Gender | null; nationality: string | null } | null | undefined;
 
 export type PassengerProfile = { gender: Gender | null; nationality: string | null; fromAccount: boolean };
@@ -11,7 +12,7 @@ export type PassengerProfile = { gender: Gender | null; nationality: string | nu
  * the companions are left blank rather than guessed.
  */
 export function passengerProfiles(passengers: ProfileRow[], account: Account) {
-  const ownerId = [...passengers].sort((a, b) => a.position - b.position || Number(a.seatNumber) - Number(b.seatNumber))[0]?.id;
+  const ownerId = [...passengers].sort((a, b) => a.position - b.position || compareSeats(a.seatNumber, b.seatNumber))[0]?.id;
   return new Map<string, PassengerProfile>(
     passengers.map((p) => {
       const isOwner = p.id === ownerId;

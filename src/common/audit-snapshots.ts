@@ -536,7 +536,7 @@ const TYPE_LABELS: Partial<Record<AuditRecordType, Record<string, string>>> = {
   loyaltyRule: { weekdays: 'أيام الأسبوع', minDaysBefore: 'قبل الرحلة بأيام على الأقل', minSeats: 'أقل عدد مقاعد' },
   loyaltyVoucher: { pointsCost: 'تكلفتها بالنقاط', validDays: 'صلاحيتها بالأيام' },
   package: { price2: 'سعر الثنائي', price3: 'سعر الثلاثي', price4: 'سعر الرباعي', nights: 'الليالي', terms: 'الشروط', kind: 'نوع الباقة', origin: 'من', destination: 'إلى', nightlyBedPrice: 'سعر السرير لليلة', nightlyRoomPrice: 'سعر الغرفة لليلة', minDepartureHour: 'أبكر ساعة انطلاق' },
-  bus: { plateNumber: 'رقم اللوحة', model: 'الطراز', color: 'اللون', company: 'الشركة', kind: 'نوع المركبة', seatCount: 'عدد المقاعد', singlesFromSeat: 'بداية مقاعد العزاب', singlesToSeat: 'نهاية مقاعد العزاب' },
+  bus: { plateNumber: 'رقم اللوحة', model: 'الطراز', color: 'اللون', company: 'الشركة', kind: 'نوع المركبة', seatCount: 'عدد المقاعد', singlesFromSeat: 'بداية مقاعد الأفراد', singlesToSeat: 'نهاية مقاعد الأفراد' },
   hotel: { nightlyRate: 'سعر الليلة', offersSharedRoom: 'غرف مشتركة', offersPrivateRoom: 'غرف خاصة', rateUnit: 'وحدة السعر', bedPrice: 'سعر السرير', privateRoomPrice: 'سعر الغرفة الخاصة', privateRoomCapacity: 'سعة الغرفة الخاصة' },
   busOffice: { contractNumber: 'رقم العقد' },
 };
@@ -567,7 +567,7 @@ const VALUE_LABELS: Record<string, Record<string, string>> = {
   gender: { MALE: 'ذكر', FEMALE: 'أنثى' },
   serviceType: BOOKING_TYPE_LABELS,
   type: { PERCENT: 'نسبة مئوية', FIXED_PER_SEAT: 'مبلغ لكل مقعد', FIXED_TOTAL: 'مبلغ ثابت للحجز' },
-  category: { FAMILY: 'عائلي', SINGLES: 'عزاب' },
+  category: { FAMILY: 'عائلي', SINGLES: 'أفراد' },
   source: { APP: 'التطبيق', BRANCH: 'الفرع' },
   direction: { ONE_WAY: 'ذهاب فقط', ROUND_TRIP: 'ذهاب وعودة' },
   idType: { NATIONAL_ID: 'هوية وطنية', IQAMA: 'إقامة', PASSPORT: 'جواز سفر' },

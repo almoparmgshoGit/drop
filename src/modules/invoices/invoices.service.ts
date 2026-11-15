@@ -12,6 +12,7 @@ import { CashActor } from '../cash/cash.service';
 import { CollectionsService } from '../cash/collections.service';
 import { ZatcaService } from '../zatca/zatca.service';
 import { InvoicesQuery, TaxReportQuery } from './invoices.dto';
+import { compareSeats, seatLabel } from '../../common/utils/seat-label.util';
 
 const PAGE_SIZE = 50;
 const sar = (value: number) => Math.round(value) / 100;
@@ -205,7 +206,7 @@ export class InvoicesService {
       crNumber: frozen.crNumber || settings.crNumber,
       city: frozen.city || settings.sellerCity,
     };
-    const passengers = [...booking.passengers].sort((a, b) => Number(a.seatNumber) - Number(b.seatNumber));
+    const passengers = [...booking.passengers].sort((a, b) => compareSeats(a.seatNumber, b.seatNumber));
     const { held, remaining } = netBookingFigures(booking);
     const total = Number(invoice.total);
     const vat = Number(invoice.vat);
@@ -217,7 +218,7 @@ export class InvoicesService {
       issuedAt: invoice.issuedAt,
       passengerName: invoice.passengerName,
       passengerCount: passengers.length,
-      seats: passengers.map((p) => p.seatNumber),
+      seats: passengers.map((p) => seatLabel(p.seatNumber)),
       tripCode: invoice.tripCode,
       destination: invoice.destination,
       tripDate: invoice.tripDate,

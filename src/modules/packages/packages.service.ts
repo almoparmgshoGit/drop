@@ -1,12 +1,66 @@
 import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../common/services/prisma.service';
-import { riyadhDayRange } from '../../common/utils/time.util';
+import { formatRiyadhTime, riyadhDate, riyadhDayRange } from '../../common/utils/time.util';
+import { seatPricing } from '../../common/utils/dynamic-pricing.util';
 import { packageWindowProblem } from '../../common/utils/package-window.util';
 import { PACKAGE_MAX_PERSONS, PackagePrices, packagePriceTiers } from '../../common/utils/package-price.util';
-import { appTripWhere, PUBLIC_TRIP_INCLUDE, toPublicTrip } from '../trips/trips.service';
-import { CreatePackageDto, PackageSearchQuery, UpdatePackageDto } from './packages.controller';
-import { CUSTOM_PACKAGE_SELECT, toPublicCustomPackage } from '../../common/utils/custom-package.util';
+import { appTripWhere, bookingTypeWhere, PUBLIC_TRIP_INCLUDE, toPublicTrip } from '../trips/trips.service';
+import { CreatePackageDto, CustomJourneyQuery, CustomPreviewDto, PackageSearchQuery, UpdatePackageDto } from './packages.controller';
+import {
+  CUSTOM_PACKAGE_MAX_NIGHTS,
+  CUSTOM_PACKAGE_SELECT,
+  customPackageStay,
+  loadCustomPackage,
+  riyadhHour,
+  toPublicCustomPackage,
+} from '../../common/utils/custom-package.util';
+
+/** How far ahead the package builder lists days to travel on. */
+const JOURNEY_DAYS_AHEAD = 120;
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/** What the package builder reads of a trip: enough to list it under its day and price its seats. */
+const JOURNEY_TRIP_SELECT = {
+  id: true,
+  tripCode: true,
+  origin: true,
+  destination: true,
+  departureTime: true,
+  departureStation: true,
+  busType: true,
+  price: true,
+  pricingRules: true,
+  totalSeats: true,
+  availableSeats: true,
+  maxSeatsPerBooking: true,
+  packageId: true,
+  package: { select: { id: true } },
+} satisfies Prisma.TripSelect;
+
+type JourneyTrip = Prisma.TripGetPayload<{ select: typeof JOURNEY_TRIP_SELECT }>;
+
+/** Trips grouped by their day in Riyadh, each with its time and the seat price the booking will charge. */
+const journeyDays = (trips: JourneyTrip[]) => {
+  const days = new Map<string, object[]>();
+  for (const trip of trips) {
+    const date = riyadhDate(trip.departureTime);
+    const list = days.get(date) ?? [];
+    list.push({
+      id: trip.id,
+      tripCode: trip.tripCode,
+      departureTime: trip.departureTime,
+      time: formatRiyadhTime(trip.departureTime),
+      hour: riyadhHour(trip.departureTime),
+      departureStation: trip.departureStation,
+      busType: trip.busType,
+      availableSeats: trip.availableSeats,
+      pricePerSeat: seatPricing(trip).price / 100,
+    });
+    days.set(date, list);
+  }
+  return [...days.entries()].map(([date, dayTrips]) => ({ date, trips: dayTrips }));
+};
 
 type CustomFields = Pick<CreatePackageDto, 'origin' | 'destination' | 'hotelId' | 'nightlyBedPrice' | 'nightlyRoomPrice' | 'minDepartureHour'>;
 
@@ -79,6 +133,93 @@ export class PackagesService {
       orderBy: { createdAt: 'desc' },
     });
     return packages.map(toPublicCustomPackage);
+  }
+
+  /**
+   * Everything the package builder needs for a route at once: its hotels (one per custom package), and the days that have an
+   * outbound or a return with seats for the whole group. The app offers only these days, so the customer never picks an empty one.
+   */
+  async getCustomJourney(query: CustomJourneyQuery) {
+    const persons = query.persons ?? 1;
+    const found = await this.getCustomPackages({ origin: query.origin, destination: query.destination });
+    if (found.length === 0) {
+      return { origin: query.origin ?? null, destination: query.destination ?? null, maxNights: CUSTOM_PACKAGE_MAX_NIGHTS, packages: [], outbound: [], inbound: [] };
+    }
+    // The search matches loosely; the trips must run exactly on the package's route, as the booking checks.
+    const origin = found[0].origin!;
+    const destination = found[0].destination!;
+    const packages = found.filter((pkg) => pkg.origin === origin && pkg.destination === destination);
+    const now = new Date();
+    const until = new Date(now.getTime() + JOURNEY_DAYS_AHEAD * DAY_MS);
+    const legWhere = (from: string, to: string): Prisma.TripWhereInput => {
+      const base = appTripWhere({});
+      return {
+        ...base,
+        origin: { equals: from, mode: 'insensitive' },
+        destination: { equals: to, mode: 'insensitive' },
+        // A package's own trips are sold with it; the builder runs on transport trips only.
+        packageId: null,
+        availableSeats: { gte: persons },
+        maxSeatsPerBooking: { gte: persons },
+        departureTime: { gt: now, lt: until },
+        AND: [...(base.AND as Prisma.TripWhereInput[]), bookingTypeWhere('TRANSPORT_ONLY')],
+      };
+    };
+    const [outbound, inbound] = await Promise.all([
+      this.prisma.trip.findMany({ where: legWhere(origin, destination), select: JOURNEY_TRIP_SELECT, orderBy: { departureTime: 'asc' }, take: 600 }),
+      this.prisma.trip.findMany({ where: legWhere(destination, origin), select: JOURNEY_TRIP_SELECT, orderBy: { departureTime: 'asc' }, take: 600 }),
+    ]);
+    // Each hotel has its own earliest outbound hour; a day shows when at least one hotel takes one of its trips.
+    const earliestHour = Math.min(...packages.map((pkg) => pkg.minDepartureHour));
+    return {
+      origin,
+      destination,
+      maxNights: CUSTOM_PACKAGE_MAX_NIGHTS,
+      packages,
+      outbound: journeyDays(outbound.filter((trip) => riyadhHour(trip.departureTime) >= earliestHour)),
+      inbound: journeyDays(inbound),
+    };
+  }
+
+  /**
+   * The price of a package the customer is building, before any seat is picked: both trips for the group and the stay
+   * by the night, with the same rules the booking charges. Coupons, points and the wallet come off later, at review.
+   */
+  async previewCustomPackage(dto: CustomPreviewDto) {
+    const pkg = await loadCustomPackage(this.prisma, dto.packageId);
+    if (dto.withoutHousing && dto.roomChoice) throw new BadRequestException('اختر نوع الغرفة أو بدون سكن، لا الاثنين');
+    const trips = await this.prisma.trip.findMany({
+      where: { ...appTripWhere({}), id: { in: [dto.outboundTripId, dto.returnTripId] } },
+      select: JOURNEY_TRIP_SELECT,
+    });
+    const outbound = trips.find((trip) => trip.id === dto.outboundTripId);
+    const inbound = trips.find((trip) => trip.id === dto.returnTripId);
+    if (!outbound || !inbound) throw new NotFoundException('الرحلة المختارة لم تعد متاحة للحجز');
+    for (const trip of [outbound, inbound]) {
+      if (trip.availableSeats < dto.persons) throw new BadRequestException(`لا توجد مقاعد كافية في الرحلة ${trip.tripCode}`);
+      if (trip.maxSeatsPerBooking < dto.persons) throw new BadRequestException(`الحد الأقصى في الرحلة ${trip.tripCode} هو ${trip.maxSeatsPerBooking} مقاعد للحجز`);
+    }
+    const stay = customPackageStay(pkg, { trip: outbound, seats: dto.persons }, { trip: inbound, seats: dto.persons }, dto.withoutHousing ? undefined : dto.roomChoice);
+    if (!dto.withoutHousing && !stay.details.choice) throw new BadRequestException('اختر نوع الغرفة');
+    const leg = (trip: JourneyTrip) => {
+      const price = seatPricing(trip).price;
+      return { tripId: trip.id, tripCode: trip.tripCode, departureTime: trip.departureTime, pricePerSeat: price / 100, subtotal: (price * dto.persons) / 100 };
+    };
+    const out = leg(outbound);
+    const back = leg(inbound);
+    const stayAmount = dto.withoutHousing ? 0 : stay.amount / 100;
+    return {
+      persons: dto.persons,
+      outbound: out,
+      inbound: back,
+      nights: stay.nights,
+      checkIn: stay.details.checkIn,
+      checkOut: stay.details.checkOut,
+      stay: dto.withoutHousing ? null : { room: stay.details.choice, amount: stayAmount, hotel: stay.details.name },
+      optionAmounts: stay.details.optionAmounts,
+      // Prices include VAT, as everywhere in the app.
+      total: Math.round((out.subtotal + back.subtotal + stayAmount) * 100) / 100,
+    };
   }
 
   async getPublishedPackages(search: PackageSearchQuery = {}) {

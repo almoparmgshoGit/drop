@@ -1,5 +1,5 @@
 import { BadRequestException, ConflictException } from '@nestjs/common';
-import { Gender, Prisma, SoloTravelerPolicy } from '@prisma/client';
+import { BookingCategory, Gender, Prisma } from '@prisma/client';
 import { BUS_SEAT_COUNT } from './bus-layout.util';
 
 export interface SinglesRange {
@@ -12,22 +12,30 @@ export const isSinglesSeat = (seat: string | number, range: SinglesRange) => Num
 export const describeSinglesRange = (range: SinglesRange) => `من ${range.from} إلى ${range.to}`;
 
 /**
- * The family section is every seat outside the singles range. A booking of one traveller sits with the singles, unless the
- * bus lets a woman travelling alone sit with the families. Without the traveller's gender yet (a seat hold before the
- * passenger details), a woman-allowed bus lets the hold through and the booking itself is checked.
+ * Who the booking is decides its section: a booking with a woman in it is a family booking, wherever she sits and however
+ * few travel, and one of men only sits with the individuals. Null while a traveller's gender is still unknown, as on a seat
+ * hold before the passenger details, so the section picked stands until the booking itself is checked.
  */
-export function assertSoloTravelerAllowed(policy: SoloTravelerPolicy, travellers: number, gender?: Gender | null) {
-  if (travellers !== 1) return;
-  if (policy === 'SINGLES_ONLY') throw new BadRequestException('المسافر الواحد يحجز في مقاعد العزّاب فقط، ومقاعد العائلات لحجوزات العائلات');
-  if (gender !== undefined && gender !== 'FEMALE') {
-    throw new BadRequestException(gender ? 'الرجل المسافر وحده يحجز في مقاعد العزّاب فقط' : 'حدد جنس المسافر: المسافرة وحدها فقط تُحجز في مقاعد العائلات');
-  }
+export function categoryForGenders(genders: (Gender | null | undefined)[]): BookingCategory | null {
+  if (genders.some((gender) => gender === 'FEMALE')) return 'FAMILY';
+  if (genders.length > 0 && genders.every((gender) => gender === 'MALE')) return 'SINGLES';
+  return null;
+}
+
+export function assertCategoryMatchesGenders(category: BookingCategory, genders: (Gender | null | undefined)[]) {
+  const expected = categoryForGenders(genders);
+  if (!expected || expected === category) return;
+  throw new BadRequestException(
+    expected === 'FAMILY'
+      ? 'الحجز الذي فيه أنثى حجز عائلات: اختر المقاعد من مقاعد العائلات'
+      : 'المسافرون كلهم ذكور فالحجز حجز أفراد: اختر المقاعد من مقاعد الأفراد',
+  );
 }
 
 /** Checked against the vehicle's seats wherever a range is saved, on a bus or in the settings (which follow the standard bus). */
 export function assertValidSinglesRange(range: SinglesRange, capacity = BUS_SEAT_COUNT) {
   if (!Number.isInteger(range.from) || !Number.isInteger(range.to) || range.from < 1 || range.to > capacity || range.from > range.to) {
-    throw new BadRequestException(`نطاق مقاعد العزّاب يجب أن يكون بين 1 و${capacity}، وبدايته لا تتجاوز نهايته`);
+    throw new BadRequestException(`نطاق مقاعد الأفراد يجب أن يكون بين 1 و${capacity}، وبدايته لا تتجاوز نهايته`);
   }
 }
 
@@ -51,24 +59,24 @@ export function singlesRangeFor(settings: SinglesRange, seatCount: number): Sing
  */
 export async function assertSinglesFitRange(db: Pick<Prisma.TransactionClient, 'bookingPassenger'>, trips: Prisma.TripWhereInput, range: SinglesRange) {
   const passengers = await db.bookingPassenger.findMany({
-    where: { booking: { category: 'SINGLES', status: { not: 'CANCELLED' }, trip: trips } },
+    where: { seatNumber: { not: null }, booking: { category: 'SINGLES', status: { not: 'CANCELLED' }, trip: trips } },
     select: { seatNumber: true, booking: { select: { trip: { select: { tripCode: true } } } } },
   });
-  const outside = passengers.find((passenger) => !isSinglesSeat(passenger.seatNumber, range));
+  const outside = passengers.find((passenger) => !isSinglesSeat(passenger.seatNumber!, range));
   // A family already seated where the new singles section would start is refused the same way.
   const families = await db.bookingPassenger.findMany({
-    where: { booking: { category: 'FAMILY', status: { not: 'CANCELLED' }, trip: trips } },
+    where: { seatNumber: { not: null }, booking: { category: 'FAMILY', status: { not: 'CANCELLED' }, trip: trips } },
     select: { seatNumber: true, booking: { select: { trip: { select: { tripCode: true } } } } },
   });
-  const inside = families.find((passenger) => isSinglesSeat(passenger.seatNumber, range));
+  const inside = families.find((passenger) => isSinglesSeat(passenger.seatNumber!, range));
   if (inside) {
     throw new ConflictException(
-      `المقعد ${inside.seatNumber} في الرحلة ${inside.booking.trip.tripCode} محجوز لعائلة وسيصبح من مقاعد العزّاب (${describeSinglesRange(range)}). انقل الراكب أولًا`,
+      `المقعد ${inside.seatNumber} في الرحلة ${inside.booking.trip.tripCode} محجوز لعائلة وسيصبح من مقاعد الأفراد (${describeSinglesRange(range)}). انقل الراكب أولًا`,
     );
   }
   if (outside) {
     throw new ConflictException(
-      `المقعد ${outside.seatNumber} في الرحلة ${outside.booking.trip.tripCode} محجوز لعزّاب وهو خارج النطاق ${describeSinglesRange(range)}. انقل الراكب أولًا`,
+      `المقعد ${outside.seatNumber} في الرحلة ${outside.booking.trip.tripCode} محجوز للأفراد وهو خارج النطاق ${describeSinglesRange(range)}. انقل الراكب أولًا`,
     );
   }
 }

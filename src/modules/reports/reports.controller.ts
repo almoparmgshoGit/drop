@@ -45,6 +45,13 @@ export class ReportsController {
     return this.reports.withComparison(query, (q) => this.reports.trips(q));
   }
 
+  @Get('ended-trips')
+  @RequirePermission('analytics.view')
+  @ApiOperation({ summary: 'Trips that are over (arrival passed), departing in a period, latest first' })
+  endedTrips(@Query() query: ReportRangeQuery) {
+    return this.reports.endedTrips(query);
+  }
+
   @Get('occupancy')
   @RequirePermission('analytics.view')
   @ApiOperation({ summary: 'Seats sold against seats offered by Riyadh weekday, by departure hour, and weekday by two-hour band' })

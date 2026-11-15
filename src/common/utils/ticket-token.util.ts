@@ -5,7 +5,8 @@ const PREFIX = 'DRB1';
 export interface TicketTokenPayload {
   ticketNumber: string;
   tripId: string;
-  seat: string;
+  /** Empty while the passenger has no seat yet. */
+  seat: string | null;
 }
 
 const hmac = (body: string, secret: string) => crypto.createHmac('sha256', secret).update(body).digest();

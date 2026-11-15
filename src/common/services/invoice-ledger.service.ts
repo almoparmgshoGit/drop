@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { halalas } from '../utils/payment.util';
 import { INVOICE_SETTING_DEFAULTS, InvoiceSettings, vatInside } from '../utils/invoice.util';
+import { compareSeats } from '../utils/seat-label.util';
 
 const DEFAULT_VAT_RATE = 15;
 
@@ -29,7 +30,7 @@ export class InvoiceLedgerService {
       },
     });
     const [settings, vatRate] = await Promise.all([this.invoiceSettings(tx), this.vatRate(tx)]);
-    const first = [...booking.passengers].sort((a, b) => Number(a.seatNumber) - Number(b.seatNumber))[0];
+    const first = [...booking.passengers].sort((a, b) => compareSeats(a.seatNumber, b.seatNumber))[0];
     const total = halalas(booking.totalPrice);
     // The rate is whatever was in force when the booking was priced, so a saved figure wins over today's setting.
     const vat = halalas(booking.vatAmount) > 0 ? halalas(booking.vatAmount) : vatInside(total, vatRate);

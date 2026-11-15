@@ -154,35 +154,27 @@ describe('Singles seats set on the bus (e2e)', () => {
     await bookReq(user, trip.id, ['3', '4'], 'FAMILY').expect(201);
   });
 
-  it('seats a traveller alone with the singles on a singles-only bus, and on a trip with no bus', async () => {
+  it('seats a booking with a woman with the families and men alone with the individuals, on a bus and on a trip with no bus', async () => {
     const bus = await createBus(26, 49);
-    expect(bus.soloTravelerPolicy).toBe('SINGLES_ONLY');
     const user = await loginPassenger(app);
     for (const trip of [await createTrip({ busId: bus.id }), await createTrip()]) {
-      expect((await seatMap(user, trip.id)).soloTravelerPolicy).toBe('SINGLES_ONLY');
-      await hold(user, trip.id, ['5'], 'FAMILY').expect(400);
-      await bookReq(user, trip.id, '5', 'FAMILY', 'FEMALE').expect(400);
-      await bookReq(user, trip.id, '35').expect(201);
+      // A hold does not know the travellers yet; the booking checks them.
+      await hold(user, trip.id, ['5'], 'FAMILY').expect(201);
+      await bookReq(user, trip.id, '5', 'FAMILY', 'FEMALE').expect(201);
+      expect((await bookReq(user, trip.id, '7', 'FAMILY', 'MALE').expect(400)).body.message).toContain('حجز أفراد');
+      expect((await bookReq(user, trip.id, ['30', '31'], 'SINGLES', 'FEMALE').expect(400)).body.message).toContain('حجز عائلات');
+      // Never a family seat inside the singles range, even for her.
+      await bookReq(user, trip.id, '32', 'FAMILY', 'FEMALE').expect(400);
+      await bookReq(user, trip.id, '35', 'SINGLES', 'MALE').expect(201);
     }
   });
 
-  it('lets a woman travelling alone sit with the families when the bus allows it', async () => {
-    const bus = await createBus(26, 49, { soloTravelerPolicy: 'WOMEN_ALLOWED' });
-    expect(bus.soloTravelerPolicy).toBe('WOMEN_ALLOWED');
+  it('keeps a woman travelling alone with the families even on a bus set to singles only', async () => {
+    const bus = await createBus(26, 49, { soloTravelerPolicy: 'SINGLES_ONLY' });
     const trip = await createTrip({ busId: bus.id });
     const user = await loginPassenger(app);
-    expect(await seatMap(user, trip.id)).toMatchObject({ singlesFromSeat: 26, singlesToSeat: 49, soloTravelerPolicy: 'WOMEN_ALLOWED' });
-
-    // A hold does not know the traveller yet; the booking checks her.
-    await hold(user, trip.id, ['6'], 'FAMILY').expect(201);
     await bookReq(user, trip.id, '6', 'FAMILY', 'FEMALE').expect(201);
-    await bookReq(user, trip.id, '7', 'FAMILY', 'MALE').expect(400);
-    // Never a family seat inside the singles range, even for her.
-    await bookReq(user, trip.id, '30', 'FAMILY', 'FEMALE').expect(400);
-
-    const updated = (await request(http()).put(`${API}/buses/${bus.id}`).set(admin.auth).send({ soloTravelerPolicy: 'SINGLES_ONLY' }).expect(200)).body;
-    expect(updated.soloTravelerPolicy).toBe('SINGLES_ONLY');
-    await bookReq(user, trip.id, '8', 'FAMILY', 'FEMALE').expect(400);
+    await bookReq(user, trip.id, '27', 'SINGLES', 'FEMALE').expect(400);
   });
 
   it('books two travellers as a family in the family section', async () => {

@@ -1,7 +1,8 @@
 import { Controller, Get, Post, Put, Delete, Param, Query, Body } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiBearerAuth, PartialType } from '@nestjs/swagger';
-import { IsArray, IsDateString, IsEnum, IsInt, IsNumber, IsOptional, IsString, Length, Max, MaxLength, Min, ValidateIf } from 'class-validator';
-import { PackageKind, PackageStatus } from '@prisma/client';
+import { IsArray, IsBoolean, IsDateString, IsEnum, IsInt, IsNumber, IsOptional, IsString, Length, Max, MaxLength, Min, ValidateIf } from 'class-validator';
+import { Type } from 'class-transformer';
+import { PackageKind, PackageStatus, RoomType } from '@prisma/client';
 import { PackagesService } from './packages.service';
 import { Public, RequirePermission } from '../../common/decorators/auth.decorators';
 
@@ -131,6 +132,22 @@ export class PackageSearchQuery {
   @IsOptional() @IsString() @MaxLength(20) date?: string;
 }
 
+export class CustomJourneyQuery {
+  @IsOptional() @IsString() @MaxLength(100) origin?: string;
+  @IsOptional() @IsString() @MaxLength(100) destination?: string;
+  /** How many travel: only trips with seats for all of them are listed. */
+  @IsOptional() @Type(() => Number) @IsInt() @Min(1) @Max(20) persons?: number;
+}
+
+export class CustomPreviewDto {
+  @IsString() @Length(1, 60) packageId: string;
+  @IsString() @Length(1, 60) outboundTripId: string;
+  @IsString() @Length(1, 60) returnTripId: string;
+  @IsInt() @Min(1) @Max(20) persons: number;
+  @IsOptional() @IsEnum(RoomType) roomChoice?: RoomType;
+  @IsOptional() @IsBoolean() withoutHousing?: boolean;
+}
+
 class NextPackageQuery {
   @IsOptional() @IsString() @MaxLength(100) origin?: string;
   @IsOptional() @IsString() @MaxLength(100) destination?: string;
@@ -154,6 +171,20 @@ export class PackagesController {
   @ApiOperation({ summary: 'Published packages the customer builds, on the searched route' })
   async getCustomPackages(@Query() query: PackageSearchQuery) {
     return this.packagesService.getCustomPackages(query);
+  }
+
+  @Public()
+  @Get('custom/journey')
+  @ApiOperation({ summary: 'Hotels and the outbound and return days with seats, for building a package on a route' })
+  async getCustomJourney(@Query() query: CustomJourneyQuery) {
+    return this.packagesService.getCustomJourney(query);
+  }
+
+  @Public()
+  @Post('custom/preview')
+  @ApiOperation({ summary: 'Price a package the customer is building, before seats are picked' })
+  async previewCustomPackage(@Body() dto: CustomPreviewDto) {
+    return this.packagesService.previewCustomPackage(dto);
   }
 
   @Public()

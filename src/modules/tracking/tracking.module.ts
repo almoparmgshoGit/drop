@@ -543,7 +543,7 @@ class TrackingService {
 
     return {
       tripDay,
-      seats: booking.passengers.map((passenger) => passenger.seatNumber).sort((a, b) => Number(a) - Number(b)),
+      seats: booking.passengers.map((passenger) => passenger.seatNumber).filter(Boolean).sort((a, b) => Number(a) - Number(b)),
       isAllBoarded,
       boarding,
       etaToMyPoint,

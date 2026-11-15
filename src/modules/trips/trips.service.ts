@@ -1003,18 +1003,23 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
    * and currentMonth at the 1st of this month. Without either, every trip, newest first, as reports and pickers need.
    * Each row carries its expected revenue from the shared metrics, so the table and the cards above it read one figure.
    */
-  async getAllAdminTrips(actor: RentActor, query: { from?: string; to?: string } = {}) {
+  async getAllAdminTrips(actor: RentActor, query: { from?: string; to?: string; scope?: 'active' | 'ended' } = {}) {
     // An employee of a city's branch works with that city's trips.
     const city = actor.userId ? await servedCity(this.prisma, { userId: actor.userId, permissions: actor.permissions }) : null;
     const departureTime = this.listWindow(query);
+    // A trip is over once its arrival has passed: it leaves the pickers and is found in the reports instead.
+    const now = new Date();
     const where: Prisma.TripWhereInput = {
       ...(city && cityTripWhere(city)),
       ...(departureTime && { departureTime }),
+      ...(query.scope === 'active' && { arrivalTime: { gt: now } }),
+      ...(query.scope === 'ended' && { arrivalTime: { lte: now } }),
     };
+    const ascending = query.scope ? query.scope === 'active' : !!departureTime;
     const [trips, revenue] = await Promise.all([
       this.prisma.trip.findMany({
         where,
-        orderBy: { departureTime: departureTime ? 'asc' : 'desc' },
+        orderBy: { departureTime: ascending ? 'asc' : 'desc' },
         include: ADMIN_TRIP_INCLUDE,
       }),
       this.metrics.revenueByTrip(where),

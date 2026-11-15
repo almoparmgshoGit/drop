@@ -1162,7 +1162,8 @@ model BookingPassenger {
   phone           String?
   nationalId      String?
   notes           String?
-  seatNumber      String
+  /// Empty until the office gives the passenger a seat: a counter booking may be saved without one.
+  seatNumber      String?
   /// The order the passengers were entered in; the first is the booking's owner, who carries the private room's price.
   position        Int              @default(0)
   gender          Gender?

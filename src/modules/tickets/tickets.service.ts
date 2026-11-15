@@ -1,6 +1,7 @@
 import { BadRequestException, ConflictException, ForbiddenException, HttpException, HttpStatus, Injectable, NotFoundException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as crypto from 'crypto';
+import { compareSeats, seatLabel } from '../../common/utils/seat-label.util';
 
 import { Prisma, TripLiveStatus } from '@prisma/client';
 import { PrismaService } from '../../common/services/prisma.service';
@@ -591,7 +592,7 @@ export class TicketsService {
           ...rideHold(ticket.booking),
         })),
       )
-      .sort((a, b) => Number(a.seatNumber) - Number(b.seatNumber));
+      .sort((a, b) => compareSeats(a.seatNumber, b.seatNumber));
 
     // The office keeps its own manifests; for the crew only the totals outlive the trip.
     const passengersHidden = actor.role !== 'ADMIN' && Date.now() > trip.arrivalTime.getTime() + MANIFEST_CLOSES_AFTER_MS;
@@ -709,7 +710,7 @@ export class TicketsService {
     };
 
     const passengersHidden = actor.role !== 'ADMIN' && Date.now() > trip.arrivalTime.getTime() + MANIFEST_CLOSES_AFTER_MS;
-    const passengers = [...own.map((ticket) => toEntry(ticket, false)), ...returning.map((ticket) => toEntry(ticket, true))].sort((a, b) => Number(a.seatNumber) - Number(b.seatNumber));
+    const passengers = [...own.map((ticket) => toEntry(ticket, false)), ...returning.map((ticket) => toEntry(ticket, true))].sort((a, b) => compareSeats(a.seatNumber, b.seatNumber));
     const { manifestSentAt: _sent, ...tripFacts } = trip;
     return {
       version: 1,
@@ -888,7 +889,7 @@ export class TicketsService {
         where: { id: ticket.bookingId },
         data: remaining === 0 ? { status: 'BOARDED' } : { updatedAt: boardedAt },
       });
-      await this.notifications.toBookingOwners(tx, 'PASSENGER_BOARDED', [ticket.bookingId], { passengerName: ticket.passenger.fullName, seatNumber: ticket.passenger.seatNumber });
+      await this.notifications.toBookingOwners(tx, 'PASSENGER_BOARDED', [ticket.bookingId], { passengerName: ticket.passenger.fullName, seatNumber: seatLabel(ticket.passenger.seatNumber) });
       return { result: 'BOARDED' as const, ticket: { ...details, boardedAt } };
     }, { maxWait: 10_000, timeout: 30_000 });
   }

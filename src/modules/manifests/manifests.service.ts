@@ -10,6 +10,8 @@ import { hotelBookingCost, paymentFigures } from '../../common/utils/payment.uti
 import { passengerWeights } from '../../common/utils/housing-price.util';
 import { tripInCity } from '../../common/utils/branch-city.util';
 import { allocate, toHalalas, toSar } from '../bookings/bookings.service';
+import { compareSeats } from '../../common/utils/seat-label.util';
+import { PROFILE_ACCOUNT_SELECT, PROFILE_PASSENGER_SELECT, passengerProfiles } from '../../common/utils/passenger-profile.util';
 
 export type ManifestActor = { userId: string; permissions: string[] };
 
@@ -22,9 +24,9 @@ const CHANNEL_BY_COLLECTION: Record<string, PaymentChannel> = { CASH: 'cash', NE
 const SOURCE_LABELS: Record<string, string> = { APP: 'التطبيق', BRANCH: 'الفرع' };
 
 /** The passenger's name and room type are always printed; these are what staff may add or leave out for the hotel. */
-export const HOUSING_SHEET_COLUMNS = ['booking', 'seat', 'nationalId', 'phone', 'hotel', 'nights', 'room', 'hotelNote', 'staffNotes'];
+export const HOUSING_SHEET_COLUMNS = ['booking', 'seat', 'gender', 'nationality', 'nationalId', 'phone', 'hotel', 'nights', 'room', 'hotelNote', 'staffNotes'];
 // Staff notes are internal, so they reach a hotel only if someone chooses to send them.
-const DEFAULT_SHEET_COLUMNS = ['booking', 'nationalId', 'phone', 'room', 'hotelNote'];
+const DEFAULT_SHEET_COLUMNS = ['booking', 'gender', 'nationality', 'nationalId', 'phone', 'room', 'hotelNote'];
 const MAX_PASSENGER_NOTE = 300;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -43,13 +45,13 @@ const MANIFEST_BOOKING_SELECT = {
   stayHotel: { select: { name: true } },
   branchId: true,
   branch: { select: { name: true } },
-  user: { select: { phone: true } },
+  user: { select: { phone: true, ...PROFILE_ACCOUNT_SELECT } },
   passengers: {
     // The booking's owner first, so the account phone below lands on them.
     orderBy: { position: 'asc' },
     // Signed ticket tokens stay out on purpose: a manifest is printed and passed around.
     select: {
-      id: true,
+      ...PROFILE_PASSENGER_SELECT,
       fullName: true,
       phone: true,
       nationalId: true,
@@ -60,6 +62,28 @@ const MANIFEST_BOOKING_SELECT = {
     },
   },
 } satisfies Prisma.BookingSelect;
+
+type SharedRoomCount = { number: string; capacity: number; _count: { occupants: number } };
+
+/**
+ * The beds paid for but left empty (الهادر): every shared room's capacity less the people placed in it, room by room.
+ * Private rooms are left out, since a family pays for the whole room whatever its size.
+ */
+export function wastedBeds(stays: { hotelName: string; rooms: SharedRoomCount[] }[]) {
+  const rooms = stays
+    .flatMap((stay) =>
+      stay.rooms.map((room) => ({
+        hotelName: stay.hotelName,
+        number: room.number,
+        capacity: room.capacity,
+        occupants: room._count.occupants,
+        empty: Math.max(0, room.capacity - room._count.occupants),
+      })),
+    )
+    .filter((room) => room.empty > 0)
+    .sort((a, b) => a.hotelName.localeCompare(b.hotelName, 'ar') || (parseInt(a.number, 10) || 0) - (parseInt(b.number, 10) || 0) || a.number.localeCompare(b.number));
+  return { beds: rooms.reduce((total, room) => total + room.empty, 0), rooms };
+}
 
 @Injectable()
 export class ManifestsService {
@@ -83,7 +107,16 @@ export class ManifestsService {
       include: {
         bus: { select: { plateNumber: true, model: true } },
         accommodations: { select: { name: true, nights: true } },
-        hotelBookings: { where: { status: 'CONFIRMED' }, orderBy: { number: 'asc' }, select: { checkIn: true, checkOut: true, hotel: { select: { name: true } } } },
+        hotelBookings: {
+          where: { status: 'CONFIRMED' },
+          orderBy: { number: 'asc' },
+          select: {
+            checkIn: true,
+            checkOut: true,
+            hotel: { select: { name: true } },
+            rooms: { where: { type: 'SHARED' }, select: { number: true, capacity: true, _count: { select: { occupants: true } } } },
+          },
+        },
         housingSheet: true,
         drivers: { orderBy: { isPrimary: 'desc' }, select: { user: { select: { name: true, phone: true, driverProfile: { select: { iqamaNumber: true } } } } } },
         supervisors: { orderBy: { isPrimary: 'desc' }, select: { user: { select: { name: true, phone: true } } } },
@@ -104,12 +137,14 @@ export class ManifestsService {
 
     const everyone = [...trip.bookings.map((booking) => ({ booking, isReturning: false })), ...returning.map((booking) => ({ booking, isReturning: true }))];
     // A seat sold by another branch still shows as taken, but whose it is stays with that branch.
-    const takenSeats = new Set(everyone.flatMap(({ booking }) => booking.passengers.map((p) => p.seatNumber)));
+    const takenSeats = new Set(everyone.flatMap(({ booking }) => booking.passengers.map((p) => p.seatNumber).filter(Boolean)));
     const passengers = everyone
       // A city's branch serves every passenger of its city's trips; elsewhere it sees its own sales.
       .filter(({ booking }) => visible === null || booking.branchId === visible.branchId || (!!visible.city && tripInCity(trip, visible.city)))
-      .flatMap(({ booking, isReturning }) =>
-        booking.passengers.map((p, idx) => ({
+      .flatMap(({ booking, isReturning }) => {
+        // The owner's account stands in for what their own row lacks, the same as the rooming screen.
+        const profiles = passengerProfiles(booking.passengers, booking.user);
+        return booking.passengers.map((p, idx) => ({
           isReturning,
           passengerId: p.id,
           bookingId: booking.id,
@@ -130,6 +165,8 @@ export class ManifestsService {
           // The account phone belongs to whoever booked, so it only represents the first passenger.
           phone: p.phone ?? (idx === 0 ? booking.user.phone : null),
           nationalId: p.nationalId,
+          gender: profiles.get(p.id)?.gender ?? null,
+          nationality: profiles.get(p.id)?.nationality ?? null,
           notes: p.notes,
           seatNumber: p.seatNumber,
           roomType: isReturning ? null : p.hotelRoom?.type ?? null,
@@ -141,11 +178,12 @@ export class ManifestsService {
           boardedAt: isReturning ? p.ticket?.returnBoardedAt ?? null : p.ticket?.boardedAt ?? null,
           /** The trip was executed without this passenger aboard (لم يحضر). */
           isNoShow: isReturning ? !!p.ticket?.returnNoShowAt && !p.ticket?.returnBoardedAt : !!p.ticket?.noShowAt && !p.ticket?.isBoarded,
-        })),
-      )
-      .sort((a, b) => Number(a.seatNumber) - Number(b.seatNumber));
+        }));
+      })
+      // Passengers saved without a seat come last, after the seated ones.
+      .sort((a, b) => compareSeats(a.seatNumber, b.seatNumber));
 
-    const bySeat = new Map(passengers.map((p) => [p.seatNumber, p]));
+    const bySeat = new Map(passengers.filter((p) => p.seatNumber).map((p) => [p.seatNumber, p]));
     const now = new Date();
     const seats = trip.seats
       .map((seat) => {
@@ -160,7 +198,7 @@ export class ManifestsService {
       // A seat sold before the reverse opened was never on it, but its passenger still sits there.
       .concat(
         passengers
-          .filter((p) => p.isReturning && !trip.seats.some((seat) => seat.seatNumber === p.seatNumber))
+          .filter((p) => p.isReturning && p.seatNumber && !trip.seats.some((seat) => seat.seatNumber === p.seatNumber))
           .map((p) => ({ seatNumber: p.seatNumber, status: 'booked', passengerName: p.fullName, isBoarded: p.isBoarded })),
       )
       .sort((a, b) => Number(a.seatNumber) - Number(b.seatNumber));
@@ -225,6 +263,7 @@ export class ManifestsService {
         sharedRooms: rooms('SHARED'),
         privateRooms: rooms('PRIVATE'),
         unassigned: housed.filter((p) => !p.roomType).length,
+        wasted: wastedBeds(trip.hotelBookings.map((stay) => ({ hotelName: stay.hotel.name, rooms: stay.rooms }))),
         stays: trip.hotelBookings.map((stay) => ({
           hotelName: stay.hotel.name,
           checkIn: stay.checkIn,
@@ -384,7 +423,7 @@ export class ManifestsService {
     const busRental = toHalalas(trip.busRentalPrice ?? 0);
     const hotelCost = trip.hotelBookings.reduce((sum, b) => sum + hotelBookingCost(b), 0);
     return {
-      rows: (rows as { seatNumber: string }[]).sort((a, b) => Number(a.seatNumber) - Number(b.seatNumber)),
+      rows: (rows as { seatNumber: string | null }[]).sort((a, b) => compareSeats(a.seatNumber, b.seatNumber)),
       places: [...places.values()].map((p) => ({
         place: p.place,
         cash: toSar(p.cash),

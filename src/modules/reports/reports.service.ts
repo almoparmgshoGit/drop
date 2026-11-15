@@ -20,6 +20,7 @@ export const UNKNOWN_LABEL = 'غير محدد';
 const UNKNOWN_KEY = 'none';
 /** The drill-down lists at most this many records; the count above them is always the full one. */
 const MAX_RECORDS = 300;
+const MAX_ENDED_TRIPS = 1000;
 
 const STATUS_LABELS: Record<string, string> = {
   CONFIRMED: 'مؤكد',
@@ -826,6 +827,54 @@ export class ReportsService {
 
     const totals = out(total);
     return { ...totals, hotels: byHotel(hotels), months, basis: ctx.basis, totals };
+  }
+
+  /**
+   * Trips that are over (their arrival has passed), departing in the period and on the route filter, latest first.
+   * Once over, a trip leaves the pickers across the system and is found here.
+   */
+  async endedTrips(query: ReportRangeQuery) {
+    const period = this.periodOf(query);
+    const where: Prisma.TripWhereInput = {
+      ...this.tripScope(query),
+      departureTime: { gte: period.start, lt: period.end },
+      arrivalTime: { lte: new Date() },
+      tripStatus: { not: 'DRAFT' },
+    };
+    const [total, rows] = await Promise.all([
+      this.prisma.trip.count({ where }),
+      this.prisma.trip.findMany({
+        where,
+        orderBy: { departureTime: 'desc' },
+        take: MAX_ENDED_TRIPS,
+        select: {
+          id: true, tripCode: true, title: true, origin: true, destination: true, departureTime: true, arrivalTime: true,
+          tripStatus: true, totalSeats: true, availableSeats: true, executedAt: true, financeClosedAt: true,
+        },
+      }),
+    ]);
+    return {
+      total,
+      rows: rows.map((trip) => {
+        const taken = trip.tripStatus === 'CANCELLED' ? 0 : Math.max(0, trip.totalSeats - trip.availableSeats);
+        return {
+          id: trip.id,
+          tripCode: trip.tripCode,
+          title: trip.title,
+          origin: trip.origin,
+          destination: trip.destination,
+          route: routeLabel(trip.origin, trip.destination),
+          departureTime: trip.departureTime,
+          arrivalTime: trip.arrivalTime,
+          status: trip.tripStatus,
+          executed: !!trip.executedAt,
+          financeClosed: !!trip.financeClosedAt,
+          taken,
+          offered: trip.totalSeats,
+          occupancy: percent(taken, trip.totalSeats),
+        };
+      }),
+    };
   }
 
   /** The records behind a figure: the report's own filters, narrowed by the figure clicked. */

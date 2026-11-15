@@ -19,6 +19,7 @@ import { signTicketToken } from '../../common/utils/ticket-token.util';
 import { AdminBookingsQuery, BoardingOverrideDto, ChangeBoardingPointDto, ChangeSeatDto, QUICK_SEARCH_FIELDS, QuickSearchField, UpdatePassengerDto } from './bookings.dto';
 import { cityTripWhere, tripInCity } from '../../common/utils/branch-city.util';
 import { riyadhDayRange, startOfRiyadhMonth } from '../../common/utils/time.util';
+import { compareSeats, NO_SEAT_LABEL, seatLabel } from '../../common/utils/seat-label.util';
 import { allocate, BookingsService, holdAvailableTo, randomCode, toHalalas, toSar } from './bookings.service';
 
 const EDIT_TX_OPTIONS = { maxWait: 10_000, timeout: 30_000 };
@@ -343,7 +344,7 @@ export class BookingsAdminService {
         b.user.phone,
         b.trip.tripCode,
         b.trip.departureTime.toISOString(),
-        b.passengers.map((p) => p.seatNumber).join(' '),
+        b.passengers.map((p) => seatLabel(p.seatNumber)).join(' '),
         Number(b.totalPrice).toFixed(2),
         b.payment?.status,
         b.status,
@@ -388,7 +389,7 @@ export class BookingsAdminService {
     };
     return {
       ...booking,
-      passengers: [...booking.passengers].sort((a, b) => Number(a.seatNumber) - Number(b.seatNumber)),
+      passengers: [...booking.passengers].sort((a, b) => compareSeats(a.seatNumber, b.seatNumber)),
       customerBookings,
     };
   }
@@ -456,19 +457,24 @@ export class BookingsAdminService {
       const phone = dto.phone === undefined ? passenger.phone : dto.phone ? normalizeSaudiPhone(dto.phone) : null;
       const nationalId = dto.nationalId === undefined ? passenger.nationalId : dto.nationalId || null;
       const notes = dto.notes === undefined ? passenger.notes : dto.notes || null;
-      if (fullName === passenger.fullName && phone === passenger.phone && nationalId === passenger.nationalId && notes === passenger.notes) {
+      const gender = dto.gender === undefined ? passenger.gender : dto.gender;
+      const nationality = dto.nationality === undefined ? passenger.nationality : dto.nationality || null;
+      if (
+        fullName === passenger.fullName && phone === passenger.phone && nationalId === passenger.nationalId && notes === passenger.notes &&
+        gender === passenger.gender && nationality === passenger.nationality
+      ) {
         throw new BadRequestException('لا يوجد تغيير للحفظ');
       }
 
-      await tx.bookingPassenger.update({ where: { id: passengerId }, data: { fullName, phone, nationalId, notes } });
+      await tx.bookingPassenger.update({ where: { id: passengerId }, data: { fullName, phone, nationalId, notes, gender, nationality } });
       await tx.booking.update({ where: { id: bookingId }, data: { updatedAt: new Date() } });
       await this.events.record(tx, {
         bookingId,
         action: 'PASSENGER_UPDATED',
         actorId,
         reason: dto.reason,
-        before: { fullName: passenger.fullName, phone: passenger.phone, nationalId: passenger.nationalId, notes: passenger.notes },
-        after: { fullName, phone, nationalId, notes },
+        before: { fullName: passenger.fullName, phone: passenger.phone, nationalId: passenger.nationalId, notes: passenger.notes, gender: passenger.gender, nationality: passenger.nationality },
+        after: { fullName, phone, nationalId, notes, gender, nationality },
         ip,
       });
       // National id and staff notes are not the customer's concern, the same rule as the booking updates.
@@ -496,12 +502,15 @@ export class BookingsAdminService {
         data: { isBooked: true, heldByUserId: null, heldUntil: null },
       });
       if (claimed.count !== 1) throw new ConflictException(`المقعد ${seatNumber} غير متاح`);
-      await tx.seat.updateMany({
-        where: { tripId: booking.tripId, seatNumber: passenger.seatNumber },
-        data: { isBooked: false, heldByUserId: null, heldUntil: null },
-      });
+      // A passenger saved without a seat already holds a place on the trip, so giving them one frees nothing.
+      if (passenger.seatNumber) {
+        await tx.seat.updateMany({
+          where: { tripId: booking.tripId, seatNumber: passenger.seatNumber },
+          data: { isBooked: false, heldByUserId: null, heldUntil: null },
+        });
+      }
       await takeLinkedSeats(tx, booking.tripId, [seatNumber], holdAvailableTo(actorId, new Date()));
-      await releaseLinkedSeats(tx, booking.tripId, [passenger.seatNumber]);
+      if (passenger.seatNumber) await releaseLinkedSeats(tx, booking.tripId, [passenger.seatNumber]);
       await tx.bookingPassenger.update({ where: { id: passengerId }, data: { seatNumber } });
 
       // A new number retires the old one, so a saved copy of the previous ticket stops working at the door.
@@ -528,7 +537,7 @@ export class BookingsAdminService {
         after: { passenger: passenger.fullName, seat: seatNumber, ticketNumber },
         ip,
       });
-      await this.notifications.toBookingOwners(tx, 'SEAT_CHANGED', [bookingId], { passengerName: passenger.fullName, oldSeat: passenger.seatNumber, newSeat: seatNumber });
+      await this.notifications.toBookingOwners(tx, 'SEAT_CHANGED', [bookingId], { passengerName: passenger.fullName, oldSeat: passenger.seatNumber ?? NO_SEAT_LABEL, newSeat: seatNumber });
     }, EDIT_TX_OPTIONS);
     return this.details(bookingId);
   }
@@ -616,7 +625,7 @@ export class BookingsAdminService {
         after: { passenger: passenger.fullName, seat: passenger.seatNumber, ticketNumber: passenger.ticket.ticketNumber },
         ip,
       });
-      await this.notifications.toBookingOwners(tx, 'PASSENGER_BOARDED', [bookingId], { passengerName: passenger.fullName, seatNumber: passenger.seatNumber });
+      await this.notifications.toBookingOwners(tx, 'PASSENGER_BOARDED', [bookingId], { passengerName: passenger.fullName, seatNumber: seatLabel(passenger.seatNumber) });
     }, EDIT_TX_OPTIONS);
     return this.details(bookingId);
   }
