@@ -958,7 +958,18 @@ export class BookingsService {
     const boardingPlace = booking.boardingPointId
       ? await this.prisma.boardingPoint.findUnique({ where: { id: booking.boardingPointId }, select: { address: true, lat: true, lng: true } })
       : null;
-    if (booking.userId === userId) return { ...toCustomerBooking(booking), passengers: withBoarding, updates, cancellationEstimate, tripDayOpen, returnRide, boarding, boardingPlace };
+    // The other trips booked with this one, as the outbound and return of a round journey or a built package, so the
+    // ticket can open the other leg's tickets. Only the same customer's bookings, with what the button needs.
+    const linkedLegs = booking.groupReference
+      ? await this.prisma.booking.findMany({
+          where: { groupReference: booking.groupReference, userId: booking.userId, id: { not: booking.id } },
+          orderBy: { trip: { departureTime: 'asc' } },
+          select: { id: true, bookingReference: true, leg: true, status: true, trip: { select: { origin: true, destination: true, departureTime: true } } },
+        })
+      : [];
+    if (booking.userId === userId) {
+      return { ...toCustomerBooking(booking), passengers: withBoarding, updates, cancellationEstimate, tripDayOpen, returnRide, boarding, boardingPlace, linkedLegs };
+    }
     // Staff read bookings but do not need the token a passenger scans to board.
     return {
       ...booking,
@@ -966,6 +977,7 @@ export class BookingsService {
       tripDayOpen,
       returnRide,
       boarding,
+      linkedLegs,
       passengers: withBoarding.map((p) => ({ ...p, ticket: p.ticket && { ...p.ticket, signedToken: undefined } })),
     };
   }

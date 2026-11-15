@@ -21,7 +21,7 @@ import { allocate, BookingsService, holdAvailableTo, randomCode, toSar } from '.
 import { CashActor, CashService } from '../cash/cash.service';
 import { CollectionsService } from '../cash/collections.service';
 import { CreateJourneyDto, CustomerDto, JourneyQuoteDto, TripSearchQuery } from './branches.dto';
-import { identityData } from '../../common/utils/identity.util';
+import { identityData, idTypeOfNumber } from '../../common/utils/identity.util';
 import { cityTripWhere, servedCity } from '../../common/utils/branch-city.util';
 import { PACKAGE_PRICE_SELECT, packageGroupTotal, packagePriceTiers } from '../../common/utils/package-price.util';
 import { seatPricing } from '../../common/utils/dynamic-pricing.util';
@@ -770,15 +770,21 @@ export class BranchBookingsService {
 
   private async customerFor(tx: Db, phone: string, details: CustomerDto) {
     const { name } = details;
-    const birthDate = new Date(`${details.birthDate}T00:00:00.000Z`);
+    // The birth date and city are no longer asked at the counter; one sent by an older screen is still checked and kept.
+    const birthDate = details.birthDate ? new Date(`${details.birthDate}T00:00:00.000Z`) : null;
     // Rejects dates like 02-31, which JavaScript would otherwise roll over silently, and dates still to come.
-    if (Number.isNaN(birthDate.getTime()) || birthDate.toISOString().slice(0, 10) !== details.birthDate || birthDate > new Date()) {
+    if (birthDate && (Number.isNaN(birthDate.getTime()) || birthDate.toISOString().slice(0, 10) !== details.birthDate || birthDate > new Date())) {
       throw new BadRequestException('تاريخ ميلاد العميل غير صحيح');
     }
     // A national ID makes the nationality Saudi; an iqama cannot belong to a Saudi.
-    const identity = identityData({ idType: details.idType, idNumber: details.idNumber }, details.nationality);
-    if (!identity.idType || !identity.idNumber) throw new BadRequestException('أدخل نوع هوية العميل ورقمها');
-    const profile = { nationality: ('nationality' in identity && identity.nationality) || details.nationality, city: details.city, gender: details.gender, birthDate };
+    const identity = identityData({ idType: details.idType ?? idTypeOfNumber(details.idNumber, details.nationality), idNumber: details.idNumber }, details.nationality);
+    if (!identity.idType || !identity.idNumber) throw new BadRequestException('أدخل رقم هوية العميل');
+    const profile = {
+      nationality: ('nationality' in identity && identity.nationality) || details.nationality,
+      gender: details.gender,
+      ...(details.city && { city: details.city }),
+      ...(birthDate && { birthDate }),
+    };
     // The same document on another account is a duplicate for the customers screen to merge; the booking still goes ahead.
     const holder = await tx.user.findFirst({ where: { idType: identity.idType, idNumber: identity.idNumber, phone: { not: phone } }, select: { id: true } });
     const ownIdentity = holder ? {} : { idType: identity.idType, idNumber: identity.idNumber };
@@ -792,9 +798,9 @@ export class BranchBookingsService {
     const missing: Prisma.UserUncheckedUpdateInput = {
       ...(!existing.name && { name }),
       ...(!existing.nationality && { nationality: profile.nationality }),
-      ...(!existing.city && { city: profile.city }),
+      ...(!existing.city && profile.city && { city: profile.city }),
       ...(!existing.gender && { gender: profile.gender }),
-      ...(!existing.birthDate && { birthDate }),
+      ...(!existing.birthDate && profile.birthDate && { birthDate: profile.birthDate }),
       ...(!existing.idNumber && ownIdentity),
     };
     return Object.keys(missing).length ? tx.user.update({ where: { id: existing.id }, data: missing }) : existing;

@@ -999,7 +999,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
 
   /**
    * The trips list. With a from or a to it is the trips page's working view, nearest departure first: from=now (its
-   * default) starts at this moment, so the first row is always the next trip to leave; a date starts at that Riyadh day,
+   * default) starts at this moment, plus the trips already on the road until they arrive; a date starts at that Riyadh day,
    * and currentMonth at the 1st of this month. Without either, every trip, newest first, as reports and pickers need.
    * Each row carries its expected revenue from the shared metrics, so the table and the cards above it read one figure.
    */
@@ -1009,9 +1009,14 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
     const departureTime = this.listWindow(query);
     // A trip is over once its arrival has passed: it leaves the pickers and is found in the reports instead.
     const now = new Date();
+    // From now, a trip that has left but not yet arrived stays on the page, so the office can follow it on the road.
+    const window: Prisma.TripWhereInput | null = !departureTime
+      ? null
+      : query.from === 'now'
+        ? { OR: [{ departureTime }, { departureTime: { lt: now }, arrivalTime: { gt: now } }] }
+        : { departureTime };
     const where: Prisma.TripWhereInput = {
-      ...(city && cityTripWhere(city)),
-      ...(departureTime && { departureTime }),
+      AND: [city ? cityTripWhere(city) : {}, window ?? {}],
       ...(query.scope === 'active' && { arrivalTime: { gt: now } }),
       ...(query.scope === 'ended' && { arrivalTime: { lte: now } }),
     };

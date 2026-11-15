@@ -174,6 +174,13 @@ export class PackagesController {
   }
 
   @Public()
+  @Get('custom/routes')
+  @ApiOperation({ summary: 'Routes a package can be built on now: a published custom package with outbound and return trips on sale' })
+  async getCustomRoutes() {
+    return this.packagesService.getCustomRoutes();
+  }
+
+  @Public()
   @Get('custom/journey')
   @ApiOperation({ summary: 'Hotels and the outbound and return days with seats, for building a package on a route' })
   async getCustomJourney(@Query() query: CustomJourneyQuery) {

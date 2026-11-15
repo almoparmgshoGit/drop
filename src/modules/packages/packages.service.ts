@@ -136,6 +136,47 @@ export class PackagesService {
   }
 
   /**
+   * The routes a customer can build a package on right now: a published custom package, and on its route an outbound the
+   * package takes and a return the other way, both still on sale with a seat. A route without trips is left out.
+   */
+  async getCustomRoutes() {
+    const packages = await this.getCustomPackages({});
+    const routes = new Map<string, { origin: string; destination: string; minHour: number }>();
+    for (const pkg of packages) {
+      if (!pkg.origin || !pkg.destination) continue;
+      const key = `${pkg.origin}→${pkg.destination}`;
+      const known = routes.get(key);
+      routes.set(key, { origin: pkg.origin, destination: pkg.destination, minHour: Math.min(known?.minHour ?? 24, pkg.minDepartureHour) });
+    }
+    const now = new Date();
+    const until = new Date(now.getTime() + JOURNEY_DAYS_AHEAD * DAY_MS);
+    const legWhere = (from: string, to: string): Prisma.TripWhereInput => {
+      const base = appTripWhere({});
+      return {
+        ...base,
+        origin: { equals: from, mode: 'insensitive' },
+        destination: { equals: to, mode: 'insensitive' },
+        packageId: null,
+        availableSeats: { gt: 0 },
+        departureTime: { gt: now, lt: until },
+        AND: [...(base.AND as Prisma.TripWhereInput[]), bookingTypeWhere('TRANSPORT_ONLY')],
+      };
+    };
+    const checked = await Promise.all(
+      [...routes.values()].map(async (route) => {
+        const [outbound, inbound] = await Promise.all([
+          this.prisma.trip.findMany({ where: legWhere(route.origin, route.destination), select: { departureTime: true }, orderBy: { departureTime: 'asc' }, take: 200 }),
+          this.prisma.trip.findFirst({ where: legWhere(route.destination, route.origin), select: { id: true } }),
+        ]);
+        // The outbound must leave at an hour one of the route's packages takes.
+        const first = outbound.find((trip) => riyadhHour(trip.departureTime) >= route.minHour);
+        return first && inbound ? { origin: route.origin, destination: route.destination, firstDate: riyadhDate(first.departureTime) } : null;
+      }),
+    );
+    return checked.filter((route) => route !== null);
+  }
+
+  /**
    * Everything the package builder needs for a route at once: its hotels (one per custom package), and the days that have an
    * outbound or a return with seats for the whole group. The app offers only these days, so the customer never picks an empty one.
    */

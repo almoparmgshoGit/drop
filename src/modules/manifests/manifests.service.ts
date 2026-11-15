@@ -82,7 +82,9 @@ export function wastedBeds(stays: { hotelName: string; rooms: SharedRoomCount[] 
     )
     .filter((room) => room.empty > 0)
     .sort((a, b) => a.hotelName.localeCompare(b.hotelName, 'ar') || (parseInt(a.number, 10) || 0) - (parseInt(b.number, 10) || 0) || a.number.localeCompare(b.number));
-  return { beds: rooms.reduce((total, room) => total + room.empty, 0), rooms };
+  // How many shared rooms exist at all, so "none wasted" is not claimed before any room was entered.
+  const sharedRooms = stays.reduce((total, stay) => total + stay.rooms.length, 0);
+  return { beds: rooms.reduce((total, room) => total + room.empty, 0), rooms, sharedRooms };
 }
 
 @Injectable()

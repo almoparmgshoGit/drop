@@ -37,6 +37,18 @@ export function normalizeIdNumber(type: IdType, input: string): string {
 }
 
 /**
+ * The document a number belongs to when the counter did not say: a Saudi's digits are a national ID, ten digits from 2
+ * an iqama, anything else (letters, or another length) a passport. Undefined without a number.
+ */
+export function idTypeOfNumber(input: string | null | undefined, nationality?: string | null): IdType | undefined {
+  const number = cleanIdNumber(input ?? '');
+  if (!number) return undefined;
+  if (!/^\d+$/.test(number)) return 'PASSPORT';
+  if (nationality === SAUDI_NATIONALITY) return 'NATIONAL_ID';
+  return /^2\d{9}$/.test(number) ? 'IQAMA' : 'PASSPORT';
+}
+
+/**
  * The fields to write for an identity change: both together, or both cleared. undefined means the request did not touch them.
  * A national ID also sets the nationality, and an iqama cannot belong to a Saudi.
  */

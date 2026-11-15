@@ -247,25 +247,30 @@ export class CustomerDto {
   @Length(9, 20, { message: 'رقم الجوال مطلوب' })
   phone: string;
 
-  // The customer's file is complete from the first counter booking; the app's own sign-up asks for these separately.
+  // The counter asks for the name, phone, gender, nationality and ID number; the rest stays for the app's own profile.
   @IsIn(NATIONALITIES, { message: 'اختر جنسية العميل من القائمة' })
   nationality: string;
 
-  /** A city from the list, or the one typed after choosing "أخرى". */
+  /** No longer asked at the counter; an older screen may still send it. */
+  @IsOptional()
   @trimmed()
   @IsString({ message: 'اختر مدينة العميل' })
   @Length(2, CITY_MAX_LENGTH, { message: 'اختر مدينة العميل أو اكتب اسمها' })
   @NotEquals(OTHER_CITY, { message: 'اكتب اسم مدينة العميل' })
-  city: string;
+  city?: string;
 
   @IsIn(GENDERS, { message: 'حدد جنس العميل' })
   gender: Gender;
 
+  /** No longer asked at the counter; an older screen may still send it. */
+  @IsOptional()
   @Matches(/^\d{4}-\d{2}-\d{2}$/, { message: 'أدخل تاريخ ميلاد العميل' })
-  birthDate: string;
+  birthDate?: string;
 
+  /** Left out, it is read from the number: 10 digits from 1 a national ID, from 2 an iqama, anything else a passport. */
+  @IsOptional()
   @IsIn(ID_TYPES, { message: 'اختر نوع هوية العميل: هوية وطنية أو إقامة أو جواز سفر' })
-  idType: IdType;
+  idType?: IdType;
 
   @trimmed()
   @IsString()
