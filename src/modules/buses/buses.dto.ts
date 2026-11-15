@@ -110,6 +110,11 @@ export class CreateBusDto {
   @IsOptional()
   @IsEnum(BusStatus)
   status?: BusStatus;
+
+  /** The driver who usually drives this bus, optional; null or empty clears it. A driver fixed on another bus moves here. */
+  @IsOptional()
+  @IsString()
+  fixedDriverId?: string | null;
 }
 
 export class UpdateBusDto extends PartialType(CreateBusDto) {}
@@ -172,6 +177,11 @@ export class CreateDriverDto {
   @IsOptional()
   @Matches(DATE_ONLY, { message: 'صيغة تاريخ التعيين غير صحيحة' })
   hireDate?: string;
+
+  /** The bus this driver usually drives, optional; null or empty clears it. The bus's previous fixed driver is released. */
+  @IsOptional()
+  @IsString()
+  fixedBusId?: string | null;
 }
 
 export class UpdateDriverDto extends PartialType(CreateDriverDto) {

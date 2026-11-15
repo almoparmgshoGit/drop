@@ -93,8 +93,13 @@ export class OperationsBoardService {
     // A trip being edited never clashes with itself or with its reverse, as on saving.
     let excludeTripIds: string[] | undefined;
     if (query.excludeTripId) {
-      const own = await this.prisma.trip.findUnique({ where: { id: query.excludeTripId }, select: { id: true, reverseOfTripId: true, reverseTrip: { select: { id: true } } } });
-      excludeTripIds = [query.excludeTripId, own?.reverseOfTripId, own?.reverseTrip?.id].filter((id): id is string => !!id);
+      const own = await this.prisma.trip.findUnique({
+        where: { id: query.excludeTripId },
+        select: { id: true, reverseOfTripId: true, reverseTrip: { select: { id: true } }, convoyFollowers: { select: { id: true, reverseTrip: { select: { id: true } } } } },
+      });
+      // The trip's other buses are edited with it, so what they hold now is not a clash either.
+      const followers = own?.convoyFollowers.flatMap((bus) => [bus.id, bus.reverseTrip?.id]) ?? [];
+      excludeTripIds = [query.excludeTripId, own?.reverseOfTripId, own?.reverseTrip?.id, ...followers].filter((id): id is string => !!id);
     }
 
     const [trips, leaves] = await Promise.all([

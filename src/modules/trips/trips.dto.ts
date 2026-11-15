@@ -25,6 +25,39 @@ import { MAX_BOARDING_CLOSES_AFTER_MINUTES, MAX_BOARDING_OPENS_BEFORE_MINUTES, M
 
 const ITINERARY_STOP_KINDS = ['STOP', 'REST', 'MIQAT'];
 
+/** The most buses one trip may run on, the first included. */
+export const MAX_TRIP_BUSES = 10;
+
+/** One extra bus of a trip, beyond the first: its vehicle, its own drivers and supervisors, and its rent. */
+export class TripBusAssignmentDto {
+  /** The bus's own trip, when editing one already saved; left out for a bus being added. */
+  @IsOptional()
+  @IsString()
+  tripId?: string;
+
+  @IsOptional()
+  @IsString()
+  busId?: string | null;
+
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(10)
+  @IsString({ each: true })
+  driverIds?: string[];
+
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(20)
+  @IsString({ each: true })
+  supervisorIds?: string[];
+
+  @IsOptional()
+  @IsNumber({ maxDecimalPlaces: 2 })
+  @Min(0)
+  @Max(10000000)
+  busRentalPrice?: number;
+}
+
 class BoardingPointDto {
   @IsString()
   @Length(1, 150)
@@ -396,6 +429,17 @@ export class CreateTripDto {
   @IsArray()
   @IsString({ each: true })
   supervisorIds?: string[];
+
+  /**
+   * The trip's other buses, in order, after the one given by busId. Sent on an edit, it is the whole list: a bus left out
+   * is taken off the trip (refused while it has bookings). Left out on an edit, the other buses stay as they are.
+   */
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(MAX_TRIP_BUSES - 1)
+  @ValidateNested({ each: true })
+  @Type(() => TripBusAssignmentDto)
+  extraBuses?: TripBusAssignmentDto[];
 
   /** What the bus costs the company for this trip; never exposed publicly. */
   @IsOptional()

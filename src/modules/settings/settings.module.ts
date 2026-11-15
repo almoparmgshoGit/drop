@@ -54,6 +54,21 @@ const PANEL_DEFAULTS: Record<string, string> = {
   panelNotice: '',
 };
 
+/**
+ * The brand logos the settings page uploads. Each is the URL of a stored image (POST /trips/images), or empty for the logo
+ * that ships with the panel and the app. A changed logo is a new image, since an image URL is cached as immutable.
+ */
+const LOGO_DEFAULTS: Record<string, string> = {
+  logoSidebarCollapsed: '',
+  logoSidebarExpanded: '',
+  faviconUrl: '',
+  invoiceLogoUrl: '',
+  appLogoUrl: '',
+  appLogoSize: '40',
+};
+const LOGO_URL = /^(\/trips\/images\/[0-9a-f-]{36})?$/;
+const LOGO_URL_MESSAGE = 'ارفع الشعار من صفحة الإعدادات';
+
 const STORE_URL = /^(https:\/\/\S+)?$/;
 const STORE_URL_MESSAGE = 'رابط المتجر يبدأ بـ https';
 
@@ -226,6 +241,13 @@ class UpdateSettingsDto {
   @IsString()
   @MaxLength(300)
   panelNotice?: string;
+
+  @IsOptional() @Matches(LOGO_URL, { message: LOGO_URL_MESSAGE }) logoSidebarCollapsed?: string;
+  @IsOptional() @Matches(LOGO_URL, { message: LOGO_URL_MESSAGE }) logoSidebarExpanded?: string;
+  @IsOptional() @Matches(LOGO_URL, { message: LOGO_URL_MESSAGE }) faviconUrl?: string;
+  @IsOptional() @Matches(LOGO_URL, { message: LOGO_URL_MESSAGE }) invoiceLogoUrl?: string;
+  @IsOptional() @Matches(LOGO_URL, { message: LOGO_URL_MESSAGE }) appLogoUrl?: string;
+  @IsOptional() @IsInt() @Min(24) @Max(120) appLogoSize?: number;
 
   @IsOptional()
   @IsInt()
@@ -525,8 +547,21 @@ class SettingsService {
   }
 
   async getAll() {
-    const settings = await this.textValues(PUBLIC_DEFAULTS);
-    return { ...settings, vatRate: Number(settings.vatRate), cancellationRules: parseCancellationRules(settings.cancellationRules) };
+    const [settings, logos] = await Promise.all([this.textValues(PUBLIC_DEFAULTS), this.logoValues()]);
+    return { ...settings, ...logos, vatRate: Number(settings.vatRate), cancellationRules: parseCancellationRules(settings.cancellationRules) };
+  }
+
+  /** Public on purpose: the browser tab, the printed invoice and the app show them, some before anyone signs in. */
+  private async logoValues() {
+    const logos = await this.textValues(LOGO_DEFAULTS);
+    return {
+      logoSidebarCollapsed: logos.logoSidebarCollapsed,
+      logoSidebarExpanded: logos.logoSidebarExpanded,
+      faviconUrl: logos.faviconUrl,
+      invoiceLogoUrl: logos.invoiceLogoUrl,
+      appLogoUrl: logos.appLogoUrl,
+      appLogoSize: Number(logos.appLogoSize) || Number(LOGO_DEFAULTS.appLogoSize),
+    };
   }
 
   /** Everything the settings page edits, except integration keys, which have their own permission. */
@@ -545,20 +580,32 @@ class SettingsService {
 
   /** What each copy of the app asks for on opening, before anyone signs in. */
   async getAppConfig() {
-    const [appText, contact, google, flags, map] = await Promise.all([
+    const [appText, contact, google, flags, map, logos] = await Promise.all([
       this.textValues(APP_TEXT_DEFAULTS),
       this.textValues({ supportPhone: '', supportWhatsapp: '' }),
       this.textValues(GOOGLE_SIGN_IN_DEFAULTS),
       this.flagValues(),
       this.integrations.mapConfig(),
+      this.logoValues(),
     ]);
-    return { ...appText, ...contact, ...google, ...flags, mapTilesUrl: map.tilesUrl, mapAttribution: map.attribution };
+    return {
+      ...appText,
+      ...contact,
+      ...google,
+      ...flags,
+      mapTilesUrl: map.tilesUrl,
+      mapAttribution: map.attribution,
+      appLogoUrl: logos.appLogoUrl,
+      appLogoSize: logos.appLogoSize,
+    };
   }
 
   async getPanelConfig() {
-    const [panel, numbers, map] = await Promise.all([this.textValues(PANEL_DEFAULTS), this.numberValues(), this.integrations.mapConfig()]);
+    const [panel, numbers, map, logos] = await Promise.all([this.textValues(PANEL_DEFAULTS), this.numberValues(), this.integrations.mapConfig(), this.logoValues()]);
     return {
       ...panel,
+      logoSidebarCollapsed: logos.logoSidebarCollapsed,
+      logoSidebarExpanded: logos.logoSidebarExpanded,
       map,
       tripDefaults: {
         crewOpensBeforeMinutes: numbers.defaultCrewOpensBeforeMinutes,

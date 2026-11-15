@@ -6,7 +6,7 @@ import { PrismaService } from '../../common/services/prisma.service';
 import { normalizeSaudiPhone } from '../../common/utils/phone.util';
 import { legacyIdentity, staffIdentityData } from '../../common/utils/staff-identity.util';
 import { CreateDriverDto, UpdateDriverDto } from './buses.dto';
-import { openTripsWhere, splitOpenTrips } from './buses.service';
+import { openTripsWhere, setFixedDriver, splitOpenTrips } from './buses.service';
 
 export interface DriverActor {
   userId: string;
@@ -52,11 +52,14 @@ export class DriversService {
         idNumber: true,
         idIssueDate: true,
         idExpiryDate: true,
+        fixedBus: { select: { id: true, plateNumber: true, model: true } },
         tripDrivers: { where: { trip: openTripsWhere() }, select: { trip: { select: { tripCode: true, departureTime: true, tripStatus: true } } } },
       },
     });
-    return drivers.map(({ driverProfile, tripDrivers, rank, ...driver }) => ({
+    return drivers.map(({ driverProfile, tripDrivers, rank, fixedBus, ...driver }) => ({
       ...driver,
+      fixedBus,
+      fixedBusId: fixedBus?.id ?? null,
       rankName: rank?.name ?? null,
       iqamaNumber: driverProfile?.iqamaNumber ?? null,
       nationality: driverProfile?.nationality ?? null,
@@ -80,6 +83,7 @@ export class DriversService {
     });
     if (!rank) throw new ConflictException('أضف رتبة لوظيفة السائق من صفحة الوظائف والرتب أولًا');
     this.assertWithinOwnAccess(actor, permissionsOf({ role: rank.role, rank }));
+    if (dto.fixedBusId && !(await this.prisma.bus.count({ where: { id: dto.fixedBusId } }))) throw new BadRequestException('الباص المحدد غير موجود');
     // A driver is registered with the same official details as every other employee.
     const identity = staffIdentityData({ ...dto, ...(!dto.idType && legacyIdentity(dto.iqamaNumber)) }, { required: true });
     const hireDate = dto.hireDate ? toDate(dto.hireDate, 'تاريخ التعيين غير صحيح') : null;
@@ -98,6 +102,7 @@ export class DriversService {
       },
       select: { id: true },
     }).catch(identityConflict);
+    if (dto.fixedBusId) await this.prisma.$transaction((tx) => setFixedDriver(tx, dto.fixedBusId!, created.id));
     return created;
   }
 
@@ -138,6 +143,14 @@ export class DriversService {
           driverProfile: { upsert: { create: profile, update: profile } },
         },
       });
+      // A stopped driver no longer holds a bus; otherwise the bus picked here becomes theirs, and their old one is let go.
+      if (dto.isActive === false || dto.fixedBusId !== undefined) {
+        await tx.bus.updateMany({ where: { fixedDriverId: id }, data: { fixedDriverId: null } });
+      }
+      if (dto.isActive !== false && dto.fixedBusId) {
+        if (!(await tx.bus.count({ where: { id: dto.fixedBusId } }))) throw new BadRequestException('الباص المحدد غير موجود');
+        await setFixedDriver(tx, dto.fixedBusId, id);
+      }
       // A changed password or a stopped driver must not leave older sessions usable.
       if (passwordHash || dto.isActive === false) await tx.refreshToken.updateMany({ where: { userId: id }, data: { revoked: true } });
     });

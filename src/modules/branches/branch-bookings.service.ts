@@ -27,6 +27,7 @@ import { PACKAGE_PRICE_SELECT, packageGroupTotal, packagePriceTiers } from '../.
 import { seatPricing } from '../../common/utils/dynamic-pricing.util';
 import { assertBookingOpened, bookingOpenedWhere } from '../../common/utils/booking-opens.util';
 import { compareSeats, seatLabel } from '../../common/utils/seat-label.util';
+import { oneBusPerConvoy } from '../../common/utils/convoy.util';
 
 type Db = Prisma.TransactionClient;
 
@@ -182,12 +183,15 @@ export class BranchBookingsService {
           hotelBookings: { where: { status: 'CONFIRMED' }, select: { hotelId: true } },
           reverseOfTripId: true,
           reverseTrip: { select: { id: true } },
+          convoyLeadId: true,
+          convoyOrder: true,
         },
       }),
       this.prisma.trip.findMany({ where: open, distinct: ['origin', 'destination'], select: { origin: true, destination: true } }),
     ]);
     return {
-      items: items.map(({ package: pack, price, pricingRules, hotelBookings, reverseOfTripId, reverseTrip, ...trip }) => ({
+      // A trip on several buses sells its buses in order, at the counter as in the app.
+      items: oneBusPerConvoy(items).map(({ package: pack, price, pricingRules, hotelBookings, reverseOfTripId, reverseTrip, ...trip }) => ({
         ...trip,
         // The trip it is linked to in the other direction, either way round, so a round trip books the pair together.
         linkedTripId: reverseTrip?.id ?? reverseOfTripId ?? null,

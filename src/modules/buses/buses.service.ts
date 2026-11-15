@@ -24,6 +24,26 @@ interface BusInput {
   singlesFromSeat?: number;
   singlesToSeat?: number;
   soloTravelerPolicy?: SoloTravelerPolicy;
+  fixedDriverId?: string | null;
+}
+
+const FIXED_DRIVER_SELECT = { select: { id: true, name: true, phone: true } };
+
+/**
+ * Makes a driver the fixed one of a bus, or clears the bus's when driverId is null. One driver has one fixed bus at most,
+ * so a driver fixed on another bus moves to this one. Only an active driver account can be fixed on a bus.
+ */
+export async function setFixedDriver(tx: Prisma.TransactionClient, busId: string, driverId: string | null) {
+  if (driverId) {
+    const driver = await tx.user.findFirst({
+      where: { id: driverId, rank: { job: { tripRole: 'DRIVER' } }, blockedAt: null },
+      select: { driverProfile: { select: { isActive: true } } },
+    });
+    if (!driver) throw new BadRequestException('السائق المحدد غير موجود');
+    if (driver.driverProfile?.isActive === false) throw new ConflictException('السائق المحدد موقوف');
+    await tx.bus.updateMany({ where: { fixedDriverId: driverId, id: { not: busId } }, data: { fixedDriverId: null } });
+  }
+  await tx.bus.update({ where: { id: busId }, data: { fixedDriverId: driverId } });
 }
 
 /**
@@ -85,6 +105,7 @@ export class BusesService {
         office: OFFICE_SELECT,
         services: SERVICES_SELECT,
         images: GALLERY_SELECT,
+        fixedDriver: FIXED_DRIVER_SELECT,
         trips: { where: openTripsWhere(), select: { tripCode: true, departureTime: true, tripStatus: true } },
         _count: { select: { trips: true } },
       },
@@ -100,6 +121,7 @@ export class BusesService {
         office: OFFICE_SELECT,
         services: SERVICES_SELECT,
         images: GALLERY_SELECT,
+        fixedDriver: FIXED_DRIVER_SELECT,
         trips: { select: { id: true, tripCode: true, departureTime: true, tripStatus: true } },
       },
     });
@@ -130,27 +152,35 @@ export class BusesService {
     assertValidSinglesRange(singles, seatCount);
     const serviceIds = await this.knownServices(dto.serviceIds);
     const gallery = galleryOf(dto) ?? [];
-    const bus = await this.prisma.bus.create({
-      data: {
-        kind,
-        seatCount,
-        singlesFromSeat: singles.from,
-        singlesToSeat: singles.to,
-        soloTravelerPolicy: dto.soloTravelerPolicy,
-        plateNumber: dto.plateNumber,
-        model: dto.model,
-        color: dto.color || 'أبيض',
-        // The cover is kept on the bus too, for copies of the app that read only it.
-        imageUrl: gallery[0] ?? null,
-        company: dto.officeId ? await this.companyOf(dto.officeId) : dto.company || 'دروب الهجرة للنقل',
-        officeId: dto.officeId || null,
-        status: dto.status ?? 'ACTIVE',
-        services: serviceIds?.length ? { create: serviceIds.map((serviceId) => ({ serviceId })) } : undefined,
-        images: gallery.length ? { create: galleryRows(gallery) } : undefined,
-      },
-      include: { services: SERVICES_SELECT, images: GALLERY_SELECT },
+    const company = dto.officeId ? await this.companyOf(dto.officeId) : dto.company || 'دروب الهجرة للنقل';
+    return this.prisma.$transaction(async (tx) => {
+      const bus = await tx.bus.create({
+        data: {
+          kind,
+          seatCount,
+          singlesFromSeat: singles.from,
+          singlesToSeat: singles.to,
+          soloTravelerPolicy: dto.soloTravelerPolicy,
+          plateNumber: dto.plateNumber,
+          model: dto.model,
+          color: dto.color || 'أبيض',
+          // The cover is kept on the bus too, for copies of the app that read only it.
+          imageUrl: gallery[0] ?? null,
+          company,
+          officeId: dto.officeId || null,
+          status: dto.status ?? 'ACTIVE',
+          services: serviceIds?.length ? { create: serviceIds.map((serviceId) => ({ serviceId })) } : undefined,
+          images: gallery.length ? { create: galleryRows(gallery) } : undefined,
+        },
+        select: { id: true },
+      });
+      if (dto.fixedDriverId) await setFixedDriver(tx, bus.id, dto.fixedDriverId);
+      const created = await tx.bus.findUniqueOrThrow({
+        where: { id: bus.id },
+        include: { services: SERVICES_SELECT, images: GALLERY_SELECT, fixedDriver: FIXED_DRIVER_SELECT },
+      });
+      return withServices(created);
     });
-    return withServices(bus);
   }
 
   private async knownServices(serviceIds?: string[]) {
@@ -218,9 +248,14 @@ export class BusesService {
           singlesToSeat: singles.to,
           soloTravelerPolicy: dto.soloTravelerPolicy,
         },
-        include: { services: SERVICES_SELECT, images: GALLERY_SELECT },
+        select: { id: true },
       });
-      return withServices(updated);
+      if (dto.fixedDriverId !== undefined) await setFixedDriver(tx, updated.id, dto.fixedDriverId || null);
+      const saved = await tx.bus.findUniqueOrThrow({
+        where: { id },
+        include: { services: SERVICES_SELECT, images: GALLERY_SELECT, fixedDriver: FIXED_DRIVER_SELECT },
+      });
+      return withServices(saved);
     }, { maxWait: 10_000, timeout: 30_000 });
   }
 

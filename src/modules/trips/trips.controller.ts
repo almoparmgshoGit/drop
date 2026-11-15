@@ -161,10 +161,10 @@ export class TripsController {
   }
 
   @Post('images')
-  @RequirePermission('trips.manage', 'buses.manage', 'hotels.manage', 'offers.manage', 'loyalty.manage')
+  @RequirePermission('trips.manage', 'buses.manage', 'hotels.manage', 'offers.manage', 'loyalty.manage', 'settings.manage')
   @UseInterceptors(FilesInterceptor('images', MAX_PUBLIC_IMAGES_PER_UPLOAD, { limits: { fileSize: MAX_PUBLIC_IMAGE_BYTES } }))
   @ApiBearerAuth()
-  @ApiOperation({ summary: 'Store photos for trips, buses and hotels; the returned URLs go on the trip, bus or hotel' })
+  @ApiOperation({ summary: 'Store photos for trips, buses, hotels and the brand logos; the returned URLs go on the trip, bus or hotel' })
   async uploadImages(@Req() req, @UploadedFiles() files?: UploadedImage[]) {
     return this.tripsService.saveImages(req.user.userId, files);
   }

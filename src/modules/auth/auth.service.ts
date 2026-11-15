@@ -20,6 +20,7 @@ import { permissionsOf } from '../../common/permissions';
 import { RedisService } from '../../common/services/redis.service';
 import { AppSettingsService } from '../../common/services/app-settings.service';
 import { normalizeSaudiPhone } from '../../common/utils/phone.util';
+import { imageTypeOf } from '../../common/utils/image-type.util';
 import { RealtimeService } from '../../common/services/realtime.service';
 import { WhatsAppError, WhatsAppService } from '../../common/services/whatsapp.service';
 import { NotificationsService } from '../../common/services/notifications.service';
@@ -65,7 +66,16 @@ const LAST_LOGIN_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 interface GoogleIdentity {
   googleId: string;
   email: string | null;
+  /** The full name on the Google account, offered to fill the registration form; never saved without the customer. */
+  name?: string | null;
+  /** The Google profile photo, copied once into an account that has none. */
+  picture?: string | null;
 }
+
+/** Only Google's own photo host is fetched, so a token can never make the server request another address. */
+const GOOGLE_PHOTO_HOST = /(^|\.)googleusercontent\.com$/;
+const GOOGLE_PHOTO_MAX_BYTES = 5 * 1024 * 1024;
+const GOOGLE_PHOTO_TIMEOUT_MS = 5000;
 
 const AUTH_USER_SELECT = {
   id: true,
@@ -239,7 +249,8 @@ export class AuthService {
     if (user) {
       // An employee promoted from a customer keeps the link, and must still use their password.
       await this.assertCustomerMayEnter(user);
-      return this.generateAuthTokens(user.id, user.role, ip, userAgent);
+      await this.copyGooglePhoto(user.id, user.photoUpdatedAt, identity.picture);
+      return { ...(await this.generateAuthTokens(user.id, user.role, ip, userAgent)), googleName: identity.name ?? null };
     }
     const linkToken = crypto.randomBytes(32).toString('hex');
     await this.redis.set(googleLinkKey(linkToken), JSON.stringify(identity), GOOGLE_LINK_TTL_SECONDS);
@@ -272,7 +283,9 @@ export class AuthService {
       const linked = user
         ? await this.prisma.user.update({ where: { id: user.id }, data: { googleId: identity.googleId, isVerified: true, ...email } })
         : await this.prisma.user.create({ data: { phone, googleId: identity.googleId, isVerified: true, ...email } });
-      return this.generateAuthTokens(linked.id, linked.role, ip, userAgent);
+      await this.copyGooglePhoto(linked.id, linked.photoUpdatedAt, identity.picture);
+      // The name only fills the registration form, where the customer confirms it with the rest of their details.
+      return { ...(await this.generateAuthTokens(linked.id, linked.role, ip, userAgent)), googleName: identity.name ?? null };
     } catch (err) {
       // Two taps of the same link can race to the unique index; the second one is told what happened.
       if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
@@ -297,7 +310,39 @@ export class AuthService {
     if (!payload?.sub) throw new UnauthorizedException('تعذر التحقق من حساب Google، حاول مرة أخرى');
     // An address Google has not verified could belong to anyone, so it is not kept.
     const email = payload.email_verified === true && payload.email ? payload.email.trim().toLowerCase() : null;
-    return { googleId: payload.sub, email };
+    const name = payload.name?.trim().slice(0, 100) || null;
+    return { googleId: payload.sub, email, name, picture: payload.picture || null };
+  }
+
+  /**
+   * Gives an account with no photo its Google profile photo. Best effort: a slow or failed download leaves the account
+   * without a photo and never stops the sign-in. A photo the customer set themselves is never replaced.
+   */
+  private async copyGooglePhoto(userId: string, photoUpdatedAt: Date | null, picture?: string | null) {
+    if (photoUpdatedAt || !picture) return;
+    try {
+      const url = new URL(picture);
+      if (url.protocol !== 'https:' || !GOOGLE_PHOTO_HOST.test(url.hostname)) return;
+      // Google sends a 96px thumbnail; the same address serves a larger one.
+      const sized = url.href.replace(/=s\d+(-c)?$/, '=s400-c');
+      const response = await fetch(sized, { redirect: 'error', signal: AbortSignal.timeout(GOOGLE_PHOTO_TIMEOUT_MS) });
+      if (!response.ok) return;
+      const data = Buffer.from(await response.arrayBuffer());
+      if (!data.length || data.length > GOOGLE_PHOTO_MAX_BYTES) return;
+      const mimeType = imageTypeOf(data);
+      if (!mimeType) return;
+      await this.prisma.$transaction([
+        this.prisma.userPhoto.upsert({
+          where: { userId },
+          create: { userId, mimeType, size: data.length, data },
+          update: { mimeType, size: data.length, data },
+        }),
+        // Only while still empty, so a photo the customer picked at the same moment wins.
+        this.prisma.user.updateMany({ where: { id: userId, photoUpdatedAt: null }, data: { photoUpdatedAt: new Date() } }),
+      ]);
+    } catch (err) {
+      this.logger.warn(`Google photo not copied: ${err instanceof Error ? err.message : err}`);
+    }
   }
 
   private worksInEveryBranch(user: BranchAccount) {

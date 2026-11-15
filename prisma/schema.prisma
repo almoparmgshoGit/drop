@@ -403,6 +403,8 @@ model User {
   walletTransactions     WalletTransaction[]
   loyaltyTransactions    LoyaltyTransaction[]
   tripDrivers            TripDriver[]
+  /// The bus this driver usually drives, set from the bus or from the drivers screen.
+  fixedBus               Bus?                  @relation("BusFixedDriver")
   tripSupervisors        TripSupervisor[]
   driverProfile          DriverProfile?
   notifications          Notification[]
@@ -577,6 +579,14 @@ model Trip {
   bookingType                String                @default("TRANSPORT_ONLY")
   busId                      String?
   bus                        Bus?                  @relation(fields: [busId], references: [id], onDelete: SetNull)
+  /// A trip on more than one bus: each extra bus is its own trip pointing at the first (its seats, crew, manifest and
+  /// tracking stay per bus). Edits to the first carry to the others; customers are offered the buses in order, the next
+  /// one only once the one before it is full. Null on the first bus and on a single-bus trip.
+  convoyLeadId               String?
+  convoyLead                 Trip?                 @relation("TripConvoy", fields: [convoyLeadId], references: [id], onDelete: SetNull)
+  convoyFollowers            Trip[]                @relation("TripConvoy")
+  /// 1 for the first bus, 2 for the next, and so on.
+  convoyOrder                Int                   @default(1)
   packageId                  String?
   package                    Package?              @relation(fields: [packageId], references: [id], onDelete: SetNull)
   reverseEnabled             Boolean               @default(false)
@@ -647,6 +657,7 @@ model Trip {
   @@index([seriesId])
   @@index([codePeriod, codeNumber])
   @@index([executedAt])
+  @@index([convoyLeadId])
 }
 
 model TripImage {
@@ -944,6 +955,9 @@ model Bus {
   /// Whether a traveller booking alone may sit in the family section: never, or only a woman.
   soloTravelerPolicy SoloTravelerPolicy  @default(SINGLES_ONLY)
   status             BusStatus           @default(ACTIVE)
+  /// The driver who usually drives this bus, optional. A driver has one such bus at most; trips on the bus start with them.
+  fixedDriverId      String?             @unique
+  fixedDriver        User?               @relation("BusFixedDriver", fields: [fixedDriverId], references: [id], onDelete: SetNull)
   createdAt          DateTime            @default(now())
   trips              Trip[]
   services           BusService[]
