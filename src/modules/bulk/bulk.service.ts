@@ -150,6 +150,7 @@ export class BulkService {
             origin: true,
             destination: true,
             channelApp: true,
+            tripStatus: true,
             convoyLeadId: true,
             bus: { select: { plateNumber: true } },
             reverseTrip: { select: { id: true, tripCode: true } },
@@ -160,9 +161,17 @@ export class BulkService {
             _count: { select: { bookings: true, invoices: true, accountEntries: true, custodies: true } },
           },
         });
+        // A finished or cancelled trip is deleted with everything on it; only invoices signed for ZATCA hold it.
+        const closedIds = trips.filter((trip) => trip.tripStatus === 'COMPLETED' || trip.tripStatus === 'CANCELLED').map((trip) => trip.id);
+        const signed = new Map<string, number>();
+        for (const id of closedIds) signed.set(id, await this.trips.signedZatcaDocuments(id));
         return trips.map((trip) => {
           const blockers: Blocker[] = [];
           const href = `/trips/${trip.id}`;
+          if (signed.has(trip.id)) {
+            if (signed.get(trip.id)) blockers.push({ key: 'zatca', label: 'عليها فواتير مُرسلة لهيئة الزكاة، وحذفها يُفسد تسلسل الفواتير القادمة', href });
+            return { id: trip.id, name: `${trip.tripCode} · ${trip.origin} ← ${trip.destination}`, hidden: !trip.channelApp, blockers };
+          }
           if (trip._count.bookings) blockers.push({ key: 'bookings', label: `عليها ${plural(trip._count.bookings, 'حجز', 'حجوزات')}`, href });
           const followerBookings = trip.convoyFollowers.filter((f) => f._count.bookings > 0);
           if (followerBookings.length) blockers.push({ key: 'convoy', label: `باصات إضافية عليها حجوزات (${followerBookings.map((f) => f.tripCode).join('، ')})`, href });
@@ -176,6 +185,8 @@ export class BulkService {
         });
       },
       remove: async (id) => {
+        // A trip's extra bus picked with it is already gone once its first bus was deleted.
+        if (!(await prisma.trip.count({ where: { id } }))) return;
         await this.trips.deleteTrip(id);
       },
       setHidden: async (ids, hidden) => {

@@ -2611,8 +2611,65 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
     return { stopped: true, deleted };
   }
 
+  /**
+   * A finished or cancelled trip is deleted with everything recorded on it: bookings, payments, cash movements, invoices,
+   * custodies, expenses, reports and hotel stays (the owner's decision). Only invoices already signed for ZATCA hold it:
+   * each signed document chains to the one before it, so removing one would get every later invoice rejected.
+   */
+  async purgeClosedTrip(id: string) {
+    const trip = await this.prisma.trip.findUnique({ where: { id }, select: { tripStatus: true, tripCode: true, convoyFollowers: { select: { id: true, tripStatus: true } } } });
+    if (!trip) throw new NotFoundException('Trip not found');
+    if (trip.tripStatus !== 'COMPLETED' && trip.tripStatus !== 'CANCELLED') throw new ConflictException('الحذف الكامل للرحلات المنتهية أو الملغاة فقط');
+    // Its other buses go with it; an open one would lose its passengers, so it must be dealt with first.
+    if (trip.convoyFollowers.some((bus) => bus.tripStatus !== 'COMPLETED' && bus.tripStatus !== 'CANCELLED')) {
+      throw new ConflictException(`للرحلة ${trip.tripCode} باص إضافي لم ينتهِ بعد`);
+    }
+    for (const tripId of [...trip.convoyFollowers.map((bus) => bus.id), id]) await this.purgeOne(tripId);
+    return { success: true };
+  }
+
+  /** How many of a trip's invoices or credit notes were signed for ZATCA; any of them keeps the trip. */
+  async signedZatcaDocuments(tripId: string) {
+    const bookingIds = (await this.prisma.booking.findMany({ where: { tripId }, select: { id: true } })).map((booking) => booking.id);
+    const invoiceIds = (await this.prisma.invoice.findMany({ where: { OR: [{ tripId }, { bookingId: { in: bookingIds } }] }, select: { id: true } })).map((invoice) => invoice.id);
+    const creditNoteIds = (await this.prisma.creditNote.findMany({ where: { OR: [{ bookingId: { in: bookingIds } }, { invoiceId: { in: invoiceIds } }] }, select: { id: true } })).map((note) => note.id);
+    return this.prisma.zatcaDocument.count({ where: { icv: { not: null }, OR: [{ invoiceId: { in: invoiceIds } }, { creditNoteId: { in: creditNoteIds } }] } });
+  }
+
+  private async purgeOne(tripId: string) {
+    if ((await this.signedZatcaDocuments(tripId)) > 0) throw new ConflictException('عليها فواتير مُرسلة لهيئة الزكاة، وحذفها يُفسد تسلسل الفواتير القادمة');
+    await this.prisma.$transaction(async (tx) => {
+      const bookingIds = (await tx.booking.findMany({ where: { tripId }, select: { id: true } })).map((booking) => booking.id);
+      const custodyIds = (await tx.custody.findMany({ where: { tripId }, select: { id: true } })).map((custody) => custody.id);
+      const invoiceIds = (await tx.invoice.findMany({ where: { OR: [{ tripId }, { bookingId: { in: bookingIds } }] }, select: { id: true } })).map((invoice) => invoice.id);
+      const creditNoteWhere = { OR: [{ bookingId: { in: bookingIds } }, { invoiceId: { in: invoiceIds } }] };
+      const creditNoteIds = (await tx.creditNote.findMany({ where: creditNoteWhere, select: { id: true } })).map((note) => note.id);
+
+      await tx.zatcaDocument.deleteMany({ where: { OR: [{ invoiceId: { in: invoiceIds } }, { creditNoteId: { in: creditNoteIds } }] } });
+      await tx.creditNote.deleteMany({ where: { id: { in: creditNoteIds } } });
+      await tx.invoice.deleteMany({ where: { id: { in: invoiceIds } } });
+      await tx.cashMovement.deleteMany({ where: { OR: [{ bookingId: { in: bookingIds } }, { custodyId: { in: custodyIds } }] } });
+      await tx.custodyAttachment.deleteMany({ where: { custodyId: { in: custodyIds } } });
+      await tx.custodyExpense.deleteMany({ where: { custodyId: { in: custodyIds } } });
+      await tx.custody.deleteMany({ where: { id: { in: custodyIds } } });
+      await tx.tripAccountAttachment.deleteMany({ where: { entry: { tripId } } });
+      await tx.tripAccountEntry.deleteMany({ where: { tripId } });
+      await tx.bookingCollection.deleteMany({ where: { bookingId: { in: bookingIds } } });
+      await tx.bookingEvent.deleteMany({ where: { bookingId: { in: bookingIds } } });
+      await tx.paymentTransaction.deleteMany({ where: { bookingId: { in: bookingIds } } });
+      await tx.ticketCompensation.deleteMany({ where: { bookingId: { in: bookingIds } } });
+      await tx.hotelBooking.deleteMany({ where: { tripId } });
+      await tx.tripReport.deleteMany({ where: { tripId } });
+      // Passengers, tickets, payments and ratings go with their bookings.
+      await tx.booking.deleteMany({ where: { tripId } });
+      await tx.trip.delete({ where: { id: tripId } });
+    }, { maxWait: 10_000, timeout: 120_000 });
+  }
+
   /** Deleting a trip's first bus deletes its other buses too, so each of them must be free to delete as well. */
   async deleteTrip(id: string) {
+    const closed = await this.prisma.trip.findUnique({ where: { id }, select: { tripStatus: true } });
+    if (closed?.tripStatus === 'COMPLETED' || closed?.tripStatus === 'CANCELLED') return this.purgeClosedTrip(id);
     const followers = await this.prisma.trip.findMany({ where: { convoyLeadId: id }, select: { id: true, tripCode: true } });
     for (const follower of followers) {
       if ((await this.prisma.booking.count({ where: { tripId: follower.id } })) > 0) {
