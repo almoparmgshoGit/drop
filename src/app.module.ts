@@ -49,6 +49,7 @@ import { MonitoringModule } from './modules/monitoring/monitoring.module';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 import { WaitlistModule } from './modules/waitlist/waitlist.module';
 import { TripFollowupModule } from './modules/trip-followup/trip-followup.module';
+import { ClosingsModule } from './modules/closings/closings.module';
 
 @Module({
   imports: [
@@ -100,6 +101,7 @@ import { TripFollowupModule } from './modules/trip-followup/trip-followup.module
     MonitoringModule,
     WaitlistModule,
     TripFollowupModule,
+    ClosingsModule,
   ],
   providers: [
     { provide: APP_GUARD, useClass: ThrottlerGuard },

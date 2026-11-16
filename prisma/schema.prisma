@@ -1789,6 +1789,7 @@ model Branch {
   bookings     Booking[]
   collections  BookingCollection[]
   refunds      PaymentTransaction[]
+  generalExpenses GeneralExpense[]
 
   @@index([managerId])
 }
@@ -3135,4 +3136,109 @@ model WaitlistEntry {
   @@index([tripId, status, position])
   @@index([userId, status])
   @@index([status, expiresAt])
+}
+
+/// What a company expense outside the trips is for. OFFICE_RENT is the rent of a branch's or the head office's premises.
+enum GeneralExpenseCategory {
+  OFFICE_RENT
+  UTILITIES
+  TELECOM
+  SUPPLIES
+  MAINTENANCE
+  GOVERNMENT
+  MARKETING
+  HOSPITALITY
+  OTHER
+}
+
+/// A company expense that belongs to no trip: premises rent, utilities, office supplies. A mistake is voided, not deleted.
+model GeneralExpense {
+  id             String                     @id @default(uuid())
+  number         Int                        @unique @default(autoincrement())
+  category       GeneralExpenseCategory
+  /// Empty for the head office or the company as a whole.
+  branchId       String?
+  branch         Branch?                    @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  amount         Decimal                    @db.Decimal(12, 2)
+  /// VAT inside the amount, fixed when entered. Zero unless a tax invoice backs it.
+  vat            Decimal                    @default(0) @db.Decimal(12, 2)
+  hasTaxInvoice  Boolean                    @default(false)
+  method         CollectionMethod           @default(CASH)
+  supplierName   String?
+  description    String
+  notes          String?
+  spentOn        DateTime                   @db.Date
+  idempotencyKey String?                    @unique
+  createdById    String
+  createdByName  String?
+  createdAt      DateTime                   @default(now())
+  voidedAt       DateTime?
+  voidedByName   String?
+  voidReason     String?
+  attachments    GeneralExpenseAttachment[]
+
+  @@index([spentOn])
+  @@index([branchId, spentOn])
+}
+
+/// Invoices live in the database so they are only reachable through the API's permission checks, never as public files.
+model GeneralExpenseAttachment {
+  id           String         @id @default(uuid())
+  expenseId    String
+  expense      GeneralExpense @relation(fields: [expenseId], references: [id], onDelete: Restrict)
+  fileName     String
+  mimeType     String
+  size         Int
+  data         Bytes
+  uploadedById String
+  createdAt    DateTime       @default(now())
+
+  @@index([expenseId])
+}
+
+enum ClosingKind {
+  /// Trips: their revenue, costs, collections and bus rents.
+  TRIPS
+  /// Employees: salaries, advances, custodies and what each collected.
+  EMPLOYEES
+  /// Everything: trips, collections, drawers, rents, offices, employees and the net.
+  COMPREHENSIVE
+}
+
+enum ClosingPeriod {
+  TRIP
+  MONTH
+  QUARTER
+  YEAR
+  CUSTOM
+}
+
+/// An approved closing of the accounts: the figures as they stood when approved, kept so later edits cannot rewrite them.
+/// Only voiding is allowed afterwards; a database trigger refuses any other change and any delete.
+model AccountClosing {
+  id            String        @id @default(uuid())
+  number        Int           @unique @default(autoincrement())
+  kind          ClosingKind
+  period        ClosingPeriod
+  /// Riyadh days, both included.
+  fromDate      DateTime      @db.Date
+  toDate        DateTime      @db.Date
+  /// The trip (its way there) for a closing of one trip.
+  tripId        String?
+  label         String
+  revenue       Decimal       @db.Decimal(14, 2)
+  expenses      Decimal       @db.Decimal(14, 2)
+  net           Decimal       @db.Decimal(14, 2)
+  /// Every section of the closing, as printed.
+  report        Json
+  note          String?
+  createdById   String
+  createdByName String?
+  createdAt     DateTime      @default(now())
+  voidedAt      DateTime?
+  voidedByName  String?
+  voidReason    String?
+
+  @@index([kind, fromDate])
+  @@index([tripId])
 }

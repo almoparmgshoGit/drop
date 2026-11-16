@@ -116,6 +116,15 @@ export const PERMISSION_GROUPS = [
     ],
   },
   {
+    title: 'تقفيل الحسابات والمصروفات العامة',
+    items: [
+      { key: 'closings.view', label: 'عرض تقفيل الحسابات وطباعته (الرحلات والصندوق والإيجارات ورواتب الموظفين)' },
+      { key: 'closings.approve', label: 'اعتماد تقفيل الحسابات وإلغاء اعتماده' },
+      { key: 'expenses.view', label: 'عرض المصروفات العامة: إيجارات المقرات ومصاريف المكاتب' },
+      { key: 'expenses.manage', label: 'تسجيل المصروفات العامة وإلغاؤها' },
+    ],
+  },
+  {
     title: 'العملاء والمحفظة',
     items: [
       { key: 'customers.view', label: 'البحث عن العملاء وفتح ملفاتهم' },
