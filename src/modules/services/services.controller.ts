@@ -54,7 +54,7 @@ export class ServicesController {
   }
 
   @Delete(':id')
-  @RequirePermission('packages.manage')
+  @RequirePermission('packages.delete')
   @ApiBearerAuth()
   @ApiOperation({ summary: 'Delete service' })
   async deleteService(@Param('id') id: string) {

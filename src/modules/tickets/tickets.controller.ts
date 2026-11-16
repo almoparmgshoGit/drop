@@ -202,6 +202,34 @@ export class TicketsController {
     return this.ticketsService.updateLiveStatus(req.user, tripId, dto.status, dto.boardingPointId);
   }
 
+  @Post('trips/:tripId/start')
+  @RequirePermission('crew.status')
+  @ApiOperation({ summary: 'The crew starts the trip: the bus is put at its first gathering point. Time alone never starts a trip' })
+  async startTrip(@Req() req, @Param('tripId') tripId: string) {
+    return this.ticketsService.startTrip(req.user, tripId);
+  }
+
+  @Post('trips/:tripId/office-start')
+  @RequirePermission('trips.start')
+  @ApiOperation({ summary: 'The office starts a trip from the dashboard, for a crew that cannot press start in the app' })
+  async startTripFromOffice(@Req() req, @Param('tripId') tripId: string) {
+    return this.ticketsService.startTrip(req.user, tripId, { fromOffice: true });
+  }
+
+  @Post('trips/:tripId/office-stop')
+  @RequirePermission('trips.start')
+  @ApiOperation({ summary: 'The office stops a trip that has started; it can be resumed, cancelled or deleted later' })
+  async stopTrip(@Req() req, @Param('tripId') tripId: string) {
+    return this.ticketsService.stopTrip(req.user, tripId);
+  }
+
+  @Post('trips/:tripId/office-resume')
+  @RequirePermission('trips.start')
+  @ApiOperation({ summary: 'The office resumes a stopped trip where the crew last reported it' })
+  async resumeTrip(@Req() req, @Param('tripId') tripId: string) {
+    return this.ticketsService.resumeTrip(req.user, tripId);
+  }
+
   @Get('reports')
   @RequirePermission('manifests.view')
   @ApiOperation({ summary: 'Latest incidents reported by trip crews' })

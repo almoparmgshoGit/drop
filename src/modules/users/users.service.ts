@@ -921,7 +921,13 @@ export class UsersService implements OnModuleInit, OnModuleDestroy {
   async deleteUser(actor: UserActor, userId: string) {
     const user = await this.prisma.user.findUnique({ where: { id: userId }, include: { rank: true } });
     if (!user) throw new NotFoundException('User not found');
-    await this.assertCanManage(actor, user);
+    // Deleting for good has its own permission per kind of account, apart from the right to edit them.
+    if (user.role === 'PASSENGER') {
+      if (!actor.permissions.includes('customers.delete')) throw new ForbiddenException('ليست لديك صلاحية حذف العملاء');
+    } else {
+      if (!actor.permissions.includes('employees.delete')) throw new ForbiddenException('ليست لديك صلاحية حذف الموظفين');
+      this.assertWithinOwnAccess(actor, permissionsOf(user));
+    }
     if (user.role === 'ADMIN') await this.assertNotLastChange(actor.userId, userId, 'حذف');
 
     const bookings = await this.prisma.booking.count({ where: { userId } });

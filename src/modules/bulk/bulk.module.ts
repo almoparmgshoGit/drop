@@ -1,6 +1,6 @@
 import { Body, Controller, HttpCode, Module, Param, Post, Req } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
-import { ArrayMaxSize, ArrayMinSize, IsArray, IsBoolean, IsOptional, IsString, IsUUID, MaxLength } from 'class-validator';
+import { ArrayMaxSize, ArrayMinSize, IsArray, IsBoolean, IsOptional, IsString, MaxLength } from 'class-validator';
 import { TripsModule } from '../trips/trips.module';
 import { UsersModule } from '../users/users.module';
 import { BusesModule } from '../buses/buses.module';
@@ -10,7 +10,9 @@ class BulkIdsDto {
   @IsArray()
   @ArrayMinSize(1)
   @ArrayMaxSize(200)
-  @IsUUID('all', { each: true })
+  // Record ids are plain text ids: rows created by imports or older seeds are not all UUIDs, and a strict check refused the whole batch.
+  @IsString({ each: true })
+  @MaxLength(64, { each: true })
   ids: string[];
 }
 
@@ -27,7 +29,8 @@ class BulkVisibilityDto extends BulkIdsDto {
 }
 
 class BulkUnlinkDto {
-  @IsUUID('all')
+  @IsString()
+  @MaxLength(64)
   id: string;
 
   @IsString()
@@ -36,7 +39,7 @@ class BulkUnlinkDto {
 }
 
 /**
- * Actions on several rows of one admin table at once. Each table needs its own manage permission, checked by the
+ * Actions on several rows of one admin table at once. Each table needs its own manage permission (and its delete permission to delete), checked by the
  * service since the table comes in the path.
  */
 @ApiTags('bulk')

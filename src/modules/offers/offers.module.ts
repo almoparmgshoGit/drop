@@ -226,7 +226,7 @@ class OffersController {
   }
 
   @Delete(':id')
-  @RequirePermission('offers.manage')
+  @RequirePermission('offers.delete')
   @ApiOperation({ summary: 'Delete promo offer' })
   remove(@Param('id') id: string) {
     return this.offers.remove(id);

@@ -91,7 +91,7 @@ export class TripFollowupService {
     if (isOver(trip)) throw new NotFoundException('انتهت صلاحية رابط التتبع بانتهاء الرحلة');
 
     const hasArrived = trip.liveStatus === 'ARRIVED';
-    const stage = hasArrived ? 'ARRIVED' : trip.liveStatus === 'ON_ROAD' || trip.liveStatus === 'AT_POINT' ? 'IN_PROGRESS' : now < trip.departureTime.getTime() ? 'NOT_STARTED' : 'IN_PROGRESS';
+    const stage = hasArrived ? 'ARRIVED' : trip.liveStatus === 'STOPPED' ? 'STOPPED' : trip.liveStatus === 'ON_ROAD' || trip.liveStatus === 'AT_POINT' ? 'IN_PROGRESS' : 'NOT_STARTED';
     const position = hasArrived ? null : trip.location;
     const isMine = (point: { id: string; name: string }) => !isReturn && (booking.boardingPointId === point.id || booking.boardingPointName === point.name);
     const map = await this.integrations.mapConfig();

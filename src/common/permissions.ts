@@ -13,6 +13,8 @@ export const PERMISSION_GROUPS = [
     items: [
       { key: 'trips.view', label: 'عرض الرحلات' },
       { key: 'trips.manage', label: 'إضافة وتعديل ونشر وإلغاء الرحلات' },
+      { key: 'trips.delete', label: 'حذف الرحلات نهائيًا' },
+      { key: 'trips.start', label: 'بدء الرحلات وإيقافها وإعادة تشغيلها من لوحة التحكم (بدونه لا تبدأ الرحلة إلا من تطبيق المشرف)' },
     ],
   },
   {
@@ -26,7 +28,8 @@ export const PERMISSION_GROUPS = [
       { key: 'bookings.edit', label: 'تعديل الركاب والمقاعد ونقاط الصعود والملاحظات' },
       { key: 'bookings.unboard', label: 'إلغاء تسجيل صعود راكب' },
       { key: 'bookings.cancel', label: 'إلغاء الحجز إداريًا' },
-      { key: 'bookings.manage_records', label: 'إخفاء الحجوزات من تطبيق العميل وحذف الملغاة منها نهائيًا' },
+      { key: 'bookings.manage_records', label: 'إخفاء الحجوزات من تطبيق العميل وإظهارها' },
+      { key: 'bookings.delete', label: 'حذف الحجوزات الملغاة نهائيًا' },
       { key: 'bookings.export', label: 'تصدير الحجوزات' },
       { key: 'cancellations.review', label: 'رفض طلبات الإلغاء' },
       { key: 'cancellations.approve', label: 'قبول طلبات الإلغاء والاسترداد' },
@@ -61,6 +64,7 @@ export const PERMISSION_GROUPS = [
       { key: 'hotels.book', label: 'حجز الغرف وتسكين الركاب وتسجيل الشكاوى' },
       { key: 'hotels.rates', label: 'عرض أسعار التعاقد والتكاليف' },
       { key: 'hotels.manage', label: 'إضافة الفنادق وتعديلها وإلغاء حجوزاتها وإغلاق الشكاوى وإخراج الغرف من الخدمة' },
+      { key: 'hotels.delete', label: 'حذف الفنادق نهائيًا' },
     ],
   },
   {
@@ -70,8 +74,10 @@ export const PERMISSION_GROUPS = [
       { key: 'buses.manage', label: 'إدارة الباصات والسائقين' },
       { key: 'buses.rates', label: 'عرض أسعار الإيجار وكشوف حساب مكاتب الباصات' },
       { key: 'buses.accounts', label: 'إدارة عقود المكاتب ومصاريف الرحلات وسداد المستحقات' },
+      { key: 'buses.delete', label: 'حذف الباصات وسجلات صيانتها ومكاتب الباصات نهائيًا' },
       { key: 'packages.view', label: 'عرض الباقات' },
       { key: 'packages.manage', label: 'إدارة الباقات والخدمات' },
+      { key: 'packages.delete', label: 'حذف الباقات والخدمات نهائيًا' },
     ],
   },
   {
@@ -93,6 +99,7 @@ export const PERMISSION_GROUPS = [
       { key: 'branches.all', label: 'عرض كل الفروع وأدائها' },
       { key: 'branches.staff', label: 'إدارة موظفي فرعه ورتبهم وصلاحياتهم' },
       { key: 'branches.manage', label: 'إضافة الفروع وتعديلها وإيقافها وتعيين مدرائها' },
+      { key: 'branches.delete', label: 'حذف الفروع نهائيًا' },
     ],
   },
   {
@@ -144,7 +151,8 @@ export const PERMISSION_GROUPS = [
     items: [
       { key: 'customers.view', label: 'البحث عن العملاء وفتح ملفاتهم' },
       { key: 'customers.list', label: 'عرض جدول العملاء وتصفحه وأرصدة المحافظ (بدونها يصل للعميل بالبحث الدقيق فقط)' },
-      { key: 'customers.manage', label: 'تعديل بيانات العملاء وحذفهم' },
+      { key: 'customers.manage', label: 'تعديل بيانات العملاء' },
+      { key: 'customers.delete', label: 'حذف حسابات العملاء نهائيًا' },
       { key: 'wallet.adjust', label: 'تعديل أرصدة المحافظ ضمن الحد اليومي' },
       { key: 'wallet.adjust_unlimited', label: 'تعديل أرصدة المحافظ فوق الحد اليومي' },
       { key: 'wallet.adjust_self', label: 'تعديل رصيد محفظته الشخصية' },
@@ -163,11 +171,14 @@ export const PERMISSION_GROUPS = [
     items: [
       { key: 'loyalty.view', label: 'عرض برنامج الولاء ونقاط العملاء' },
       { key: 'loyalty.manage', label: 'إدارة برنامج الولاء وقواعده وقسائمه' },
+      { key: 'loyalty.delete', label: 'حذف قواعد برنامج الولاء نهائيًا' },
       { key: 'loyalty.adjust', label: 'تعديل نقاط العملاء يدويًا ضمن الحد اليومي' },
       { key: 'loyalty.adjust_unlimited', label: 'تعديل نقاط العملاء فوق الحد اليومي' },
       { key: 'loyalty.adjust_self', label: 'تعديل نقاطه الشخصية' },
       { key: 'coupons.manage', label: 'إدارة الكوبونات' },
+      { key: 'coupons.delete', label: 'حذف الكوبونات نهائيًا' },
       { key: 'offers.manage', label: 'إدارة العروض الترويجية التي تظهر عند فتح التطبيق' },
+      { key: 'offers.delete', label: 'حذف العروض الترويجية نهائيًا' },
     ],
   },
   {
@@ -175,10 +186,12 @@ export const PERMISSION_GROUPS = [
     items: [
       { key: 'employees.view', label: 'عرض الموظفين والوظائف والرتب' },
       { key: 'employees.manage', label: 'إدارة الموظفين والوظائف والرتب' },
+      { key: 'employees.delete', label: 'حذف حسابات الموظفين والسائقين والرتب والوظائف نهائيًا' },
       { key: 'employees.discipline', label: 'البت في طلبات تخلي الطاقم عن الرحلات وتسجيل الجزاءات على الموظفين' },
       { key: 'settings.manage', label: 'تعديل إعدادات النظام' },
       { key: 'integrations.manage', label: 'إدارة مفاتيح الخدمات الخارجية والتكاملات' },
       { key: 'audit.view', label: 'عرض سجل العمليات' },
+      { key: 'system.reset', label: 'تصفير بيانات النظام وحذفها نهائيًا (بكلمة المرور)' },
     ],
   },
   {
@@ -196,6 +209,7 @@ export const PERMISSION_GROUPS = [
       { key: 'payroll.approve', label: 'اعتماد مسيّر الرواتب ومخالصات نهاية الخدمة' },
       { key: 'payroll.pay', label: 'تسجيل صرف الرواتب والمخالصات وتصدير ملف البنك' },
       { key: 'settlements.manage', label: 'إعداد مخالصة نهاية الخدمة' },
+      { key: 'hr.delete', label: 'حذف وثائق الموظفين وسجلات رواتبهم ومسودات مسيّرات الرواتب والمخالصات نهائيًا' },
     ],
   },
   {
@@ -205,6 +219,7 @@ export const PERMISSION_GROUPS = [
       { key: 'notifications.send', label: 'إرسال إشعارات لموظفي الأقسام التي يملك صلاحية فيها' },
       { key: 'notifications.log', label: 'عرض سجل إرسال واتساب وحالة التسليم' },
       { key: 'notifications.campaigns', label: 'إرسال الرسائل والعروض لمجموعات العملاء' },
+      { key: 'notifications.delete', label: 'حذف مسودات الرسائل لمجموعات العملاء نهائيًا' },
       { key: 'notifications.campaigns_unlimited', label: 'إرسال حملة لعدد عملاء فوق الحد المحدد في الإعدادات' },
       { key: 'notifications.stations', label: 'عرض مسار الرحلات وإرسال تنبيهات المحطات يدويًا' },
     ],

@@ -720,7 +720,7 @@ export class UsersController {
   }
 
   @Delete(':id')
-  @RequirePermission('customers.manage', 'employees.manage')
+  @RequirePermission('customers.delete', 'employees.delete')
   @ApiOperation({ summary: 'Delete a customer or employee' })
   async deleteUser(@Req() req, @Param('id') id: string) {
     return this.usersService.deleteUser(req.user, id);

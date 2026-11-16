@@ -486,14 +486,13 @@ class TrackingService {
     const now = Date.now();
     const start = trip.departureTime.getTime();
     const end = trip.arrivalTime.getTime();
-    // The crew's word beats the timetable, which cannot know about a delay.
+    // Only the crew's word moves the trip: it starts when the supervisor (or the office) starts it, never by the clock.
     const stage =
       trip.tripStatus === 'CANCELLED' ? 'CANCELLED'
-        : trip.liveStatus === 'ARRIVED' ? 'ARRIVED'
-        : trip.liveStatus === 'ON_ROAD' ? 'IN_PROGRESS'
-        : now < start ? 'NOT_STARTED'
-          : now < end ? 'IN_PROGRESS'
-            : 'ARRIVED';
+        : trip.liveStatus === 'ARRIVED' || trip.tripStatus === 'COMPLETED' ? 'ARRIVED'
+        : trip.liveStatus === 'STOPPED' ? 'STOPPED'
+        : trip.liveStatus === 'ON_ROAD' || trip.liveStatus === 'AT_POINT' ? 'IN_PROGRESS'
+          : 'NOT_STARTED';
 
     // Stop times carry no date, so each is read as the first time that clock comes round after departure; a night trip passes midnight.
     const departureClock = clockMinutes(new Date(start + RIYADH_OFFSET_MS).toISOString().slice(11, 16));
@@ -568,7 +567,7 @@ class TrackingService {
         return mine && position ? Math.round(distanceInMeters(position, { lat: mine.lat!, lng: mine.lng! }) / 100) / 10 : null;
       })(),
       // Share of the scheduled time elapsed, not of the road; distance needs a mapped route.
-      scheduleProgress: stage === 'ARRIVED' ? 100 : stage === 'IN_PROGRESS' ? Math.round(((now - start) / (end - start)) * 100) : 0,
+      scheduleProgress: stage === 'ARRIVED' ? 100 : stage === 'IN_PROGRESS' ? Math.min(99, Math.max(0, Math.round(((now - start) / (end - start)) * 100))) : 0,
       stops,
       nextStop,
       supervisor: supervisor ? { name: supervisor.name, phone: showContact ? supervisor.phone : null } : null,

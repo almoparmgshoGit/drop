@@ -22,6 +22,7 @@ import { ServicesModule } from './modules/services/services.module';
 import { CouponsModule } from './modules/coupons/coupons.module';
 import { OffersModule } from './modules/offers/offers.module';
 import { SettingsModule } from './modules/settings/settings.module';
+import { SystemResetModule } from './modules/system-reset/system-reset.module';
 import { DashboardModule } from './modules/dashboard/dashboard.module';
 import { ManifestsModule } from './modules/manifests/manifests.module';
 import { HotelsModule } from './modules/hotels/hotels.module';
@@ -76,6 +77,7 @@ import { BulkModule } from './modules/bulk/bulk.module';
     CouponsModule,
     OffersModule,
     SettingsModule,
+    SystemResetModule,
     DashboardModule,
     ManifestsModule,
     HotelsModule,

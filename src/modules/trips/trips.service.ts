@@ -452,14 +452,14 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
     const now = Date.now();
     const graceHours = await this.appSettings.number('trackingClosesAfterHours');
     // A late bus the crew still reports as moving stays open, so they can still report its arrival; only a bus gone silent long past the limit is closed.
+    // A trip nobody started is never completed by the clock: it stays "not started" for the office to start or cancel.
     const completed = await this.prisma.trip.updateMany({
       where: {
         tripStatus: 'PUBLISHED',
         OR: [
           // Arrival completes a trip at once; this also closes any left open from before that rule.
           { liveStatus: 'ARRIVED' },
-          { arrivalTime: { lt: new Date(now) }, liveStatus: { notIn: ['AT_POINT', 'ON_ROAD'] } },
-          { arrivalTime: { lt: new Date(now - graceHours * 60 * 60 * 1000) } },
+          { arrivalTime: { lt: new Date(now - graceHours * 60 * 60 * 1000) }, liveStatus: { in: ['AT_POINT', 'ON_ROAD'] } },
         ],
       },
       data: { tripStatus: 'COMPLETED' },

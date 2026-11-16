@@ -127,7 +127,7 @@ export class TripsController {
   }
 
   @Post('series/far-drafts/delete')
-  @RequirePermission('trips.manage')
+  @RequirePermission('trips.delete')
   @ApiBearerAuth()
   @ApiOperation({ summary: 'Admin only: delete unbooked weekly drafts beyond next month, left by the old year-ahead drafting' })
   async deleteFarFutureDrafts(@Req() req) {
@@ -244,7 +244,7 @@ export class TripsController {
   }
 
   @Delete(':id')
-  @RequirePermission('trips.manage')
+  @RequirePermission('trips.delete')
   @ApiBearerAuth()
   @ApiOperation({ summary: 'Delete trip without bookings' })
   async deleteTrip(@Param('id') id: string) {

@@ -195,6 +195,7 @@ export class CampaignsController {
   }
 
   @Delete(':id')
+  @RequirePermission('notifications.delete')
   @ApiOperation({ summary: 'Delete a draft' })
   remove(@Param('id') id: string) {
     return this.campaigns.remove(id);

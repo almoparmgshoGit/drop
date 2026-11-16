@@ -24,10 +24,12 @@ export type InspectedRow = { id: string; name: string; hidden: boolean; blockers
 export type BulkActor = { userId: string; role: string; permissions: string[]; name?: string | null };
 
 type Handler = {
-  /** Any one of these opens the table's actions; hide and remove may ask for their own. */
+  /** Any one of these opens the table's actions; hide and unlink may ask for their own. */
   permission: string | string[];
   hidePermission?: string[];
-  removePermission?: string[];
+  unlinkPermission?: string[];
+  /** Deleting for good needs this one alone, whatever else the employee holds. */
+  deletePermission: string;
   inspect(ids: string[]): Promise<InspectedRow[]>;
   /** Deletes one row already found free of blockers. */
   remove(id: string, actor: BulkActor): Promise<void>;
@@ -66,11 +68,16 @@ export class BulkService {
     };
   }
 
-  private handler(entity: string, actor: BulkActor, action?: 'hide' | 'remove') {
+  private handler(entity: string, actor: BulkActor, action?: 'hide' | 'unlink' | 'delete') {
     if (!(BULK_ENTITIES as readonly string[]).includes(entity)) throw new NotFoundException('نوع غير معروف');
     const handler = this.handlers[entity as BulkEntity];
     const base = Array.isArray(handler.permission) ? handler.permission : [handler.permission];
-    const needed = (action === 'hide' && handler.hidePermission) || (action === 'remove' && handler.removePermission) || base;
+    // Looking rows over (the delete dialog's first step) is open to whoever may act on the table or delete from it.
+    const needed =
+      (action === 'delete' && [handler.deletePermission]) ||
+      (action === 'hide' && handler.hidePermission) ||
+      (action === 'unlink' && handler.unlinkPermission) ||
+      (action ? base : [...base, handler.deletePermission]);
     if (!needed.some((permission) => actor.permissions?.includes(permission))) throw new ForbiddenException('ليست لديك صلاحية لتنفيذ هذا الإجراء');
     return handler;
   }
@@ -91,7 +98,7 @@ export class BulkService {
    * goes, so a booking made since the dialog opened still keeps its trip.
    */
   async remove(entity: string, actor: BulkActor, ids: string[]) {
-    const handler = this.handler(entity, actor, 'remove');
+    const handler = this.handler(entity, actor, 'delete');
     const rows = await handler.inspect(this.ids(ids));
     const deleted: string[] = [];
     const skipped: { id: string; name: string; reason: string }[] = [];
@@ -118,7 +125,7 @@ export class BulkService {
   }
 
   async unlink(entity: string, actor: BulkActor, id: string, key: string) {
-    const handler = this.handler(entity, actor, 'remove');
+    const handler = this.handler(entity, actor, 'unlink');
     const [row] = await handler.inspect([id]);
     if (!row) throw new NotFoundException('العنصر غير موجود');
     if (!handler.unlink || !row.blockers.some((b) => b.unlink === key)) throw new BadRequestException('لا يمكن إلغاء هذا الربط من هنا');
@@ -133,6 +140,7 @@ export class BulkService {
     const prisma = this.prisma;
     return {
       permission: 'trips.manage',
+      deletePermission: 'trips.delete',
       inspect: async (ids) => {
         const trips = await prisma.trip.findMany({
           where: { id: { in: ids } },
@@ -196,6 +204,7 @@ export class BulkService {
     const prisma = this.prisma;
     return {
       permission: 'bookings.manage_records',
+      deletePermission: 'bookings.delete',
       inspect: async (ids) => {
         const bookings = await prisma.booking.findMany({
           where: { id: { in: ids } },
@@ -244,6 +253,7 @@ export class BulkService {
     const prisma = this.prisma;
     return {
       permission: 'packages.manage',
+      deletePermission: 'packages.delete',
       inspect: async (ids) => {
         const packages = await prisma.package.findMany({
           where: { id: { in: ids } },
@@ -284,6 +294,7 @@ export class BulkService {
     const prisma = this.prisma;
     return {
       permission: 'offers.manage',
+      deletePermission: 'offers.delete',
       inspect: async (ids) => {
         const offers = await prisma.promoOffer.findMany({ where: { id: { in: ids } }, select: { id: true, title: true, isActive: true } });
         return offers.map((offer) => ({ id: offer.id, name: offer.title, hidden: !offer.isActive, blockers: [] }));
@@ -304,6 +315,7 @@ export class BulkService {
     const prisma = this.prisma;
     return {
       permission: 'coupons.manage',
+      deletePermission: 'coupons.delete',
       inspect: async (ids) => {
         const coupons = await prisma.coupon.findMany({
           where: { id: { in: ids } },
@@ -341,6 +353,7 @@ export class BulkService {
     const prisma = this.prisma;
     return {
       permission: 'hotels.manage',
+      deletePermission: 'hotels.delete',
       inspect: async (ids) => {
         const hotels = await prisma.hotel.findMany({
           where: { id: { in: ids } },
@@ -377,6 +390,7 @@ export class BulkService {
     const prisma = this.prisma;
     return {
       permission: 'buses.manage',
+      deletePermission: 'buses.delete',
       inspect: async (ids) => {
         const now = new Date();
         const buses = await prisma.bus.findMany({
@@ -429,6 +443,7 @@ export class BulkService {
     const prisma = this.prisma;
     return {
       permission: 'branches.manage',
+      deletePermission: 'branches.delete',
       inspect: async (ids) => {
         const branches = await prisma.branch.findMany({
           where: { id: { in: ids } },
@@ -491,7 +506,8 @@ export class BulkService {
     return {
       permission: customers ? ['customers.block', 'customers.manage'] : 'employees.manage',
       hidePermission: customers ? ['customers.block'] : ['employees.manage'],
-      removePermission: customers ? ['customers.manage'] : ['employees.manage'],
+      unlinkPermission: customers ? ['customers.manage'] : ['employees.manage'],
+      deletePermission: customers ? 'customers.delete' : 'employees.delete',
       inspect: async (ids) => {
         const people = await prisma.user.findMany({
           where: { id: { in: ids }, role: customers ? 'PASSENGER' : { not: 'PASSENGER' } },
@@ -546,6 +562,8 @@ export class BulkService {
     const prisma = this.prisma;
     return {
       permission: 'buses.manage',
+      // A driver is an employee account, and the users service asks for the employees' delete permission too.
+      deletePermission: 'employees.delete',
       inspect: async (ids) => {
         const drivers = await prisma.user.findMany({
           where: { id: { in: ids }, driverProfile: { isNot: null } },
@@ -595,6 +613,7 @@ export class BulkService {
     const prisma = this.prisma;
     return {
       permission: 'buses.accounts',
+      deletePermission: 'buses.delete',
       inspect: async (ids) => {
         const offices = await prisma.busOffice.findMany({
           where: { id: { in: ids } },
@@ -628,6 +647,7 @@ export class BulkService {
     const prisma = this.prisma;
     return {
       permission: 'loyalty.manage',
+      deletePermission: 'loyalty.delete',
       inspect: async (ids) => {
         const rules = await prisma.loyaltyRule.findMany({ where: { id: { in: ids } }, select: { id: true, name: true, isActive: true } });
         // Bookings keep the terms they were made under, so a rule never holds anything back.

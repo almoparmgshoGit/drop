@@ -168,6 +168,7 @@ class CouponsController {
   }
 
   @Delete(':id')
+  @RequirePermission('coupons.delete')
   @ApiOperation({ summary: 'Delete coupon' })
   remove(@Param('id') id: string) {
     return this.coupons.remove(id);

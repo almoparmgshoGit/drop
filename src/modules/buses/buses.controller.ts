@@ -57,7 +57,7 @@ export class BusesController {
   }
 
   @Delete('maintenance/:logId')
-  @RequirePermission('buses.manage')
+  @RequirePermission('buses.delete')
   @ApiOperation({ summary: 'Delete a maintenance entry' })
   async deleteMaintenance(@Param('logId') logId: string) {
     return this.maintenanceService.remove(logId);
@@ -85,7 +85,7 @@ export class BusesController {
   }
 
   @Delete(':id')
-  @RequirePermission('buses.manage')
+  @RequirePermission('buses.delete')
   @ApiOperation({ summary: 'Delete bus' })
   async deleteBus(@Param('id') id: string) {
     return this.busesService.deleteBus(id);

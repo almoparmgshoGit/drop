@@ -183,7 +183,7 @@ export class HrEmployeesController {
   }
 
   @Delete('documents/:id')
-  @RequirePermission('hr.manage', 'employees.manage')
+  @RequirePermission('hr.delete')
   @ApiOperation({ summary: 'Remove a filed document' })
   removeDocument(@Req() req, @Param('id') id: string) {
     return this.documents.remove(req.user, id);
@@ -238,7 +238,7 @@ export class HrEmployeesController {
   }
 
   @Delete(':userId/salaries/:salaryId')
-  @RequirePermission('hr.manage')
+  @RequirePermission('hr.delete')
   @ApiOperation({ summary: 'Remove a salary row no approved payroll used' })
   removeSalary(@Req() req, @Param('userId') userId: string, @Param('salaryId') salaryId: string) {
     assertSalaries(req.user);
@@ -518,7 +518,7 @@ export class PayrollController {
   }
 
   @Delete(':id')
-  @RequirePermission('payroll.prepare')
+  @RequirePermission('hr.delete')
   @ApiOperation({ summary: 'Delete a draft payroll' })
   remove(@Param('id') id: string) {
     return this.payroll.remove(id);
@@ -614,7 +614,7 @@ export class SettlementsController {
   }
 
   @Delete(':id')
-  @RequirePermission('settlements.manage')
+  @RequirePermission('hr.delete')
   @ApiOperation({ summary: 'Delete a draft settlement' })
   remove(@Req() req, @Param('id') id: string) {
     return this.settlements.remove(req.user, id);

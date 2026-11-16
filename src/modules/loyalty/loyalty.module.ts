@@ -304,7 +304,7 @@ class LoyaltyController {
   }
 
   @Delete('rules/:id')
-  @RequirePermission('loyalty.manage')
+  @RequirePermission('loyalty.delete')
   @ApiOperation({ summary: 'Delete an earning rule; bookings keep the terms they were made under' })
   removeRule(@Param('id') id: string) {
     return this.admin.removeRule(id);

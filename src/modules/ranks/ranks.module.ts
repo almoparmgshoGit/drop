@@ -245,7 +245,7 @@ class RanksController {
   }
 
   @Delete(':id')
-  @RequirePermission('employees.manage')
+  @RequirePermission('employees.delete')
   @ApiOperation({ summary: 'Delete a rank that no employee holds' })
   remove(@Req() req, @Param('id') id: string) {
     return this.ranks.remove(req.user, id);
@@ -280,7 +280,7 @@ class JobTypesController {
   }
 
   @Delete(':id')
-  @RequirePermission('employees.manage')
+  @RequirePermission('employees.delete')
   @ApiOperation({ summary: 'Delete a job type that no rank uses' })
   remove(@Param('id') id: string) {
     return this.ranks.removeJob(id);

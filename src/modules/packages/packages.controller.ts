@@ -233,7 +233,7 @@ export class PackagesController {
   }
 
   @Delete(':id')
-  @RequirePermission('packages.manage')
+  @RequirePermission('packages.delete')
   @ApiBearerAuth()
   @ApiOperation({ summary: 'Delete package' })
   async deletePackage(@Param('id') id: string) {

@@ -226,6 +226,8 @@ enum TripLiveStatus {
   AT_POINT
   ON_ROAD
   ARRIVED
+  /// Stopped by the office after it started; resuming puts it back where the crew last reported it.
+  STOPPED
 }
 
 enum TripReportCategory {

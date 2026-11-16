@@ -223,6 +223,17 @@ describe('Ranks and permissions', () => {
       await request(http()).put(`${API}/users/${passenger.user.id}`).set(auth).send({ password: 'attacker-controlled-pw' }).expect(403);
       await request(http()).put(`${API}/users/${passenger.user.id}`).set(auth).send({ rankId: 'rank-driver' }).expect(403);
     });
+
+    it('deletes accounts for good only with the delete permission of their kind', async () => {
+      const editor = await employeeWith(['customers.manage', 'employees.manage']);
+      const staffDeleter = await employeeWith(['employees.delete']);
+      const deleter = await employeeWith(['customers.delete']);
+      const passenger = await loginPassenger(app);
+      await request(http()).delete(`${API}/users/${passenger.user.id}`).set(editor.auth).expect(403);
+      await request(http()).delete(`${API}/users/${passenger.user.id}`).set(staffDeleter.auth).expect(403);
+      await request(http()).post(`${API}/bulk/customers/delete`).set(editor.auth).send({ ids: [passenger.user.id] }).expect(403);
+      await request(http()).delete(`${API}/users/${passenger.user.id}`).set(deleter.auth).expect(200);
+    });
   });
 
   describe('email accounts', () => {

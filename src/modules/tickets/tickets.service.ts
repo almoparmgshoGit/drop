@@ -17,6 +17,7 @@ import { formatRiyadhDate, formatRiyadhTime } from '../../common/utils/time.util
 import { returningBookingIds } from '../../common/utils/linked-seats.util';
 import { paymentFigures } from '../../common/utils/payment.util';
 import { TICKET_BOARDING_TRIP_SELECT, ticketBoarding } from '../../common/utils/ticket-boarding.util';
+import { inTravelOrder } from '../../common/utils/trip-route.util';
 import { signPaperCode, verifyPaperCode, verifyTicketToken } from '../../common/utils/ticket-token.util';
 import { PROFILE_ACCOUNT_SELECT, PROFILE_PASSENGER_SELECT, passengerProfiles } from '../../common/utils/passenger-profile.util';
 
@@ -416,9 +417,11 @@ export class TicketsService {
   }
 
   /** The crew's word on where the bus is: passengers follow it, and the scanner checks tickets against it. */
-  async updateLiveStatus(actor: Actor, tripId: string, status: TripLiveStatus, boardingPointId?: string) {
-    await this.assertAssigned(actor, tripId);
+  async updateLiveStatus(actor: Actor, tripId: string, status: TripLiveStatus, boardingPointId?: string, options: { isStart?: boolean; fromOffice?: boolean } = {}) {
+    // The office starts a trip from the dashboard under its own permission; it is neither on the crew nor held to the crew's schedule.
+    if (!options.fromOffice) await this.assertAssigned(actor, tripId);
     if (status === 'NOT_STARTED') throw new BadRequestException('لا يمكن إعادة الرحلة إلى ما قبل الانطلاق');
+    if (status === 'STOPPED') throw new BadRequestException('إيقاف الرحلة يتم من لوحة التحكم');
     if (status === 'AT_POINT' && !boardingPointId) throw new BadRequestException('اختر النقطة التي وصلت إليها الحافلة');
 
     return this.prisma.$transaction(async (tx) => {
@@ -430,7 +433,11 @@ export class TicketsService {
       });
       if (!trip) throw new NotFoundException('Trip not found');
       if (trip.tripStatus !== 'PUBLISHED') throw new ConflictException('لا يمكن تحديث حالة رحلة غير قائمة');
-      this.assertTripOpen(actor, trip);
+      if (!options.fromOffice) this.assertTripOpen(actor, trip);
+      // A trip starts only when the supervisor presses "start" or the office starts it; time alone never starts it.
+      if (options.isStart && trip.liveStatus !== 'NOT_STARTED') throw new ConflictException('بدأت هذه الرحلة بالفعل');
+      if (trip.liveStatus === 'STOPPED') throw new ConflictException('هذه الرحلة موقوفة من الإدارة، ولا تتغير حالتها حتى تُعاد');
+      if (!options.isStart && trip.liveStatus === 'NOT_STARTED') throw new ConflictException('ابدأ الرحلة أولًا من زر "ابدأ الرحلة"');
 
       const point = status === 'AT_POINT' ? await tx.boardingPoint.findFirst({ where: { id: boardingPointId, tripId } }) : null;
       if (status === 'AT_POINT' && !point) throw new BadRequestException('هذه النقطة لا تخص هذه الرحلة');
@@ -478,6 +485,67 @@ export class TicketsService {
       const statusText = status === 'AT_POINT' ? `الحافلة في ${point!.name}` : status === 'ON_ROAD' ? 'الحافلة في الطريق' : `الحافلة وصلت إلى ${trip.destination}`;
       await this.notifications.toTripCrew(tx, 'CREW_TRIP_STATUS_CHANGED', tripId, { exceptUserId: actor.userId, extra: { senderName: actorUser?.name, currentPoint: statusText } });
       return { liveStatus: status, currentBoardingPointId: pointId, changed: true };
+    }, { maxWait: 10_000, timeout: 30_000 });
+  }
+
+  /**
+   * Starts the trip: the bus is put at its first gathering point (or on the road when the trip has none), which tells the
+   * passengers and opens scanning there. Only the trip's crew from the app, or the office from the dashboard, can do it.
+   */
+  async startTrip(actor: Actor, tripId: string, options: { fromOffice?: boolean } = {}) {
+    if (!options.fromOffice) {
+      await this.assertAssigned(actor, tripId);
+      // Starting the trip is the supervisor's call; a driver on the trip does not start it.
+      const supervises = actor.role === 'ADMIN' || (await this.prisma.tripSupervisor.count({ where: { tripId, userId: actor.userId } })) > 0;
+      if (!supervises) throw new ForbiddenException('بدء الرحلة متاح لمشرف الرحلة أو من لوحة التحكم');
+    }
+    const trip = await this.prisma.trip.findUnique({ where: { id: tripId }, select: { boardingPoints: { select: { id: true, time: true } } } });
+    if (!trip) throw new NotFoundException('Trip not found');
+    const first = inTravelOrder(trip.boardingPoints)[0];
+    return this.updateLiveStatus(actor, tripId, first ? 'AT_POINT' : 'ON_ROAD', first?.id, { ...options, isStart: true });
+  }
+
+  /**
+   * The office stops a trip that has started: the crew can no longer move it, and it is never completed by the clock.
+   * It can be resumed from where the crew last reported it, or cancelled or deleted like any other trip.
+   */
+  async stopTrip(actor: Actor, tripId: string) {
+    return this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT "id" FROM "Trip" WHERE "id" = ${tripId} FOR UPDATE`;
+      const trip = await tx.trip.findUnique({ where: { id: tripId }, select: { tripStatus: true, liveStatus: true } });
+      if (!trip) throw new NotFoundException('Trip not found');
+      if (trip.tripStatus !== 'PUBLISHED' || (trip.liveStatus !== 'AT_POINT' && trip.liveStatus !== 'ON_ROAD')) {
+        throw new ConflictException('يمكن إيقاف الرحلة بعد انطلاقها وقبل وصولها فقط');
+      }
+      const actorUser = await tx.user.findUnique({ where: { id: actor.userId }, select: { name: true } });
+      await tx.trip.update({ where: { id: tripId }, data: { liveStatus: 'STOPPED', liveStatusAt: new Date() } });
+      await tx.tripStatusUpdate.create({ data: { tripId, status: 'STOPPED', actorId: actor.userId, actorName: actorUser?.name } });
+      this.realtime.tripChanged(tripId);
+      await this.notifications.toTripCrew(tx, 'CREW_TRIP_STATUS_CHANGED', tripId, { exceptUserId: actor.userId, extra: { senderName: actorUser?.name, currentPoint: 'الرحلة موقوفة من الإدارة' } });
+      return { liveStatus: 'STOPPED' as const };
+    }, { maxWait: 10_000, timeout: 30_000 });
+  }
+
+  /** Resumes a stopped trip where the crew last reported it, without telling the passengers again. */
+  async resumeTrip(actor: Actor, tripId: string) {
+    return this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT "id" FROM "Trip" WHERE "id" = ${tripId} FOR UPDATE`;
+      const trip = await tx.trip.findUnique({ where: { id: tripId }, select: { tripStatus: true, liveStatus: true, currentBoardingPointId: true } });
+      if (!trip) throw new NotFoundException('Trip not found');
+      if (trip.tripStatus !== 'PUBLISHED' || trip.liveStatus !== 'STOPPED') throw new ConflictException('هذه الرحلة غير موقوفة');
+      const last = await tx.tripStatusUpdate.findFirst({
+        where: { tripId, status: { in: ['AT_POINT', 'ON_ROAD'] } },
+        orderBy: { createdAt: 'desc' },
+        select: { status: true, boardingPointId: true, pointName: true },
+      });
+      const status = last?.status === 'AT_POINT' && trip.currentBoardingPointId ? 'AT_POINT' : 'ON_ROAD';
+      const pointId = status === 'AT_POINT' ? trip.currentBoardingPointId : null;
+      const actorUser = await tx.user.findUnique({ where: { id: actor.userId }, select: { name: true } });
+      await tx.trip.update({ where: { id: tripId }, data: { liveStatus: status, liveStatusAt: new Date(), currentBoardingPointId: pointId } });
+      await tx.tripStatusUpdate.create({ data: { tripId, status, boardingPointId: pointId, pointName: status === 'AT_POINT' ? last?.pointName : null, actorId: actor.userId, actorName: actorUser?.name } });
+      this.realtime.tripChanged(tripId);
+      await this.notifications.toTripCrew(tx, 'CREW_TRIP_STATUS_CHANGED', tripId, { exceptUserId: actor.userId, extra: { senderName: actorUser?.name, currentPoint: 'أُعيد تشغيل الرحلة' } });
+      return { liveStatus: status, currentBoardingPointId: pointId };
     }, { maxWait: 10_000, timeout: 30_000 });
   }
 
