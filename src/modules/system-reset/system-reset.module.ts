@@ -1,4 +1,4 @@
-import { BadRequestException, Body, Controller, ForbiddenException, Get, HttpCode, Injectable, Module, Post, Req } from '@nestjs/common';
+import { BadRequestException, Body, Controller, ForbiddenException, Get, HttpCode, Injectable, Logger, Module, Post, Req } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { ArrayMaxSize, ArrayMinSize, IsArray, IsIn, IsString, MaxLength } from 'class-validator';
 import * as argon2 from 'argon2';
@@ -224,6 +224,8 @@ class ConfirmResetDto extends ResetDto {
 
 @Injectable()
 export class SystemResetService {
+  private logger = new Logger('SystemReset');
+
   constructor(private prisma: PrismaService) {}
 
   list() {
@@ -372,20 +374,38 @@ export class SystemResetService {
 
     const groups = this.resolveGroups(dto.groups);
     const plan = this.plan(groups, await this.foreignKeys());
-    const deleted = await this.prisma.$transaction(
-      async (tx) => {
-        await tx.$executeRawUnsafe(`SET LOCAL statement_timeout = 0`);
-        for (const statement of plan.unlink) await tx.$executeRawUnsafe(statement);
-        const result: { table: string; label: string; count: number }[] = [];
-        for (const table of plan.order) {
-          const count = await tx.$executeRawUnsafe(`DELETE FROM ${quote(table)} WHERE ${plan.where.get(table)}`);
-          if (count > 0) result.push({ table, label: TABLE_LABELS[table] ?? table, count });
-        }
-        for (const statement of plan.after) await tx.$executeRawUnsafe(statement);
-        return result;
-      },
-      { maxWait: 10_000, timeout: 15 * 60_000 },
-    );
+    // The guards that keep financial records append-only (invoices, cash movements, closed sessions, approved payrolls…)
+    // reject every delete, so they are switched off for this transaction only. ALTER TABLE is transactional: they come
+    // back on at the end, and on any failure the rollback restores them along with every row.
+    const guarded = (
+      await this.prisma.$queryRawUnsafe<{ table: string }[]>(`
+        SELECT DISTINCT c.relname AS table FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+        WHERE NOT t.tgisinternal AND c.relnamespace = 'public'::regnamespace`)
+    ).map((row) => row.table);
+
+    let deleted: { table: string; label: string; count: number }[];
+    try {
+      deleted = await this.prisma.$transaction(
+        async (tx) => {
+          await tx.$executeRawUnsafe(`SET LOCAL statement_timeout = 0`);
+          for (const table of guarded) await tx.$executeRawUnsafe(`ALTER TABLE ${quote(table)} DISABLE TRIGGER USER`);
+          for (const statement of plan.unlink) await tx.$executeRawUnsafe(statement);
+          const result: { table: string; label: string; count: number }[] = [];
+          for (const table of plan.order) {
+            const count = await tx.$executeRawUnsafe(`DELETE FROM ${quote(table)} WHERE ${plan.where.get(table)}`);
+            if (count > 0) result.push({ table, label: TABLE_LABELS[table] ?? table, count });
+          }
+          for (const statement of plan.after) await tx.$executeRawUnsafe(statement);
+          for (const table of guarded) await tx.$executeRawUnsafe(`ALTER TABLE ${quote(table)} ENABLE TRIGGER USER`);
+          return result;
+        },
+        { maxWait: 10_000, timeout: 15 * 60_000 },
+      );
+    } catch (err: any) {
+      this.logger.error(`System reset failed: ${err?.message}`, err?.stack);
+      const reason = String(err?.meta?.message ?? err?.message ?? '').split('\n').filter(Boolean).pop()?.slice(0, 300);
+      throw new BadRequestException(`تعذّر التصفير ولم يُحذف شيء${reason ? `: ${reason}` : ''}`);
+    }
 
     const total = deleted.reduce((sum, row) => sum + row.count, 0);
     // Written by hand: the audit interceptor would copy the password from the request body.
