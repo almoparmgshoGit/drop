@@ -3,6 +3,7 @@ import { Prisma, RoomType } from '@prisma/client';
 import { riyadhDate } from './time.util';
 import { SERVICE_SELECT, withHotelServices } from './services.util';
 import { GALLERY_SELECT } from './gallery.util';
+import { privateRoomsNeeded } from './housing-price.util';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const RIYADH_OFFSET_MS = 3 * 60 * 60 * 1000;
@@ -36,6 +37,7 @@ export const CUSTOM_PACKAGE_SELECT = {
       isActive: true,
       offersSharedRoom: true,
       offersPrivateRoom: true,
+      privateRoomCapacity: true,
       services: SERVICE_SELECT,
       images: GALLERY_SELECT,
     },
@@ -57,8 +59,8 @@ export const customRoomOptions = (pkg: CustomPackage): RoomType[] => [
 ];
 
 /** Halalas for the stay: a shared room charges each person's bed, a private room is one price a night for the group. */
-export const customStayCharge = (pkg: CustomPackage, room: RoomType, persons: number, nights: number) =>
-  room === 'SHARED' ? halalas(pkg.nightlyBedPrice) * persons * nights : halalas(pkg.nightlyRoomPrice) * nights;
+export const customStayCharge = (pkg: CustomPackage, room: RoomType, persons: number, nights: number, privateRooms = 1) =>
+  room === 'SHARED' ? halalas(pkg.nightlyBedPrice) * persons * nights : halalas(pkg.nightlyRoomPrice) * nights * Math.max(1, privateRooms);
 
 /** What the app shows for a custom package: its route, hotel and nightly prices. */
 export function toPublicCustomPackage(pkg: CustomPackage) {
@@ -91,6 +93,7 @@ export function customPackageStay(
   outbound: { trip: JourneyTrip; seats: number },
   inbound: { trip: JourneyTrip; seats: number },
   roomChoice: RoomType | undefined,
+  privateRooms = 1,
 ) {
   const same = (a: string, b: string | null) => a.trim() === (b ?? '').trim();
   if (outbound.trip.package || inbound.trip.package) throw new BadRequestException('رحلات الباقة المصممة تكون من رحلات النقل، لا من باقة أخرى');
@@ -119,13 +122,15 @@ export function customPackageStay(
   if (roomChoice && !options.includes(roomChoice)) throw new BadRequestException('نوع الغرفة المختار غير متاح في هذه الباقة');
   const choice = roomChoice ?? (options.length === 1 ? options[0] : null);
   const persons = outbound.seats;
+  if (privateRooms > persons) throw new BadRequestException('عدد الغرف أكثر من عدد المسافرين');
+  const rooms = choice === 'PRIVATE' ? privateRooms : 1;
   const place = toPublicCustomPackage(pkg).hotel!;
   return {
     hotelId: pkg.hotel!.id,
     checkIn: new Date(`${checkIn}T00:00:00Z`),
     checkOut: new Date(`${checkOut}T00:00:00Z`),
     nights,
-    amount: choice ? customStayCharge(pkg, choice, persons, nights) : 0,
+    amount: choice ? customStayCharge(pkg, choice, persons, nights, rooms) : 0,
     details: {
       ...place,
       customPackageId: pkg.id,
@@ -135,7 +140,12 @@ export function customPackageStay(
       checkOut,
       options,
       choice,
-      optionAmounts: Object.fromEntries(options.map((room) => [room, sar(customStayCharge(pkg, room, persons, nights))])),
+      optionAmounts: Object.fromEntries(options.map((room) => [room, sar(customStayCharge(pkg, room, persons, nights, rooms))])),
+      // A group larger than a private room is told so, and may take more rooms, each at one room's price.
+      privateRoomCapacity: pkg.hotel?.privateRoomCapacity ?? null,
+      privateRoomsNeeded: privateRoomsNeeded(pkg.hotel?.privateRoomCapacity, persons),
+      privateRoomAmount: sar(customStayCharge(pkg, 'PRIVATE', persons, nights)),
+      privateRooms: rooms,
     },
   };
 }

@@ -34,6 +34,23 @@ type IntegrationField = {
 };
 
 const ROUTING_PROVIDER_KEY = 'routingProvider';
+export const WHATSAPP_PROVIDER_KEY = 'whatsappProvider';
+export const ULTRAMSG_PROVIDER = 'ultramsg';
+
+const WHATSAPP_OPTIONS: IntegrationOption[] = [
+  {
+    value: '',
+    label: 'WhatsApp Cloud API من Meta',
+    help: 'رسائل العملاء تخرج بقوالب يعتمدها Meta مسبقًا من صفحة الإشعارات، وإشعارات الموظفين لا تصل عبر واتساب.',
+    requires: [],
+  },
+  {
+    value: ULTRAMSG_PROVIDER,
+    label: 'UltraMsg (دون قوالب)',
+    help: 'يُرسل نص كل إشعار كما هو، للعملاء والموظفين، دون اعتماد قوالب. أنشئ Instance في ultramsg.com واربطه برقم الواتساب بمسح الـQR، ثم انسخ Instance ID والـToken.',
+    requires: ['ultramsgInstanceId', 'ultramsgToken'],
+  },
+];
 const DEFAULT_MAPBOX_STYLE = 'mapbox/streets-v12';
 const MAPBOX_ATTRIBUTION = '&copy; <a href="https://www.mapbox.com/about/maps/">Mapbox</a> &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>';
 
@@ -52,7 +69,7 @@ const ROUTING_OPTIONS: IntegrationOption[] = [
 export const INTEGRATION_GROUPS = [
   { id: 'maps', title: 'الخرائط والمواقع', description: 'خريطة التتبع في التطبيق وخريطة تحديد نقاط التجمع في اللوحة. يسري أي تغيير هنا فور الحفظ، ويظهر في التطبيق عند فتحه من جديد.' },
   { id: 'routing', title: 'حساب الطرق ووقت الوصول', description: 'يحسب الخادم وقت وصول الحافلة إلى محطة الراكب ويرسله إلى التطبيق، ولا يصل المفتاح إلى الأجهزة. يسري أي تغيير هنا فور الحفظ.' },
-  { id: 'whatsapp', title: 'واتساب أعمال', description: 'إشعارات العملاء وقوالبها عبر WhatsApp Cloud API من Meta، وتُدار من صفحة الإشعارات. ورمز دخول العملاء يُرسل عبر قالب المصادقة أدناه، ودونه لا يعمل دخول العملاء في الإنتاج.' },
+  { id: 'whatsapp', title: 'واتساب أعمال', description: 'الإشعارات عبر واتساب، وتُدار من صفحة الإشعارات. مع Meta تحتاج كل رسالة قالبًا معتمدًا ويُرسل رمز الدخول عبر قالب المصادقة، ومع UltraMsg يُرسل النص مباشرة دون قوالب. دون ربط مكتمل لا يعمل دخول العملاء في الإنتاج.' },
   { id: 'payments', title: 'بوابة الدفع', description: 'الدفع الإلكتروني من التطبيق.' },
   {
     id: 'push',
@@ -120,6 +137,27 @@ export const INTEGRATION_FIELDS: IntegrationField[] = [
   { key: 'mapboxAccessToken', group: 'routing', label: 'رمز Mapbox (Access Token)', secret: true, inUse: true, showFor: ['mapbox'], pattern: /^(pk|sk)\.\S+$/, patternMessage: 'رمز Mapbox يبدأ بـ pk. أو sk.' },
   // Keeps its original key, so a value saved before this group existed still works.
   { key: 'googleMapsApiKey', group: 'routing', label: 'مفتاح Google Maps', secret: true, inUse: true, showFor: ['google_essentials', 'google_pro'] },
+  {
+    key: WHATSAPP_PROVIDER_KEY,
+    group: 'whatsapp',
+    label: 'مزوّد واتساب',
+    secret: false,
+    inUse: true,
+    options: WHATSAPP_OPTIONS,
+    pattern: new RegExp(`^${ULTRAMSG_PROVIDER}$`),
+    patternMessage: 'مزوّد غير معروف',
+  },
+  {
+    key: 'ultramsgInstanceId',
+    group: 'whatsapp',
+    label: 'Instance ID من UltraMsg',
+    secret: false,
+    inUse: true,
+    showFor: [ULTRAMSG_PROVIDER],
+    pattern: /^instance\d{1,12}$/,
+    patternMessage: 'المعرّف بالشكل instance12345 كما في لوحة UltraMsg',
+  },
+  { key: 'ultramsgToken', group: 'whatsapp', label: 'Token من UltraMsg', secret: true, inUse: true, showFor: [ULTRAMSG_PROVIDER] },
   // Only Meta's own host: this address receives the access token, so a typo or a bad actor must not redirect it.
   {
     key: 'whatsappApiUrl',
@@ -127,21 +165,23 @@ export const INTEGRATION_FIELDS: IntegrationField[] = [
     label: 'إصدار واجهة Meta (اختياري)',
     secret: false,
     inUse: true,
+    showFor: [''],
     pattern: /^https:\/\/graph\.facebook\.com\/v\d+\.\d+$/,
     patternMessage: 'الرابط بالشكل https://graph.facebook.com/v23.0',
     help: 'فارغ يعني https://graph.facebook.com/v23.0.',
   },
-  { key: 'whatsappPhoneId', group: 'whatsapp', label: 'معرّف رقم الإرسال (Phone Number ID)', secret: false, inUse: true, pattern: /^\d{5,30}$/, patternMessage: 'المعرّف أرقام فقط' },
-  { key: 'whatsappBusinessAccountId', group: 'whatsapp', label: 'معرّف حساب الأعمال (WABA ID)', secret: false, inUse: true, pattern: /^\d{5,30}$/, patternMessage: 'المعرّف أرقام فقط', help: 'لإرسال القوالب للاعتماد ومعرفة حالتها.' },
-  { key: 'whatsappToken', group: 'whatsapp', label: 'رمز الوصول الدائم (System User Token)', secret: true, inUse: true },
-  { key: 'whatsappAppSecret', group: 'whatsapp', label: 'App Secret', secret: true, inUse: true, help: 'يثبت أن تحديثات حالة الرسائل قادمة من Meta فعلًا. دونه تُرفض كلها.' },
-  { key: 'whatsappWebhookVerifyToken', group: 'whatsapp', label: 'رمز التحقق من الـWebhook', secret: true, inUse: true, help: 'اختر نصًا طويلًا عشوائيًا والصقه نفسه في إعدادات Webhook عند Meta.' },
+  { key: 'whatsappPhoneId', group: 'whatsapp', label: 'معرّف رقم الإرسال (Phone Number ID)', secret: false, inUse: true, showFor: [''], pattern: /^\d{5,30}$/, patternMessage: 'المعرّف أرقام فقط' },
+  { key: 'whatsappBusinessAccountId', group: 'whatsapp', label: 'معرّف حساب الأعمال (WABA ID)', secret: false, inUse: true, showFor: [''], pattern: /^\d{5,30}$/, patternMessage: 'المعرّف أرقام فقط', help: 'لإرسال القوالب للاعتماد ومعرفة حالتها.' },
+  { key: 'whatsappToken', group: 'whatsapp', label: 'رمز الوصول الدائم (System User Token)', secret: true, inUse: true, showFor: [''] },
+  { key: 'whatsappAppSecret', group: 'whatsapp', label: 'App Secret', secret: true, inUse: true, showFor: [''], help: 'يثبت أن تحديثات حالة الرسائل قادمة من Meta فعلًا. دونه تُرفض كلها.' },
+  { key: 'whatsappWebhookVerifyToken', group: 'whatsapp', label: 'رمز التحقق من الـWebhook', secret: true, inUse: true, showFor: [''], help: 'اختر نصًا طويلًا عشوائيًا والصقه نفسه في إعدادات Webhook عند Meta.' },
   {
     key: 'whatsappOtpTemplate',
     group: 'whatsapp',
     label: 'اسم قالب رمز الدخول (Authentication)',
     secret: false,
     inUse: true,
+    showFor: [''],
     pattern: /^[a-z0-9_]{1,512}$/,
     patternMessage: 'اسم القالب كما في Meta: أحرف إنجليزية صغيرة وأرقام وشرطة سفلية',
     help: 'أنشئه في WhatsApp Manager من فئة Authentication مع زر "نسخ الرمز" (Copy code)، وانتظر اعتماده ثم الصق اسمه هنا. فارغ يعني أن دخول العملاء متوقف في الإنتاج.',
@@ -152,6 +192,7 @@ export const INTEGRATION_FIELDS: IntegrationField[] = [
     label: 'لغة قالب رمز الدخول (اختياري)',
     secret: false,
     inUse: true,
+    showFor: [''],
     pattern: /^[a-z]{2,3}(_[A-Z]{2})?$/,
     patternMessage: 'رمز اللغة كما في Meta، مثل ar أو en_US',
     help: 'فارغ يعني ar. يجب أن يطابق لغة القالب المعتمد.',

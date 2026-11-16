@@ -13,7 +13,7 @@ import { PrismaService } from '../../common/services/prisma.service';
 import { RealtimeService } from '../../common/services/realtime.service';
 import { EXPO_TOKEN_PATTERN, PushService } from '../../common/services/push.service';
 import { approvedWhatsAppTemplates, templateWording } from '../../common/services/notifications.service';
-import { WhatsAppError, WhatsAppService } from '../../common/services/whatsapp.service';
+import { toWhatsAppText, WhatsAppError, WhatsAppService } from '../../common/services/whatsapp.service';
 import { normalizeSaudiPhone } from '../../common/utils/phone.util';
 import { randomUUID } from 'crypto';
 
@@ -312,17 +312,27 @@ class NotificationsCenterService {
       );
     }
 
-    if (entry.audience === 'PASSENGER') results.push(await this.testWhatsApp(event, language, wording, values, recipient.phone, !!custom?.whatsappEnabled));
+    const freeText = await this.whatsapp.isFreeText();
+    if (entry.audience === 'PASSENGER' || freeText) results.push(await this.testWhatsApp(event, language, wording, values, recipient.phone, !!custom?.whatsappEnabled, freeText ? `${TEST_LABEL} ${renderTemplate(wording.title, values)}` : null));
 
     return { language, title, body, clientTrial: this.isClientTrial, results };
   }
 
   /** Sent straight to Meta instead of through the queue, so it shows at once and stays out of the delivery counts. */
-  private async testWhatsApp(event: NotificationEvent, language: MessageLanguage, wording: Wording, values: NotificationValues, phone: string, enabled: boolean): Promise<TestResult> {
+  /** freeTextTitle is set when the provider needs no template (UltraMsg): the text is sent as it is, saved or not. */
+  private async testWhatsApp(event: NotificationEvent, language: MessageLanguage, wording: Wording, values: NotificationValues, phone: string, enabled: boolean, freeTextTitle: string | null = null): Promise<TestResult> {
     const skip = (detail: string): TestResult => ({ channel: 'WHATSAPP', status: 'SKIPPED', detail });
     if (!enabled) return skip('واتساب غير مفعّل لهذا القالب');
     if (this.isClientTrial) return skip('النسخة التجريبية لا ترسل عبر واتساب');
     if (!(await this.whatsapp.isConfigured())) return skip('واتساب غير مربوط بعد');
+    if (freeTextTitle !== null) {
+      try {
+        await this.whatsapp.sendText(phone, toWhatsAppText(freeTextTitle, renderTemplate(wording.body, values)));
+        return { channel: 'WHATSAPP', status: 'SENT', detail: 'استلمه UltraMsg للإرسال' };
+      } catch (err) {
+        return { channel: 'WHATSAPP', status: 'FAILED', detail: err instanceof WhatsAppError ? err.message : 'تعذر الإرسال عبر واتساب' };
+      }
+    }
     // Only an approved copy of exactly this text can go out, so unsaved or unapproved wording is tested in the app only.
     const template = (await approvedWhatsAppTemplates(this.prisma, event, () => wording.body)).get(language);
     if (!template) return skip(`هذا النص باللغة ${LANGUAGE_NAMES[language]} غير معتمد من Meta بعد`);

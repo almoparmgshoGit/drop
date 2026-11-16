@@ -92,6 +92,10 @@ const VARIABLES = {
   supervisorPhone: { label: 'جوال مشرف الرحلة', example: '+966551234567' },
   boardingMapLink: { label: 'رابط موقع نقطة التجمع على الخريطة', example: 'https://www.google.com/maps/search/?api=1&query=24.7136,46.6753' },
   trackingLink: { label: 'رابط تتبع الحافلة للأهل', example: 'https://durobalhijrah.tech/track/AbC123' },
+  remittanceNumber: { label: 'رقم التوريد', example: 'TR-0006' },
+  remittanceMethod: { label: 'طريقة التوريد', example: 'تسليم نقدي للمالك' },
+  rejectReason: { label: 'سبب عدم الاستلام', example: 'لم يصلني أي مبلغ' },
+  monthName: { label: 'الشهر', example: 'نوفمبر 2026' },
 } as const;
 
 export type NotificationVariable = keyof typeof VARIABLES;
@@ -248,6 +252,19 @@ export const NOTIFICATION_CATALOG = {
     translations: {
       en: { title: 'We have responded to your complaint', body: 'Your complaint {{complaintReference}}: {{complaintResolution}}' },
       ur: { title: 'آپ کی شکایت کا جواب', body: 'آپ کی شکایت {{complaintReference}}: {{complaintResolution}}' },
+    },
+  },
+  CUSTOMER_COMPLAINT_REPLY: {
+    audience: 'PASSENGER',
+    group: 'الحجوزات',
+    label: 'رسالة من الدعم على شكوى',
+    trigger: 'عند رد موظف الدعم على شكوى العميل دون إغلاقها',
+    title: 'رد جديد على شكواك',
+    body: 'شكواك {{complaintReference}} ({{complaintCategory}}): {{complaintResolution}}',
+    variables: ['userName', 'complaintReference', 'complaintCategory', 'complaintResolution'],
+    translations: {
+      en: { title: 'New reply on your complaint', body: 'Your complaint {{complaintReference}}: {{complaintResolution}}' },
+      ur: { title: 'آپ کی شکایت پر نیا جواب', body: 'آپ کی شکایت {{complaintReference}}: {{complaintResolution}}' },
     },
   },
   HOTEL_COMPLAINT_RESOLVED: {
@@ -1201,6 +1218,32 @@ export const NOTIFICATION_CATALOG = {
       ur: { title: 'ایک چیٹ آپ کو منتقل کی گئی', body: '{{assignedBy}} نے کسٹمر {{customerName}} کی چیٹ آپ کو منتقل کی ہے۔ یہ آپ کو گفتگو میں ملے گی۔' },
     },
   },
+  COMPLAINT_ASSIGNED: {
+    audience: 'STAFF',
+    group: 'المحادثات',
+    label: 'إسناد تذكرة دعم إليك',
+    trigger: 'عند إسناد شكوى عميل (تذكرة دعم) إلى موظف',
+    title: 'أُسندت إليك التذكرة {{complaintReference}}',
+    body: 'أسند {{assignedBy}} إليك شكوى العميل {{customerName}} ({{complaintCategory}}). تجدها في «تذاكري» بصفحة الشكاوى.',
+    variables: ['userName', 'assignedBy', 'customerName', 'complaintReference', 'complaintCategory'],
+    translations: {
+      en: { title: 'Ticket {{complaintReference}} was assigned to you', body: '{{assignedBy}} assigned the complaint from {{customerName}} to you. Find it under My tickets.' },
+      ur: { title: 'ٹکٹ {{complaintReference}} آپ کو سونپا گیا', body: '{{assignedBy}} نے {{customerName}} کی شکایت آپ کو سونپی ہے۔' },
+    },
+  },
+  COMPLAINT_CUSTOMER_REPLIED: {
+    audience: 'STAFF',
+    group: 'المحادثات',
+    label: 'رد العميل على تذكرتك',
+    trigger: 'عند رد العميل على شكوى مسندة إلى الموظف',
+    title: 'رد العميل على التذكرة {{complaintReference}}',
+    body: 'كتب {{customerName}} ردًا جديدًا على شكواه ({{complaintCategory}}). افتحها من «تذاكري».',
+    variables: ['userName', 'customerName', 'complaintReference', 'complaintCategory'],
+    translations: {
+      en: { title: 'Customer replied on {{complaintReference}}', body: '{{customerName}} replied on their complaint. Open it from My tickets.' },
+      ur: { title: 'گاہک نے {{complaintReference}} پر جواب دیا', body: '{{customerName}} نے اپنی شکایت پر جواب دیا ہے۔' },
+    },
+  },
   CUSTODY_ISSUED: {
     audience: 'STAFF',
     group: 'الصندوق والعهد',
@@ -1264,6 +1307,84 @@ export const NOTIFICATION_CATALOG = {
     translations: {
       en: { title: 'Different opening balance', body: '{{senderName}} opened the {{branchName}} cash box with {{amount}}, while the last closing was {{carriedAmount}}.' },
       ur: { title: 'مختلف ابتدائی بیلنس', body: '{{senderName}} نے {{branchName}} کا کیش باکس {{amount}} کے ساتھ کھولا، جبکہ آخری بندش {{carriedAmount}} پر ہوئی تھی۔' },
+    },
+  },
+  REMITTANCE_SUBMITTED: {
+    audience: 'STAFF',
+    group: 'التوريدات والتصفية',
+    label: 'توريد بانتظار تأكيد المالك',
+    trigger: 'عند إنشاء توريد من صناديق فرع مقفلة',
+    title: 'توريد {{remittanceNumber}} بانتظار تأكيدك',
+    body: 'أرسل {{senderName}} توريدًا بمبلغ {{amount}} من {{branchName}} ({{remittanceMethod}}). أكّد استلامه من صفحة المالك.',
+    variables: ['userName', 'senderName', 'branchName', 'remittanceNumber', 'remittanceMethod', 'amount'],
+    translations: {
+      en: { title: 'Remittance {{remittanceNumber}} awaits your confirmation', body: '{{senderName}} sent a remittance of {{amount}} from {{branchName}} ({{remittanceMethod}}). Confirm it from the owner page.' },
+      ur: { title: 'ترسیل {{remittanceNumber}} آپ کی تصدیق کی منتظر', body: '{{senderName}} نے {{branchName}} سے {{amount}} کی ترسیل بھیجی ({{remittanceMethod}})۔ مالک کے صفحے سے اس کی تصدیق کریں۔' },
+    },
+  },
+  REMITTANCE_REJECTED: {
+    audience: 'STAFF',
+    group: 'التوريدات والتصفية',
+    label: 'المالك لم يستلم التوريد',
+    trigger: 'عند إفادة المالك بعدم استلام توريد، لمن أنشأه ولمطابقي البنك',
+    title: 'لم يُستلم التوريد {{remittanceNumber}}',
+    body: 'أفاد {{senderName}} بعدم استلام التوريد {{remittanceNumber}} بمبلغ {{amount}} من {{branchName}}. السبب: {{rejectReason}}. يُحمَّل المبلغ على من أنشأه حتى يُبرَّر.',
+    variables: ['userName', 'senderName', 'branchName', 'remittanceNumber', 'amount', 'rejectReason'],
+    translations: {
+      en: { title: 'Remittance {{remittanceNumber}} not received', body: '{{senderName}} reported not receiving remittance {{remittanceNumber}} of {{amount}} from {{branchName}}. Reason: {{rejectReason}}. It is charged to its creator until explained.' },
+      ur: { title: 'ترسیل {{remittanceNumber}} موصول نہیں ہوئی', body: '{{senderName}} نے بتایا کہ {{branchName}} سے {{amount}} کی ترسیل {{remittanceNumber}} موصول نہیں ہوئی۔ وجہ: {{rejectReason}}۔ وضاحت تک یہ بنانے والے کے ذمے ہے۔' },
+    },
+  },
+  REMITTANCE_DIFFERENCE: {
+    audience: 'STAFF',
+    group: 'التوريدات والتصفية',
+    label: 'فرق بين المعلن والمستلم في توريد',
+    trigger: 'عند تأكيد استلام أو مطابقة توريد بمبلغ يختلف عن المعلن',
+    title: 'فرق في التوريد {{remittanceNumber}}',
+    body: 'أُعلن في التوريد {{remittanceNumber}} من {{branchName}} مبلغ {{amount}} والمستلم يختلف بفرق {{differenceAmount}}. يُحمَّل الفرق على من أنشأه حتى يُبرَّر.',
+    variables: ['userName', 'branchName', 'remittanceNumber', 'amount', 'differenceAmount'],
+    translations: {
+      en: { title: 'Difference in remittance {{remittanceNumber}}', body: 'Remittance {{remittanceNumber}} from {{branchName}} declared {{amount}}, and what was received differs by {{differenceAmount}}. It is charged to its creator until explained.' },
+      ur: { title: 'ترسیل {{remittanceNumber}} میں فرق', body: '{{branchName}} سے ترسیل {{remittanceNumber}} میں {{amount}} بتایا گیا اور موصول رقم میں {{differenceAmount}} کا فرق ہے۔ وضاحت تک یہ بنانے والے کے ذمے ہے۔' },
+    },
+  },
+  CASH_UNREMITTED_ALERT: {
+    audience: 'STAFF',
+    group: 'التوريدات والتصفية',
+    label: 'نقد بقي في الصندوق دون توريد',
+    trigger: 'عند إقفال صندوق وفيه نقد لم يُورَّد منذ أكثر من 3 أيام أو تجاوز 5,000 ر.س',
+    title: 'نقد لم يُورَّد في {{branchName}}',
+    body: 'في صناديق {{branchName}} المقفلة {{amount}} لم تُورَّد بعد، أقدمها من {{businessDate}}.',
+    variables: ['userName', 'branchName', 'amount', 'businessDate'],
+    translations: {
+      en: { title: 'Cash not remitted at {{branchName}}', body: 'The closed cash boxes of {{branchName}} hold {{amount}} not yet remitted, the oldest from {{businessDate}}.' },
+      ur: { title: '{{branchName}} میں غیر ترسیل شدہ نقد', body: '{{branchName}} کے بند کیش باکسز میں {{amount}} ابھی ترسیل نہیں ہوئے، سب سے پرانا {{businessDate}} کا ہے۔' },
+    },
+  },
+  MONTH_SETTLEMENT_AWAITING_OWNER: {
+    audience: 'STAFF',
+    group: 'التوريدات والتصفية',
+    label: 'تصفية شهر بانتظار اعتماد المالك',
+    trigger: 'عند اعتماد المحاسب للتصفية الشهرية',
+    title: 'تصفية {{monthName}} بانتظار اعتمادك',
+    body: 'اعتمد {{senderName}} تصفية {{monthName}}. راجع كشف المالك واعتمدها نهائيًا ليُقفل الشهر.',
+    variables: ['userName', 'senderName', 'monthName'],
+    translations: {
+      en: { title: '{{monthName}} settlement awaits your approval', body: '{{senderName}} approved the {{monthName}} settlement. Review the owner statement and give the final approval to close the month.' },
+      ur: { title: '{{monthName}} کا تصفیہ آپ کی منظوری کا منتظر', body: '{{senderName}} نے {{monthName}} کا تصفیہ منظور کیا۔ مالک کا گوشوارہ دیکھ کر حتمی منظوری دیں تاکہ مہینہ بند ہو۔' },
+    },
+  },
+  MONTH_SETTLEMENT_LOCKED: {
+    audience: 'STAFF',
+    group: 'التوريدات والتصفية',
+    label: 'إقفال الشهر نهائيًا',
+    trigger: 'عند اعتماد المالك النهائي للتصفية الشهرية',
+    title: 'أُقفل شهر {{monthName}}',
+    body: 'اعتمد {{senderName}} تصفية {{monthName}} نهائيًا وأُقفل الشهر. كشف المالك جاهز للتحميل PDF.',
+    variables: ['userName', 'senderName', 'monthName'],
+    translations: {
+      en: { title: '{{monthName}} is closed', body: '{{senderName}} gave the final approval to the {{monthName}} settlement and the month is closed. The owner statement is ready to download as PDF.' },
+      ur: { title: '{{monthName}} بند ہو گیا', body: '{{senderName}} نے {{monthName}} کے تصفیے کی حتمی منظوری دی اور مہینہ بند ہو گیا۔ مالک کا گوشوارہ PDF میں ڈاؤن لوڈ کے لیے تیار ہے۔' },
     },
   },
   TRIP_REMINDER_24H: {

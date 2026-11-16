@@ -21,14 +21,19 @@ export const isRoomSellable = (terms: HousingTerms, room: RoomType) =>
   terms.housingPriceMode === 'INCLUDED_IN_BASE' || (room === 'SHARED' ? terms.housingPrice : terms.privateRoomPrice) !== null;
 
 /** Halalas charged on top of the seat prices. When housing is included in the base price, only a private room's extra is charged. */
-export function housingCharge(terms: HousingTerms, room: RoomType, seats: number, nights: number) {
+export function housingCharge(terms: HousingTerms, room: RoomType, seats: number, nights: number, privateRooms = 1) {
   const units = stayUnits(terms, nights);
   if (room === 'SHARED') return terms.housingPriceMode === 'ADDED_TO_BASE' ? toHalalas(terms.housingPrice) * seats * units : 0;
 
   // A private room is the booking owner's: one nightly price for the whole booking, however many companions share it,
   // so a family pays for its one room times the nights, never a room per person nor one price for the whole stay.
-  return toHalalas(terms.privateRoomPrice) * Math.max(1, nights);
+  // A group larger than the room may take more rooms, each at the hotel's price for one.
+  return toHalalas(terms.privateRoomPrice) * Math.max(1, nights) * Math.max(1, privateRooms);
 }
+
+/** How many private rooms the travellers need to fit, from the hotel's room capacity; one when it is not set. */
+export const privateRoomsNeeded = (capacity: number | null | undefined, persons: number) =>
+  capacity && capacity > 0 ? Math.max(1, Math.ceil(persons / capacity)) : 1;
 
 /**
  * How a booking's price splits across its passengers, in their entered order: each seat the same, and a private room all on the

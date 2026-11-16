@@ -45,6 +45,13 @@ export class BookingLegDto {
   @IsEnum(RoomType)
   roomChoice?: RoomType;
 
+  /** How many private rooms the travellers take, when they are more than one room holds; one by default. */
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(20)
+  privateRooms?: number;
+
   /**
    * The customer leaves this trip's hotel out and books its seat alone. Only where the housing is charged on top of the
    * seat price; a package, or a trip whose price already includes the stay, has no price without it.

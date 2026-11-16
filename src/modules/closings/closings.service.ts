@@ -1,4 +1,4 @@
-import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
 import { ClosingKind, ClosingPeriod, CollectionMethod, Prisma } from '@prisma/client';
 import { PrismaService } from '../../common/services/prisma.service';
 import { halalas } from '../../common/utils/payment.util';
@@ -7,6 +7,7 @@ import { journeyCodeOf } from '../../common/utils/trip-code.util';
 import { BusAccountsService } from '../buses/bus-accounts.service';
 import { TripAccountsService } from '../invoices/trip-accounts.service';
 import { ApproveClosingDto, ClosingQuery, ClosingsListQuery } from './closings.dto';
+import { FixedExpensesService } from './fixed-expenses.service';
 import { EXPENSE_CATEGORY_LABELS } from './general-expenses.service';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -56,6 +57,7 @@ export class ClosingsService {
     private prisma: PrismaService,
     private accounts: TripAccountsService,
     private buses: BusAccountsService,
+    private fixed: FixedExpensesService,
   ) {}
 
   /** The period (or trip) a closing covers, worked out on the server so the same period always has the same bounds. */
@@ -113,7 +115,8 @@ export class ClosingsService {
     return { ...report, approved: existing && { id: existing.id, number: existing.number, createdAt: existing.createdAt, createdByName: existing.createdByName } };
   }
 
-  async approve(actor: { userId: string; name?: string | null }, dto: ApproveClosingDto) {
+  /** `extra` is saved inside the report beside its sections, such as the monthly settlement's branch statement. */
+  async approve(actor: { userId: string; name?: string | null }, dto: ApproveClosingDto, extra: Record<string, unknown> = {}) {
     const scope = await this.scopeOf(dto);
     if (scope.period !== 'TRIP' && scope.to >= riyadhDate(new Date())) throw new ConflictException('لا يُعتمد تقفيل فترة لم تنتهِ بعد');
     if (await this.standingClosing(scope)) throw new ConflictException('يوجد تقفيل معتمد لهذه الفترة، ألغِ اعتماده أولًا لإعادة التقفيل');
@@ -125,7 +128,7 @@ export class ClosingsService {
       if (row.closing === 'AWAITING_CLOSE') await this.accounts.close(actor, scope.trip.id);
     }
 
-    const report = await this.build(scope);
+    const report = { ...(await this.build(scope)), ...extra };
     try {
       const saved = await this.prisma.accountClosing.create({
         data: {
@@ -208,7 +211,11 @@ export class ClosingsService {
     };
   }
 
-  async void(actor: { name?: string | null }, id: string, reason: string) {
+  async void(actor: { name?: string | null; permissions?: string[] }, id: string, reason: string) {
+    // A month the owner closed for good is reopened by the owner only.
+    if ((await this.prisma.monthSettlementApproval.count({ where: { closingId: id } })) && !actor.permissions?.includes('owner.confirm')) {
+      throw new ForbiddenException('أقفل المالك هذا الشهر نهائيًا، ولا يُلغى اعتماده إلا بموافقته');
+    }
     const voided = await this.prisma.accountClosing.updateMany({ where: { id, voidedAt: null }, data: { voidedAt: new Date(), voidedByName: actor.name ?? null, voidReason: reason } });
     if (voided.count === 0) {
       const exists = await this.prisma.accountClosing.count({ where: { id } });
@@ -233,12 +240,13 @@ export class ClosingsService {
     const trips = withTrips ? await this.tripsSection(scope) : null;
     const legIds = trips?.legIds ?? [];
     // A trip closing counts what its own bookings brought in, whenever paid; the comprehensive one, the money that moved in the period.
-    const [collections, cash, rents, offices, employees] = await Promise.all([
+    const [collections, cash, rents, offices, employees, fixed] = await Promise.all([
       withTrips ? this.collectionsSection(kind === 'TRIPS' ? { legIds } : { range: scope.range }) : null,
       kind === 'COMPREHENSIVE' ? this.cashSection(scope) : null,
       withTrips && scope.period !== 'TRIP' ? this.rentsSection(scope, kind === 'COMPREHENSIVE') : null,
       kind === 'COMPREHENSIVE' ? this.officesSection(scope) : null,
       kind !== 'TRIPS' ? this.employeesSection(scope) : null,
+      kind === 'COMPREHENSIVE' ? this.fixedSection(scope) : null,
     ]);
 
     const revenue: Line[] = [];
@@ -255,6 +263,7 @@ export class ClosingsService {
       );
     }
     if (rents?.premises) expenses.push({ key: 'premisesRent', label: 'إيجارات المقرات والمكاتب', amount: rents.premises.total });
+    if (fixed) expenses.push({ key: 'fixedExpenses', label: 'المصاريف الثابتة المرحّلة (عقود الإيجار والفواتير)', amount: fixed.total });
     if (offices) {
       expenses.push({ key: 'officeExpenses', label: 'مصاريف المكاتب', amount: offices.generalTotal });
       expenses.push({ key: 'officeCustody', label: 'عهد مصروفة على المكاتب', amount: offices.custodyTotal });
@@ -300,8 +309,23 @@ export class ClosingsService {
         rents,
         offices,
         employees,
+        fixed,
       },
     };
+  }
+
+  /** The month's share of every rent contract and recurring expense, and the variable bills paid for the period's months. */
+  private async fixedSection(scope: Scope) {
+    const rows = await this.fixed.monthsExpense(monthsBetween(scope.from.slice(0, 7), scope.to.slice(0, 7)));
+    const byContract = new Map<string, { title: string; categoryLabel: string; scope: string; months: number; amount: number }>();
+    for (const row of rows) {
+      const entry = byContract.get(row.id) ?? { title: row.title, categoryLabel: row.categoryLabel, scope: row.branchName ?? (row.allBranches ? 'كل الفروع' : 'الإدارة العامة'), months: 0, amount: 0 };
+      entry.months += 1;
+      entry.amount += row.amount;
+      byContract.set(row.id, entry);
+    }
+    const items = [...byContract.values()].map((row) => ({ ...row, amount: sar(row.amount) })).sort((a, b) => b.amount - a.amount);
+    return { rows: items, total: sar(rows.reduce((sum, row) => sum + row.amount, 0)) };
   }
 
   /** Each DR journey that departed in the period, as the trip accounts page works it out. */
@@ -410,7 +434,7 @@ export class ClosingsService {
     const movements = sessions.length
       ? await this.prisma.cashMovement.groupBy({ by: ['sessionId', 'type'], where: { sessionId: { in: sessions.map((session) => session.id) } }, _sum: { amount: true }, _count: true })
       : [];
-    const branches = new Map<string, { name: string; sessions: number; open: number; opening: number; receipts: number; receiptCount: number; refunds: number; custodyIssued: number; custodyReturned: number; advancesIssued: number; advancesRepaid: number; salaries: number; differences: number; lastCounted: number | null }>();
+    const branches = new Map<string, { name: string; sessions: number; open: number; opening: number; receipts: number; receiptCount: number; refunds: number; custodyIssued: number; custodyReturned: number; advancesIssued: number; advancesRepaid: number; salaries: number; expensesPaid: number; remitted: number; differences: number; lastCounted: number | null }>();
     for (const session of sessions) {
       const entry = branches.get(session.branchId) ?? {
         name: session.branch.name,
@@ -425,6 +449,8 @@ export class ClosingsService {
         advancesIssued: 0,
         advancesRepaid: 0,
         salaries: 0,
+        expensesPaid: 0,
+        remitted: 0,
         differences: 0,
         lastCounted: null,
       };
@@ -446,12 +472,17 @@ export class ClosingsService {
         if (row.type === 'ADVANCE_ISSUE') entry.advancesIssued += amount;
         if (row.type === 'ADVANCE_REPAYMENT') entry.advancesRepaid += amount;
         if (row.type === 'SALARY_PAYMENT') entry.salaries += amount;
+        if (row.type === 'EXPENSE_PAYMENT') entry.expensesPaid += amount;
+        if (row.type === 'EXPENSE_REVERSAL') entry.expensesPaid -= amount;
+        if (row.type === 'REMITTANCE_OUT') entry.remitted += amount;
+        if (row.type === 'REMITTANCE_RETURN') entry.remitted -= amount;
       }
       branches.set(session.branchId, entry);
     }
     const rows = [...branches.values()].map((entry) => {
       const cashIn = entry.receipts + entry.custodyReturned + entry.advancesRepaid;
-      const cashOut = entry.refunds + entry.custodyIssued + entry.advancesIssued + entry.salaries;
+      // Remitted cash is handed over, not spent, so it stays inside what the drawer handed over.
+      const cashOut = entry.refunds + entry.custodyIssued + entry.advancesIssued + entry.salaries + entry.expensesPaid;
       return {
         name: entry.name,
         sessions: entry.sessions,
@@ -465,6 +496,8 @@ export class ClosingsService {
         advancesIssued: sar(entry.advancesIssued),
         advancesRepaid: sar(entry.advancesRepaid),
         salaries: sar(entry.salaries),
+        expensesPaid: sar(entry.expensesPaid),
+        remitted: sar(entry.remitted),
         cashIn: sar(cashIn),
         cashOut: sar(cashOut),
         /** What the drawer should hand over from the period: everything that came in less everything paid out of it. */
@@ -473,7 +506,7 @@ export class ClosingsService {
         lastCounted: entry.lastCounted === null ? null : sar(entry.lastCounted),
       };
     });
-    const sum = (key: 'receipts' | 'refunds' | 'custodyIssued' | 'custodyReturned' | 'advancesIssued' | 'advancesRepaid' | 'salaries' | 'cashIn' | 'cashOut' | 'net' | 'differences') =>
+    const sum = (key: 'receipts' | 'refunds' | 'custodyIssued' | 'custodyReturned' | 'advancesIssued' | 'advancesRepaid' | 'salaries' | 'expensesPaid' | 'remitted' | 'cashIn' | 'cashOut' | 'net' | 'differences') =>
       sar(rows.reduce((total, row) => total + money(row[key]), 0));
     return {
       rows,
@@ -488,6 +521,8 @@ export class ClosingsService {
         advancesIssued: sum('advancesIssued'),
         advancesRepaid: sum('advancesRepaid'),
         salaries: sum('salaries'),
+        expensesPaid: sum('expensesPaid'),
+        remitted: sum('remitted'),
         cashIn: sum('cashIn'),
         cashOut: sum('cashOut'),
         net: sum('net'),

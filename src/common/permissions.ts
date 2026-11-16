@@ -26,6 +26,7 @@ export const PERMISSION_GROUPS = [
       { key: 'bookings.edit', label: 'تعديل الركاب والمقاعد ونقاط الصعود والملاحظات' },
       { key: 'bookings.unboard', label: 'إلغاء تسجيل صعود راكب' },
       { key: 'bookings.cancel', label: 'إلغاء الحجز إداريًا' },
+      { key: 'bookings.manage_records', label: 'إخفاء الحجوزات من تطبيق العميل وحذف الملغاة منها نهائيًا' },
       { key: 'bookings.export', label: 'تصدير الحجوزات' },
       { key: 'cancellations.review', label: 'رفض طلبات الإلغاء' },
       { key: 'cancellations.approve', label: 'قبول طلبات الإلغاء والاسترداد' },
@@ -50,6 +51,7 @@ export const PERMISSION_GROUPS = [
     items: [
       { key: 'complaints.view', label: 'عرض شكاوى العملاء من التطبيق وشكاوى الفنادق' },
       { key: 'complaints.manage', label: 'الرد على شكاوى العملاء والفنادق وإغلاقها وإعادة فتحها' },
+      { key: 'complaints.assign', label: 'الإشراف على تذاكر الدعم: رؤية تذاكر كل الموظفين وإسنادها لأي موظف' },
     ],
   },
   {
@@ -122,6 +124,19 @@ export const PERMISSION_GROUPS = [
       { key: 'closings.approve', label: 'اعتماد تقفيل الحسابات وإلغاء اعتماده' },
       { key: 'expenses.view', label: 'عرض المصروفات العامة: إيجارات المقرات ومصاريف المكاتب' },
       { key: 'expenses.manage', label: 'تسجيل المصروفات العامة وإلغاؤها' },
+    ],
+  },
+  {
+    title: 'التصفية الشهرية والتوريدات والمصاريف الثابتة',
+    items: [
+      { key: 'remittances.view', label: 'عرض التوريدات من صناديق الفروع إلى المالك أو البنك' },
+      { key: 'remittances.create', label: 'إنشاء توريد من صناديق فرعه المقفلة وسحبه قبل تأكيده' },
+      { key: 'remittances.match', label: 'مطابقة الإيداعات مع كشف البنك وتسجيل الفروقات وتبريرها' },
+      { key: 'owner.confirm', label: 'المالك: تأكيد استلام التوريدات والاعتماد النهائي للتصفية وإقفال الشهر' },
+      { key: 'performance.view', label: 'عرض أداء الفروع وكشف ربح كل فرع' },
+      { key: 'fixed_expenses.view', label: 'عرض المصاريف الثابتة وعقود الإيجار والمستحقات وسجل الدفعات' },
+      { key: 'fixed_expenses.manage', label: 'إضافة المصاريف الثابتة وعقود الإيجار وتعديلها وإيقافها' },
+      { key: 'fixed_expenses.pay', label: 'تسجيل دفعات المصاريف الثابتة وإلغاؤها بقيد عكسي' },
     ],
   },
   {

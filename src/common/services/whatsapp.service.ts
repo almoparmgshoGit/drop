@@ -1,7 +1,12 @@
 import { Injectable } from '@nestjs/common';
-import { IntegrationsService } from './integrations.service';
+import { IntegrationsService, ULTRAMSG_PROVIDER, WHATSAPP_PROVIDER_KEY } from './integrations.service';
 
 const DEFAULT_API_URL = 'https://graph.facebook.com/v23.0';
+const ULTRAMSG_API_URL = 'https://api.ultramsg.com';
+/** WhatsApp's own limit on one text message. */
+const MAX_TEXT_LENGTH = 4096;
+
+export type WhatsAppProvider = 'meta' | 'ultramsg';
 const REQUEST_TIMEOUT_MS = 10_000;
 /** Meta's codes for a number that cannot receive the message: trying again changes nothing. */
 const RECIPIENT_ERRORS = new Set([131026, 131021, 131050, 131008, 131009, 130472]);
@@ -41,10 +46,67 @@ const ERROR_MESSAGES: Record<SendFailure, string> = {
 /** Meta takes the number's digits with the country code and no plus sign. */
 export const toWhatsAppNumber = (phone: string) => phone.replace(/\D/g, '');
 
-/** The only code that talks to Meta. Keys are read on each use, so a change in the panel applies at once. */
+/** WhatsApp's bold, so the title stands out above the text. */
+export const toWhatsAppText = (title: string, body: string) => {
+  const text = title.trim() ? `*${title.trim()}*\n${body}` : body;
+  return text.length > MAX_TEXT_LENGTH ? `${text.slice(0, MAX_TEXT_LENGTH - 1)}…` : text;
+};
+
+/**
+ * The only code that talks to the WhatsApp provider: Meta's Cloud API with approved templates, or UltraMsg with plain text.
+ * Keys are read on each use, so a change in the panel applies at once.
+ */
 @Injectable()
 export class WhatsAppService {
   constructor(private integrations: IntegrationsService) {}
+
+  async provider(): Promise<WhatsAppProvider> {
+    return (await this.integrations.value(WHATSAPP_PROVIDER_KEY)) === ULTRAMSG_PROVIDER ? 'ultramsg' : 'meta';
+  }
+
+  /** True when every notification goes out as its own text, with no template to approve, staff ones included. */
+  async isFreeText() {
+    return (await this.provider()) === 'ultramsg';
+  }
+
+  private async ultramsgKeys() {
+    const [instanceId, token] = await Promise.all([this.integrations.value('ultramsgInstanceId'), this.integrations.value('ultramsgToken')]);
+    return { instanceId, token };
+  }
+
+  /** UltraMsg answers 200 with an error field for most failures, so the reply's wording decides what kind it is. */
+  private async ultramsgCall(path: string, init: RequestInit & { query?: Record<string, string> } = {}) {
+    const { instanceId, token } = await this.ultramsgKeys();
+    if (!instanceId || !token) throw new WhatsAppError('أدخل Instance ID والـToken من UltraMsg أولًا', 'ACCOUNT');
+    const { query, ...rest } = init;
+    const url = `${ULTRAMSG_API_URL}/${encodeURIComponent(instanceId)}/${path}?${new URLSearchParams({ token, ...query })}`;
+    let res: Response;
+    try {
+      res = await fetch(url, { ...rest, redirect: 'error', signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+    } catch {
+      throw new WhatsAppError('تعذر الوصول إلى UltraMsg، حاول مرة أخرى', 'TEMPORARY');
+    }
+    const body: any = await res.json().catch(() => null);
+    const error = body?.error === undefined ? null : JSON.stringify(body.error).toLowerCase();
+    if (res.ok && !error) return body;
+    if (res.status === 401 || res.status === 403 || (error && /token|instance|unauthori|not authenticated|stopped|expired|payment|subscription/.test(error))) {
+      throw new WhatsAppError('رفض UltraMsg الطلب: تأكد من Instance ID والـToken وأن الرقم مربوط والاشتراك فعال', 'ACCOUNT');
+    }
+    if (error && /\bto\b|phone|number|invalid|not exist|not registered|chatid/.test(error)) throw new WhatsAppError(ERROR_MESSAGES.RECIPIENT, 'RECIPIENT');
+    throw new WhatsAppError(ERROR_MESSAGES.TEMPORARY, 'TEMPORARY');
+  }
+
+  /** A plain text message, through UltraMsg. Returns the provider's id for the message. */
+  async sendText(phone: string, text: string) {
+    const body = await this.ultramsgCall('messages/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ to: `+${toWhatsAppNumber(phone)}`, body: text.slice(0, MAX_TEXT_LENGTH) }).toString(),
+    });
+    const messageId: unknown = body?.id;
+    if (body?.sent !== 'true' && body?.sent !== true) throw new WhatsAppError('رد UltraMsg برد غير متوقع', 'TEMPORARY');
+    return messageId === undefined || messageId === null ? null : `ultramsg:${String(messageId)}`;
+  }
 
   private async keys() {
     const [apiUrl, phoneId, businessId, token] = await Promise.all([
@@ -57,21 +119,30 @@ export class WhatsAppService {
   }
 
   async isConfigured() {
+    if (await this.isFreeText()) {
+      const { instanceId, token } = await this.ultramsgKeys();
+      return !!instanceId && !!token;
+    }
     const { phoneId, token } = await this.keys();
     return !!phoneId && !!token;
   }
 
-  /** Login codes need their own Authentication template on top of the account's keys. */
+  /** Login codes need their own Authentication template on top of Meta's keys; UltraMsg sends them as text. */
   async isOtpConfigured() {
+    if (await this.isFreeText()) return this.isConfigured();
     const [configured, template] = await Promise.all([this.isConfigured(), this.integrations.value('whatsappOtpTemplate')]);
     return configured && !!template;
   }
 
   /**
-   * Sends a login code through the account's Authentication template. Meta fixes that template's wording,
+   * Sends a login code. With Meta it goes through the account's Authentication template, whose wording Meta fixes,
    * and its copy-code button carries the code a second time, so both parameters are the code.
    */
   async sendOtp(phone: string, code: string) {
+    if (await this.isFreeText()) {
+      const id = await this.sendText(phone, `رمز الدخول إلى دروب الهجرة: *${code}*\nلا تشاركه مع أحد.\n\nYour Durob Al Hijra login code: ${code}`);
+      return id ?? 'ultramsg';
+    }
     const [{ apiUrl, phoneId, token }, template, language] = await Promise.all([
       this.keys(),
       this.integrations.value('whatsappOtpTemplate'),
@@ -146,6 +217,18 @@ export class WhatsAppService {
 
   /** Reads the number's details, so a wrong key shows up before anyone relies on the connection. */
   async test() {
+    if (await this.isFreeText()) {
+      const body = await this.ultramsgCall('instance/status');
+      const state = body?.status?.accountStatus;
+      const status = typeof state?.status === 'string' ? state.status : null;
+      if (status !== 'authenticated') throw new WhatsAppError(`Instance غير مربوط بالرقم${status ? ` (${status})` : ''}: افتح لوحة UltraMsg وامسح رمز QR`, 'ACCOUNT');
+      const me = await this.ultramsgCall('instance/me').catch(() => null);
+      return {
+        displayPhone: typeof me?.id === 'string' ? `+${me.id.replace(/@.*$/, '')}` : null,
+        verifiedName: typeof me?.name === 'string' ? me.name : 'UltraMsg',
+        quality: typeof state?.substatus === 'string' ? state.substatus : null,
+      };
+    }
     const { apiUrl, phoneId, token } = await this.keys();
     if (!phoneId || !token) throw new WhatsAppError('أدخل معرّف الرقم ورمز الوصول أولًا', 'ACCOUNT');
     const body = await this.call(`${apiUrl}/${encodeURIComponent(phoneId)}?fields=display_phone_number,verified_name,quality_rating`, token);

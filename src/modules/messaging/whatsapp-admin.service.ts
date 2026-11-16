@@ -70,6 +70,7 @@ export class WhatsAppAdminService {
   /** Each action's WhatsApp state and its 30-day delivery counts, for the templates page. */
   async overview() {
     const since = new Date(Date.now() - STATS_DAYS * DAY_MS);
+    const freeText = await this.whatsapp.isFreeText();
     const [templates, customs, counts] = await Promise.all([
       this.prisma.whatsAppTemplate.findMany(),
       this.prisma.notificationTemplate.findMany({ select: { event: true, body: true, translations: true } }),
@@ -83,7 +84,7 @@ export class WhatsAppAdminService {
     });
 
     return (Object.keys(NOTIFICATION_CATALOG) as NotificationEvent[])
-      .filter((event) => NOTIFICATION_CATALOG[event].audience === 'PASSENGER')
+      .filter((event) => freeText || NOTIFICATION_CATALOG[event].audience === 'PASSENGER')
       .map((event) => {
         const ofEvent = counts.filter((row) => row.event === event);
         const count = (...statuses: MessageDeliveryStatus[]) => ofEvent.filter((row) => statuses.includes(row.status)).reduce((sum, row) => sum + row._count._all, 0);
@@ -119,7 +120,8 @@ export class WhatsAppAdminService {
     this.assertEvent(event);
     const entry = NOTIFICATION_CATALOG[event];
     const { crewManual } = describeEntry(event);
-    if (dto.whatsapp !== undefined && entry.audience !== 'PASSENGER') throw new BadRequestException('واتساب متاح لإشعارات العملاء فقط');
+    // Staff can be reached only where no template is needed (UltraMsg), and turning it off is always allowed.
+    if (dto.whatsapp === true && entry.audience !== 'PASSENGER' && !(await this.whatsapp.isFreeText())) throw new BadRequestException('واتساب للموظفين متاح مع UltraMsg فقط. اختره مزوّدًا من الإعدادات ← واتساب أعمال');
     if (dto.crewCanSend !== undefined && !crewManual) throw new BadRequestException('هذا الإشعار تلقائي، ولا يرسله المشرف');
     const changes = {
       ...(dto.inApp !== undefined && { isActive: dto.inApp }),
@@ -183,13 +185,16 @@ export class WhatsAppAdminService {
   }
 
   async status(webhookUrl: string) {
-    const [phoneId, businessId, token, appSecret, verifyToken, lastCheck] = await Promise.all([
+    const [phoneId, businessId, token, appSecret, verifyToken, lastCheck, provider, instanceId, ultramsgToken] = await Promise.all([
       this.integrations.value('whatsappPhoneId'),
       this.integrations.value('whatsappBusinessAccountId'),
       this.integrations.value('whatsappToken'),
       this.integrations.value('whatsappAppSecret'),
       this.integrations.value('whatsappWebhookVerifyToken'),
       this.prisma.setting.findUnique({ where: { key: LAST_CHECK_KEY } }),
+      this.whatsapp.provider(),
+      this.integrations.value('ultramsgInstanceId'),
+      this.integrations.value('ultramsgToken'),
     ]);
     const startOfMonth = new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), 1));
     const [monthSent, approved] = await Promise.all([
@@ -197,8 +202,9 @@ export class WhatsAppAdminService {
       this.prisma.whatsAppTemplate.count({ where: { status: 'APPROVED' } }),
     ]);
     return {
-      steps: { phoneId: !!phoneId, businessId: !!businessId, token: !!token, appSecret: !!appSecret, verifyToken: !!verifyToken },
-      isReady: !!phoneId && !!token,
+      provider,
+      steps: { phoneId: !!phoneId, businessId: !!businessId, token: !!token, appSecret: !!appSecret, verifyToken: !!verifyToken, ultramsgInstanceId: !!instanceId, ultramsgToken: !!ultramsgToken },
+      isReady: provider === 'ultramsg' ? !!instanceId && !!ultramsgToken : !!phoneId && !!token,
       lastCheck: lastCheck ? (JSON.parse(lastCheck.value) as object) : null,
       webhookUrl,
       monthSent,

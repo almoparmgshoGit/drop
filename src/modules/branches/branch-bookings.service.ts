@@ -68,6 +68,7 @@ const JOURNEY_TRIP = {
   housingPricePeriod: true,
   package: { select: { ...PACKAGE_PRICE_SELECT, status: true } },
   hotelBookings: { where: { status: 'CONFIRMED' as const }, select: { hotelId: true } },
+  convoyLeadId: true,
 } satisfies Prisma.TripSelect;
 
 type JourneyTrip = Prisma.TripGetPayload<{ select: typeof JOURNEY_TRIP }>;
@@ -182,7 +183,8 @@ export class BranchBookingsService {
           boardingPoints: { select: { id: true, name: true, time: true } },
           hotelBookings: { where: { status: 'CONFIRMED' }, select: { hotelId: true } },
           reverseOfTripId: true,
-          reverseTrip: { select: { id: true } },
+          reverseOf: { select: { id: true, convoyLeadId: true } },
+          reverseTrip: { select: { id: true, convoyLeadId: true } },
           convoyLeadId: true,
           convoyOrder: true,
         },
@@ -191,10 +193,12 @@ export class BranchBookingsService {
     ]);
     return {
       // A trip on several buses sells its buses in order, at the counter as in the app.
-      items: oneBusPerConvoy(items).map(({ package: pack, price, pricingRules, hotelBookings, reverseOfTripId, reverseTrip, ...trip }) => ({
+      items: oneBusPerConvoy(items).map(({ package: pack, price, pricingRules, hotelBookings, reverseOfTripId, reverseOf, reverseTrip, ...trip }) => ({
         ...trip,
         // The trip it is linked to in the other direction, either way round, so a round trip books the pair together.
         linkedTripId: reverseTrip?.id ?? reverseOfTripId ?? null,
+        // That trip's convoy: the counter lists one bus per convoy, which may be another bus of the linked trip.
+        linkedConvoyId: reverseTrip ? reverseTrip.convoyLeadId ?? reverseTrip.id : reverseOf ? reverseOf.convoyLeadId ?? reverseOf.id : null,
         // The counter starts the stay at the trip's own hotel, whose price the trip already set.
         hotelIds: [...new Set(hotelBookings.map((row) => row.hotelId))],
         price: pack ? Number(pack.price) : seatPricing({ price, pricingRules, ...trip }).price / 100,
@@ -429,6 +433,20 @@ export class BranchBookingsService {
     assertBookingOpened(trip);
   }
 
+  /**
+   * Whether the return trip is the outbound's linked reverse. Each bus of a convoy has its own reverse and the counter
+   * sells whichever bus has room, so any bus of the linked convoy counts.
+   */
+  private async isLinkedReturn(db: Db, outbound: JourneyTrip, inbound: JourneyTrip) {
+    // A return carries its outbound's number and month: D007-12/2026 comes back on R007-12/2026.
+    const twinCode = /^D\d/.test(outbound.tripCode) ? `R${outbound.tripCode.slice(1)}` : `${outbound.tripCode}-R`;
+    if (inbound.tripCode === twinCode) return true;
+    const outboundConvoy = { OR: [{ id: outbound.convoyLeadId ?? outbound.id }, { convoyLeadId: outbound.convoyLeadId ?? outbound.id }] };
+    const inboundConvoy = { OR: [{ id: inbound.convoyLeadId ?? inbound.id }, { convoyLeadId: inbound.convoyLeadId ?? inbound.id }] };
+    const linked = await db.trip.count({ where: { AND: [outboundConvoy, { OR: [{ reverseTrip: inboundConvoy }, { reverseOf: inboundConvoy }] }] } });
+    return linked > 0;
+  }
+
   /** The only place a branch price is calculated: the screen shows the result and never supplies a listed amount. */
   private async computeQuote(db: Db, dto: JourneyQuoteDto) {
     const parts = BOOKING_KIND_PARTS[dto.kind];
@@ -471,6 +489,9 @@ export class BranchBookingsService {
     const returnTrip = priced.find((row) => row.leg.leg === 'RETURN')?.trip;
     if (outboundTrip && returnTrip && returnTrip.departureTime <= outboundTrip.departureTime) {
       throw new BadRequestException('رحلة العودة يجب أن تكون بعد رحلة الذهاب');
+    }
+    if (dto.pairedReturn && outboundTrip && returnTrip && !(await this.isLinkedReturn(db, outboundTrip, returnTrip))) {
+      throw new BadRequestException(`رحلة العودة في الذهاب والعودة هي الرحلة المرتبطة برحلة ${outboundTrip.tripCode} فقط`);
     }
 
     const stay = dto.stay ? await this.priceStay(db, dto, persons, priced.map((row) => row.trip), outboundTrip, returnTrip) : null;

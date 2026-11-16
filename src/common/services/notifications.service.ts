@@ -7,6 +7,7 @@ import { formatRiyadhDate, formatRiyadhTime } from '../utils/time.util';
 import { randomUUID } from 'crypto';
 import { PushService } from './push.service';
 import { RealtimeService } from './realtime.service';
+import { toWhatsAppText, WhatsAppService } from './whatsapp.service';
 import { compareSeats, seatLabel } from '../utils/seat-label.util';
 
 type Db = Prisma.TransactionClient;
@@ -103,17 +104,24 @@ export async function approvedWhatsAppTemplates(db: Pick<Prisma.TransactionClien
   return new Map<string, ApprovedTemplate>(rows.filter((row) => row.bodySnapshot === currentBody(row.language)).map((row) => [row.language, row]));
 }
 
-export function whatsappDelivery(userId: string, event: string, template: ApprovedTemplate, values: Record<string, unknown>, tripId?: string, expiresMinutes?: number, campaignId?: string): Prisma.MessageDeliveryCreateManyInput {
+export function whatsappDelivery(userId: string, event: string, template: ApprovedTemplate, values: Record<string, unknown>, tripId?: string, expiresMinutes?: number, campaignId?: string, text?: string): Prisma.MessageDeliveryCreateManyInput {
   return {
     userId,
     event,
     language: template.language,
     templateName: template.name,
     params: template.paramOrder.map((key) => toWhatsAppParam(values[key])),
+    // Kept with template messages too, so a queued one still leaves if the provider is switched to UltraMsg meanwhile.
+    text,
     expiresAt: new Date(Date.now() + (expiresMinutes ?? WHATSAPP_DEFAULT_EXPIRES_MINUTES) * MINUTE_MS),
     tripId,
     campaignId,
   };
+}
+
+/** A message that needs no template: an empty templateName tells the worker to send its text as it is. */
+export function textDelivery(userId: string, event: string, language: string, text: string, tripId?: string, expiresMinutes?: number, campaignId?: string): Prisma.MessageDeliveryCreateManyInput {
+  return whatsappDelivery(userId, event, { name: '', language, paramOrder: [] }, {}, tripId, expiresMinutes, campaignId, text);
 }
 
 /**
@@ -125,6 +133,7 @@ export class NotificationsService {
   constructor(
     private realtime: RealtimeService,
     private push: PushService,
+    private whatsapp: WhatsAppService,
   ) {}
 
   private async send(db: Db, event: NotificationEvent, messages: Message[], channels: ChannelChoice = {}) {
@@ -132,7 +141,9 @@ export class NotificationsService {
     const entry: CatalogView = NOTIFICATION_CATALOG[event];
     const custom = await db.notificationTemplate.findUnique({ where: { event } });
     const wantsInApp = (custom?.isActive ?? true) && channels.inApp !== false;
-    const wantsWhatsapp = !!custom?.whatsappEnabled && entry.audience === 'PASSENGER' && channels.whatsapp !== false;
+    // Without templates (UltraMsg) staff can be reached on WhatsApp too; Meta's templates are for customers only.
+    const freeText = !!custom?.whatsappEnabled && channels.whatsapp !== false && (await this.whatsapp.isFreeText());
+    const wantsWhatsapp = !!custom?.whatsappEnabled && channels.whatsapp !== false && (entry.audience === 'PASSENGER' || freeText);
     if (!wantsInApp && !wantsWhatsapp) return;
 
     const wordingFor = templateWording(entry, custom, event);
@@ -170,12 +181,20 @@ export class NotificationsService {
     }
 
     if (wantsWhatsapp) {
+      const textOf = (language: string, all: NotificationValues) => {
+        const wording = wordingFor(language);
+        return toWhatsAppText(renderTemplate(wording.title, all), renderTemplate(wording.body, all));
+      };
+      if (freeText) {
+        await db.messageDelivery.createMany({ data: prepared.map(({ user, all, language, tripId }) => textDelivery(user.id, event, language, textOf(language, all), tripId, entry.expiresMinutes)) });
+        return;
+      }
       const approved = await approvedWhatsAppTemplates(db, event, (language) => wordingFor(language).body);
       await db.messageDelivery.createMany({
         data: prepared.flatMap(({ user, all, language, tripId }) => {
           const template = approved.get(language) ?? approved.get('ar');
           if (!template) return [];
-          return [whatsappDelivery(user.id, event, template, all, tripId, entry.expiresMinutes)];
+          return [whatsappDelivery(user.id, event, template, all, tripId, entry.expiresMinutes, undefined, textOf(language, all))];
         }),
       });
     }

@@ -1,6 +1,6 @@
 import { Transform, Type } from 'class-transformer';
-import { IsEnum, IsInt, IsOptional, IsString, Length, Max, MaxLength, Min } from 'class-validator';
-import { CustomerComplaintCategory, CustomerComplaintStatus, HotelComplaintSource, HotelComplaintStatus } from '@prisma/client';
+import { IsBoolean, IsEnum, IsIn, IsInt, IsOptional, IsString, Length, Max, MaxLength, Min, ValidateIf } from 'class-validator';
+import { CustomerComplaintCategory, CustomerComplaintStatus, HotelComplaintSource, HotelComplaintStatus, SupportTicketPriority } from '@prisma/client';
 
 const trimmed = () => Transform(({ value }) => (typeof value === 'string' ? value.trim() : value));
 
@@ -27,10 +27,29 @@ export class ResolveCustomerComplaintDto {
   resolution: string;
 }
 
+export const TICKET_VIEWS = ['new', 'mine', 'all', 'closed'] as const;
+export type TicketView = (typeof TICKET_VIEWS)[number];
+
 export class ListCustomerComplaintsQuery {
+  /** new: open and nobody took it yet; mine: open and with me; all: every open one I may see; closed. */
+  @IsOptional()
+  @IsIn(TICKET_VIEWS)
+  view?: TicketView;
+
+  /** The older filter, still read when no view is given. */
   @IsOptional()
   @IsEnum(CustomerComplaintStatus)
   status?: CustomerComplaintStatus;
+
+  @IsOptional()
+  @IsEnum(SupportTicketPriority)
+  priority?: SupportTicketPriority;
+
+  /** An employee's id, or "none" for tickets nobody holds. Only a supervisor's filter. */
+  @IsOptional()
+  @IsString()
+  @MaxLength(64)
+  assignee?: string;
 
   @IsOptional()
   @IsEnum(CustomerComplaintCategory)
@@ -86,4 +105,34 @@ export class ListHotelComplaintsQuery {
   @Min(1)
   @Max(100)
   limit?: number;
+}
+
+const booleanField = () => Transform(({ value }) => (value === 'true' || value === true ? true : value === 'false' || value === false ? false : value));
+
+/** Sent as multipart when images come with it, so every field arrives as text. */
+export class ComplaintMessageDto {
+  @IsOptional()
+  @trimmed()
+  @IsString()
+  @MaxLength(2000)
+  body?: string;
+
+  /** A note only staff read; the customer is not told. */
+  @IsOptional()
+  @booleanField()
+  @IsBoolean()
+  internal?: boolean;
+}
+
+export class AssignComplaintDto {
+  /** null returns the ticket to «جديدة» for anyone to take. */
+  @ValidateIf((_, value) => value !== null)
+  @IsString()
+  @MaxLength(64)
+  assigneeId: string | null;
+}
+
+export class ComplaintPriorityDto {
+  @IsEnum(SupportTicketPriority, { message: 'اختر الأولوية' })
+  priority: SupportTicketPriority;
 }

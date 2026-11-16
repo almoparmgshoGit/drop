@@ -9,6 +9,7 @@ import { LanguageWordings, normalizeLanguages, readWordings, typedWordings, Word
 import { PrismaService } from '../../common/services/prisma.service';
 import { PushService } from '../../common/services/push.service';
 import { RealtimeService } from '../../common/services/realtime.service';
+import { toWhatsAppText, WhatsAppService } from '../../common/services/whatsapp.service';
 import { randomUUID } from 'crypto';
 import { aggregateAudience, assertAudienceFilters, AudienceFilters, audienceWhere, isMarketingCampaign } from './audience.util';
 import { CampaignDto, SendCampaignDto } from './campaigns.dto';
@@ -80,6 +81,7 @@ export class CampaignsService {
     private appSettings: AppSettingsService,
     private realtime: RealtimeService,
     private push: PushService,
+    private whatsappService: WhatsAppService,
   ) {}
 
   private usableCoupon = (now = new Date()): Prisma.CouponWhereInput => ({
@@ -94,6 +96,11 @@ export class CampaignsService {
     const event = couponId ? 'CAMPAIGN_OFFER' : 'CAMPAIGN_ANNOUNCEMENT';
     const custom = await this.prisma.notificationTemplate.findUnique({ where: { event } });
     if (!custom?.whatsappEnabled) return { event, template: null, forLanguage: () => null };
+    // UltraMsg sends the staff's own text, so there is nothing to approve: an empty name marks a text-only message.
+    if (await this.whatsappService.isFreeText()) {
+      const textOnly = { name: '', language: 'ar', paramOrder: [] as string[] };
+      return { event, template: textOnly, forLanguage: (language: string) => ({ ...textOnly, language }) };
+    }
     const wording = templateWording(NOTIFICATION_CATALOG[event] as CatalogView, custom);
     const approved = await approvedWhatsAppTemplates(this.prisma, event, (language) => wording(language).body);
     const template = approved.get('ar') ?? approved.values().next().value ?? null;
@@ -417,7 +424,9 @@ export class CampaignsService {
           const data = users.flatMap((user) => {
             const chosen = whatsapp!.forLanguage(user.messageLanguage);
             if (!chosen) return [];
-            return [whatsappDelivery(user.id, whatsapp!.event, chosen, { userName: user.name || FALLBACK_NAME, message: wordingFor(user.messageLanguage).body, couponCode: code }, undefined, expiresMinutes, id)];
+            const wording = wordingFor(user.messageLanguage);
+            const text = toWhatsAppText(wording.title, code ? `${wording.body}${couponLine(code, languageOf(user.messageLanguage))}` : wording.body);
+            return [whatsappDelivery(user.id, whatsapp!.event, chosen, { userName: user.name || FALLBACK_NAME, message: wording.body, couponCode: code }, undefined, expiresMinutes, id, text)];
           });
           queued = data.length;
           await tx.messageDelivery.createMany({ data });

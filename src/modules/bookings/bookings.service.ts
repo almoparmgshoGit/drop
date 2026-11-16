@@ -21,7 +21,7 @@ import { includesHousing, includesVisits } from '../../common/utils/booking-type
 import { serviceTypeOf } from '../../common/utils/booking-kinds.util';
 import { nextBookingNumber } from '../../common/utils/booking-number.util';
 import { GALLERY_SELECT } from '../../common/utils/gallery.util';
-import { housingCharge, HousingTerms, isRoomSellable } from '../../common/utils/housing-price.util';
+import { housingCharge, HousingTerms, isRoomSellable, privateRoomsNeeded } from '../../common/utils/housing-price.util';
 import { applicableRule, daysUntil, parseCancellationRules } from '../../common/utils/cancellation-policy.util';
 import { paymentFigures } from '../../common/utils/payment.util';
 import { normalizeSaudiPhone } from '../../common/utils/phone.util';
@@ -360,7 +360,7 @@ export class BookingsService {
     const skipsCustomStay = !!customPackage && !!dto.legs[0].withoutHousing;
     if (skipsCustomStay && dto.legs[0].roomChoice) throw new BadRequestException('اختر نوع الغرفة أو بدون سكن، لا الاثنين');
     const builtStay = customPackage
-      ? customPackageStay(customPackage, { trip: seated[0].trip, seats: seated[0].seats.length }, { trip: seated[1].trip, seats: seated[1].seats.length }, skipsCustomStay ? undefined : dto.legs[0].roomChoice)
+      ? customPackageStay(customPackage, { trip: seated[0].trip, seats: seated[0].seats.length }, { trip: seated[1].trip, seats: seated[1].seats.length }, skipsCustomStay ? undefined : dto.legs[0].roomChoice, dto.legs[0].privateRooms)
       : null;
     // What the customer can still pick from is shown either way; only a stay they keep is charged and saved.
     const customStayLeg = builtStay && {
@@ -559,7 +559,7 @@ export class BookingsService {
       accommodations: { nights: number | null }[];
       hotelBookings: { hotel: { name: string; city: string; address: string | null; description: string | null; services: { service: PublicService }[]; offersSharedRoom: boolean; offersPrivateRoom: boolean } }[];
     },
-    leg: { roomChoice?: RoomType; withoutHousing?: boolean },
+    leg: { roomChoice?: RoomType; withoutHousing?: boolean; privateRooms?: number },
     seats: number,
   ) {
     if (!includesHousing(trip.bookingType)) return null;
@@ -583,7 +583,10 @@ export class BookingsService {
     if (leg.roomChoice && !options.includes(leg.roomChoice)) throw new BadRequestException('نوع الغرفة المختار غير متاح في هذا الفندق');
     // With no housing left out, a hotel with one room type picks it; leaving the stay out picks none.
     const choice = skips ? null : leg.roomChoice ?? (options.length === 1 ? options[0] : null);
-    const chargeFor = (room: RoomType) => (charges ? housingCharge(trip, room, seats, nights) : 0);
+    // A group larger than a private room may take more rooms; each costs the hotel's price for one room.
+    if ((leg.privateRooms ?? 1) > seats) throw new BadRequestException('عدد الغرف أكثر من عدد المسافرين');
+    const rooms = choice === 'PRIVATE' ? leg.privateRooms ?? 1 : 1;
+    const chargeFor = (room: RoomType, count = rooms) => (charges ? housingCharge(trip, room, seats, nights, count) : 0);
     const { offersSharedRoom, offersPrivateRoom, ...place } = withHotelServices(hotel);
     return {
       amount: choice ? chargeFor(choice) : 0,
@@ -592,6 +595,11 @@ export class BookingsService {
         options,
         choice,
         optionAmounts: Object.fromEntries(options.map((room) => [room, toSar(chargeFor(room))])),
+        // The app tells a group larger than one private room so, and offers the rooms they need at one room's price each.
+        privateRoomCapacity: trip.privateRoomCapacity,
+        privateRoomsNeeded: privateRoomsNeeded(trip.privateRoomCapacity, seats),
+        privateRoomAmount: toSar(chargeFor('PRIVATE', 1)),
+        privateRooms: rooms,
         // Whether the app may offer the stay as optional, and whether the customer left it out.
         canSkip,
         withoutHousing: skips,
@@ -737,6 +745,7 @@ export class BookingsService {
                 status: 'CONFIRMED',
                 category,
                 roomChoice: quote.housing[legIndex]?.choice ?? null,
+                privateRooms: quote.housing[legIndex]?.choice === 'PRIVATE' ? quote.housing[legIndex]?.privateRooms ?? 1 : 1,
                 serviceType: serviceTypeOf(hasStay, includesVisits(leg.trip.bookingType)),
                 // The customer's own package: both legs carry it, and the stay sits on the outbound like a branch's journey.
                 ...(quote.customStay && {
@@ -876,7 +885,8 @@ export class BookingsService {
   async getMyBookings(userId: string) {
     const [bookings, closesAfterHours] = await Promise.all([
       this.prisma.booking.findMany({
-        where: { userId },
+        // Staff can hide a booking from this list without touching it.
+        where: { userId, appHidden: false },
         include: BOOKING_INCLUDE,
         orderBy: { createdAt: 'desc' },
         take: 200,

@@ -447,6 +447,10 @@ class ListUsersQuery {
 
   @IsOptional()
   @IsString()
+  rankId?: string;
+
+  @IsOptional()
+  @IsString()
   branchId?: string;
 
   @IsOptional()
@@ -565,7 +569,7 @@ export class UsersController {
   @RequirePermission('employees.view')
   @ApiOperation({ summary: 'List employees with their ranks' })
   async getEmployees(@Query() query: ListUsersQuery) {
-    return this.usersService.getEmployees(query.search, query.page, query.limit, query.jobId, query.branchId);
+    return this.usersService.getEmployees(query.search, query.page, query.limit, query.jobId, query.branchId, query.rankId, query.status);
   }
 
   @Get('employees/achievements')

@@ -3,6 +3,7 @@ import { BookingStatus, Prisma } from '@prisma/client';
 import { BOOKING_TYPE_LABELS } from '../../common/booking-type-labels';
 import { PrismaService } from '../../common/services/prisma.service';
 import { TripMetricsService } from '../../common/services/trip-metrics.service';
+import { bookingHasStay, includesHousing } from '../../common/utils/booking-types.util';
 import { includedBedValue } from '../../common/utils/housing-price.util';
 import { halalas, netBookingFigures, paymentFigures } from '../../common/utils/payment.util';
 import { addDays, riyadhDate, riyadhDayRange } from '../../common/utils/time.util';
@@ -104,6 +105,9 @@ export function monthWeeks(from: string, to: string) {
 }
 
 const CHARGE_SUCCEEDED = { type: 'CHARGE' as const, status: 'SUCCEEDED' as const };
+
+/** The bookings a trip's manifest lists, so the housing statistics count the same people as its rooming screen. */
+const HOUSING_STAT_STATUSES: BookingStatus[] = ['CONFIRMED', 'BOARDED', 'PENDING_CANCELLATION_REVIEW'];
 
 /** What every booking query needs to place a booking on its date, whichever date the report reads by. */
 const DATED_SELECT = {
@@ -826,7 +830,78 @@ export class ReportsService {
     });
 
     const totals = out(total);
-    return { ...totals, hotels: byHotel(hotels), months, basis: ctx.basis, totals };
+    return { ...totals, hotels: byHotel(hotels), months, basis: ctx.basis, totals, housing: await this.housingStats(query, ctx.period) };
+  }
+
+  /**
+   * The rooms each trip of the period needs, by its departure day, from what its customers chose when booking: shared
+   * beds filled at the trip's shared-room capacity, and private rooms counted the same way as the trip's manifest.
+   * Per trip, then per week (Sunday to Saturday inside each month) with each month's total.
+   */
+  private async housingStats(query: ReportRangeQuery, period: Period) {
+    const trips = await this.prisma.trip.findMany({
+      where: {
+        ...this.tripScope(query),
+        departureTime: { gte: period.start, lt: period.end },
+        tripStatus: { notIn: ['DRAFT', 'CANCELLED'] },
+        // A return leg carries no stay of its own; its passengers were housed on the way out.
+        reverseOfTripId: null,
+      },
+      orderBy: [{ departureTime: 'asc' }, { tripCode: 'asc' }],
+      select: {
+        id: true,
+        tripCode: true,
+        destination: true,
+        departureTime: true,
+        bookingType: true,
+        sharedRoomCapacity: true,
+        privateRoomCapacity: true,
+        bookings: {
+          where: {
+            status: { in: HOUSING_STAT_STATUSES },
+            ...(query.branchId && { branchId: query.branchId }),
+            ...(query.source && { source: query.source }),
+          },
+          select: { kind: true, roomChoice: true, stayHotelId: true, _count: { select: { passengers: true } } },
+        },
+      },
+    });
+
+    type Rooms = { sharedPersons: number; sharedRooms: number; privateRooms: number; totalRooms: number };
+    const zero = (): Rooms => ({ sharedPersons: 0, sharedRooms: 0, privateRooms: 0, totalRooms: 0 });
+    const add = (into: Rooms, row: Rooms) => {
+      into.sharedPersons += row.sharedPersons;
+      into.sharedRooms += row.sharedRooms;
+      into.privateRooms += row.privateRooms;
+      into.totalRooms += row.totalRooms;
+    };
+    const weeks = monthWeeks(query.from, query.to).map((week) => ({ ...week, ...zero() }));
+
+    const rows = trips
+      .map((trip) => {
+        const housed = trip.bookings.filter((booking) => bookingHasStay(trip.bookingType, booking));
+        if (!housed.length && !includesHousing(trip.bookingType)) return null;
+        const sharedPersons = housed.filter((booking) => booking.roomChoice === 'SHARED').reduce((sum, booking) => sum + booking._count.passengers, 0);
+        const sharedRooms = Math.ceil(sharedPersons / Math.max(1, trip.sharedRoomCapacity));
+        // Without a private-room capacity on the trip, each private booking is one room, as on the manifest.
+        const privateRooms = housed
+          .filter((booking) => booking.roomChoice === 'PRIVATE')
+          .reduce((sum, booking) => sum + Math.ceil(booking._count.passengers / Math.max(1, trip.privateRoomCapacity ?? booking._count.passengers)), 0);
+        const date = riyadhDate(trip.departureTime);
+        const week = weeks.find((row) => row.from <= date && date <= row.to);
+        const figures: Rooms = { sharedPersons, sharedRooms, privateRooms, totalRooms: sharedRooms + privateRooms };
+        if (week) add(week, figures);
+        return { tripId: trip.id, tripCode: trip.tripCode, date, week: week?.index ?? null, destination: trip.destination, sharedRoomCapacity: trip.sharedRoomCapacity, ...figures };
+      })
+      .filter((row) => row !== null);
+
+    const months = [...new Set(weeks.map((week) => week.month))].map((month) => {
+      const own = weeks.filter((week) => week.month === month);
+      const totals = zero();
+      for (const week of own) add(totals, week);
+      return { month, totals, weeks: own.map(({ month: _month, ...week }) => week) };
+    });
+    return { trips: rows, months };
   }
 
   /**

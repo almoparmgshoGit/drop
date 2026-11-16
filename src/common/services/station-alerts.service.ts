@@ -9,6 +9,7 @@ import { markPassedLegs, minutesAfterDeparture, orderRouteLegs } from '../utils/
 import { approvedWhatsAppTemplates, NotificationsService, tripValues } from './notifications.service';
 import { PrismaService } from './prisma.service';
 import { RoutingService } from './routing.service';
+import { WhatsAppService } from './whatsapp.service';
 
 const MINUTE_MS = 60_000;
 const HOUR_MS = 60 * MINUTE_MS;
@@ -81,6 +82,7 @@ export class StationAlertsService {
     private prisma: PrismaService,
     private notifications: NotificationsService,
     private routing: RoutingService,
+    private whatsapp: WhatsAppService,
   ) {}
 
   async rules() {
@@ -525,6 +527,7 @@ export class StationAlertsService {
     const entry = NOTIFICATION_CATALOG[event];
     const custom = await this.prisma.notificationTemplate.findUnique({ where: { event } });
     if (!custom?.whatsappEnabled) return false;
+    if (await this.whatsapp.isFreeText()) return true;
     const approved = await approvedWhatsAppTemplates(this.prisma, event, (language) => customerWording(event, language === 'ar' ? custom.body : (entry as { translations?: Record<string, { body: string }> }).translations?.[language]?.body ?? custom.body));
     return approved.size > 0;
   }
@@ -540,7 +543,7 @@ export class StationAlertsService {
     const { event } = MANUAL_STATION_TYPES[alert.type];
     const wantsWhatsapp = alert.channels.includes('WHATSAPP');
     const wantsInApp = alert.channels.includes('IN_APP');
-    if (wantsWhatsapp && !(await this.whatsappReady(event))) throw new ConflictException('لا يوجد قالب واتساب معتمد ومفعل لهذا التنبيه');
+    if (wantsWhatsapp && !(await this.whatsappReady(event))) throw new ConflictException((await this.whatsapp.isFreeText()) ? 'واتساب غير مفعل لهذا التنبيه من صفحة القوالب' : 'لا يوجد قالب واتساب معتمد ومفعل لهذا التنبيه');
     if (wantsInApp) {
       const custom = await this.prisma.notificationTemplate.findUnique({ where: { event } });
       if (custom && !custom.isActive) throw new ConflictException('إشعار التطبيق متوقف لهذا التنبيه من صفحة القوالب');

@@ -7,6 +7,7 @@ import { halalas } from '../../common/utils/payment.util';
 import { riyadhDate, riyadhDayRange } from '../../common/utils/time.util';
 import { readInvoiceFiles, UploadedInvoice } from '../cash/cash.service';
 import { CreateGeneralExpenseDto, GeneralExpensesQuery } from './closings.dto';
+import { assertPeriodOpen } from './period-lock';
 
 const PAGE_SIZE = 50;
 const sar = (value: number) => Math.round(value) / 100;
@@ -20,6 +21,7 @@ export const EXPENSE_CATEGORY_LABELS: Record<GeneralExpenseCategory, string> = {
   GOVERNMENT: 'رسوم حكومية',
   MARKETING: 'تسويق وإعلان',
   HOSPITALITY: 'ضيافة ونظافة',
+  MARKETER_COMMISSION: 'عمولة مسوّق',
   OTHER: 'مصاريف أخرى',
 };
 
@@ -166,12 +168,7 @@ export class GeneralExpensesService {
   }
 
   /** A day inside an approved comprehensive closing is final: void that closing before changing its expenses. */
-  private async assertPeriodOpen(day: string) {
-    const date = new Date(`${day}T00:00:00Z`);
-    const closing = await this.prisma.accountClosing.findFirst({
-      where: { voidedAt: null, kind: 'COMPREHENSIVE', period: { not: 'TRIP' }, fromDate: { lte: date }, toDate: { gte: date } },
-      select: { number: true, label: true },
-    });
-    if (closing) throw new ConflictException(`هذا التاريخ داخل تقفيل معتمد (${closing.label})، ألغِ اعتماده أولًا`);
+  private assertPeriodOpen(day: string) {
+    return assertPeriodOpen(this.prisma, day);
   }
 }

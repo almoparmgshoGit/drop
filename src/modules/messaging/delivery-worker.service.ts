@@ -15,7 +15,7 @@ const BASE_RETRY_MS = 60_000;
 /** A server that died mid-send leaves its rows claimed; after this long another may take them. */
 const STALE_CLAIM_MS = 5 * 60_000;
 
-type Claimed = { id: string; templateName: string; language: string; params: Prisma.JsonValue; attempts: number; user: { phone: string } };
+type Claimed = { id: string; templateName: string; language: string; params: Prisma.JsonValue; text: string | null; attempts: number; user: { phone: string } };
 
 /** Everything that happens later than the request: WhatsApp's queue, scheduled messages and station alerts. */
 @Injectable()
@@ -59,14 +59,14 @@ export class DeliveryWorkerService implements OnModuleInit, OnModuleDestroy {
 
   private async finish(id: string, data: Prisma.MessageDeliveryUpdateInput) {
     // The values may hold a name and a booking number, and are no use once the message has left or given up.
-    await this.prisma.messageDelivery.updateMany({ where: { id }, data: { ...(data as Prisma.MessageDeliveryUpdateManyMutationInput), params: Prisma.DbNull, claimedAt: null } });
+    await this.prisma.messageDelivery.updateMany({ where: { id }, data: { ...(data as Prisma.MessageDeliveryUpdateManyMutationInput), params: Prisma.DbNull, text: null, claimedAt: null } });
   }
 
   async sweepDeliveries() {
     const now = new Date();
     await this.prisma.messageDelivery.updateMany({
       where: { status: 'PENDING', expiresAt: { lt: now } },
-      data: { status: 'EXPIRED', params: Prisma.DbNull, failedAt: now, errorMessage: 'انتهت مدة صلاحية الرسالة قبل إرسالها' },
+      data: { status: 'EXPIRED', params: Prisma.DbNull, text: null, failedAt: now, errorMessage: 'انتهت مدة صلاحية الرسالة قبل إرسالها' },
     });
     await this.prisma.messageDelivery.updateMany({ where: { status: 'SENDING', claimedAt: { lt: new Date(now.getTime() - STALE_CLAIM_MS) } }, data: { status: 'PENDING', claimedAt: null } });
 
@@ -88,11 +88,12 @@ export class DeliveryWorkerService implements OnModuleInit, OnModuleDestroy {
     if (rows.length === 0) return;
     const claimed: Claimed[] = await this.prisma.messageDelivery.findMany({
       where: { id: { in: rows.map((row) => row.id) } },
-      select: { id: true, templateName: true, language: true, params: true, attempts: true, user: { select: { phone: true } } },
+      select: { id: true, templateName: true, language: true, params: true, text: true, attempts: true, user: { select: { phone: true } } },
     });
+    const freeText = await this.whatsapp.isFreeText();
 
     for (let index = 0; index < claimed.length; index++) {
-      const paused = await this.deliver(claimed[index]);
+      const paused = await this.deliver(claimed[index], freeText);
       if (paused) {
         // Every other message would fail the same way, and each failure counts against the account.
         await this.prisma.messageDelivery.updateMany({
@@ -105,10 +106,16 @@ export class DeliveryWorkerService implements OnModuleInit, OnModuleDestroy {
   }
 
   /** Returns true when the whole queue should wait. */
-  private async deliver(row: Claimed) {
+  private async deliver(row: Claimed, freeText: boolean) {
     const params = Array.isArray(row.params) ? row.params.map(String) : [];
+    // Queued under one provider and the panel switched to the other since: a message the current one cannot carry gives up.
+    const unsendable = freeText ? (!row.text && 'لا يوجد نص لهذه الرسالة لإرسالها عبر UltraMsg') : (!row.templateName && 'رسالة دون قالب: لا تُرسل إلا عبر UltraMsg');
+    if (unsendable) {
+      await this.finish(row.id, { status: 'FAILED', failedAt: new Date(), attempts: { increment: 1 }, errorMessage: unsendable });
+      return false;
+    }
     try {
-      const messageId = await this.whatsapp.sendTemplate(row.user.phone, row.templateName, row.language, params);
+      const messageId = freeText ? await this.whatsapp.sendText(row.user.phone, row.text!) : await this.whatsapp.sendTemplate(row.user.phone, row.templateName, row.language, params);
       await this.finish(row.id, { status: 'SENT', sentAt: new Date(), providerMessageId: messageId, attempts: { increment: 1 }, errorCode: null, errorMessage: null });
       return false;
     } catch (err) {

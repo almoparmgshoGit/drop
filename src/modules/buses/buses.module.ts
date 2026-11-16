@@ -8,6 +8,6 @@ import { DriversService } from './drivers.service';
 @Module({
   controllers: [BusesController, DriversController, BusOfficesController],
   providers: [BusesService, DriversService, BusAccountsService, BusMaintenanceService],
-  exports: [BusesService],
+  exports: [BusesService, DriversService],
 })
 export class BusesModule {}

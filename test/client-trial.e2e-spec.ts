@@ -87,7 +87,7 @@ describe('login code during the client trial', () => {
       notification: { deleteMany: jest.fn(async () => ({ count: 0 })), createMany: jest.fn(async () => ({ count: 2 })) },
       user: { findMany: jest.fn(async () => [{ id: 'admin-1' }, { id: 'admin-2' }]) },
     };
-    const reached = await new NotificationsService(realtime as never, push as never).trialLoginCodeToAdmins(db as never, '+966500000005', '1234', 5);
+    const reached = await new NotificationsService(realtime as never, push as never, {} as never).trialLoginCodeToAdmins(db as never, '+966500000005', '1234', 5);
 
     expect(reached).toBe(2);
     expect(db.user.findMany).toHaveBeenCalledWith(expect.objectContaining({ where: { role: 'ADMIN' } }));

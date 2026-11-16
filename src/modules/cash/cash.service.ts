@@ -32,6 +32,12 @@ const TX_OPTIONS = { maxWait: 10_000, timeout: 30_000 };
 const MIN_REASON_LENGTH = 3;
 
 const riyadhToday = () => new Date(Date.now() + RIYADH_OFFSET_MS).toISOString().slice(0, 10);
+const daysBetween = (from: string, to: string) => Math.round((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86_400_000);
+
+/** The owner is alerted when closed drawers hold cash not remitted for longer than this, or more than this amount. */
+export const UNREMITTED_ALERT_DAYS = 3;
+export const UNREMITTED_ALERT_HALALAS = 5_000 * 100;
+const REMITTANCES_SINCE_KEY = 'remittancesSince';
 const dateOnly = (date: Date) => date.toISOString().slice(0, 10);
 const nextMonthStart = (start: Date) => new Date(Date.UTC(new Date(start.getTime() + RIYADH_OFFSET_MS).getUTCFullYear(), new Date(start.getTime() + RIYADH_OFFSET_MS).getUTCMonth() + 1, 1) - RIYADH_OFFSET_MS);
 
@@ -170,6 +176,8 @@ export class CashService {
         advancesIssued: toSar(balance.advancesIssued),
         advancesRepaid: toSar(balance.advancesRepaid),
         salariesPaid: toSar(balance.salariesPaid),
+        expensesPaid: toSar(balance.expensesPaid),
+        remitted: toSar(balance.remitted),
         expected: toSar(balance.expected),
       },
       stats: {
@@ -241,12 +249,18 @@ export class CashService {
       const last = await tx.cashSession.findFirst({ where: { branchId }, orderBy: { openedAt: 'desc' } });
       if (last?.status === 'OPEN') throw new ConflictException('يوجد صندوق مفتوح لهذا الفرع، أقفله أولًا');
 
-      const carried = last?.countedCash ?? null;
+      // What was remitted after the last closing, while no drawer was open, left with the owner or the bank.
+      const remittedSince = last?.closedAt ? await this.remittedWhileClosed(tx, branchId, last.closedAt) : 0;
+      const carried = last?.countedCash ? toSar(toHalalas(last.countedCash) - remittedSince) : null;
       // Cash that left between two days (a bank deposit, say) must be explained, or it would simply vanish from the books.
       const changed = carried !== null && toHalalas(carried) !== toHalalas(dto.openingBalance);
       const note = dto.note || null;
       if (changed && (note?.length ?? 0) < MIN_REASON_LENGTH) {
-        throw new BadRequestException(`آخر إقفال كان ${formatSar(carried!)}. اكتب سبب اختلاف الرصيد الافتتاحي`);
+        throw new BadRequestException(
+          remittedSince
+            ? `آخر إقفال بعد خصم التوريدات ${formatSar(carried!)}. اكتب سبب اختلاف الرصيد الافتتاحي`
+            : `آخر إقفال كان ${formatSar(carried!)}. اكتب سبب اختلاف الرصيد الافتتاحي`,
+        );
       }
 
       const today = riyadhToday();
@@ -315,6 +329,13 @@ export class CashService {
           businessDate: dateOnly(session.businessDate),
           differenceAmount: `${difference > 0 ? '+' : '-'}${formatSar(toSar(Math.abs(difference)))}`,
         }, { exceptUserId: actor.userId });
+      }
+      // Cash left in closed drawers too long, or too much of it, is the owner's to chase.
+      const waiting = await this.unremittedSessions(tx, found.branchId);
+      const total = waiting.reduce((sum, row) => sum + row.net, 0);
+      const oldest = waiting[0]?.businessDate;
+      if (total > 0 && oldest && (total > UNREMITTED_ALERT_HALALAS || daysBetween(oldest, riyadhToday()) > UNREMITTED_ALERT_DAYS)) {
+        await this.notifications.toStaff(tx, 'CASH_UNREMITTED_ALERT', ['owner.confirm'], { branchName: branch.name, amount: formatSar(toSar(total)), businessDate: oldest });
       }
       return closed;
     }, TX_OPTIONS);
@@ -519,6 +540,9 @@ export class CashService {
     const advancesIssued = sum('ADVANCE_ISSUE');
     const advancesRepaid = sum('ADVANCE_REPAYMENT');
     const salariesPaid = sum('SALARY_PAYMENT');
+    // A voided payment's reversal and a withdrawn remittance put back exactly what left, so each nets against its own.
+    const expensesPaid = sum('EXPENSE_PAYMENT') - sum('EXPENSE_REVERSAL');
+    const remitted = sum('REMITTANCE_OUT') - sum('REMITTANCE_RETURN');
     return {
       opening,
       receipts,
@@ -528,8 +552,92 @@ export class CashService {
       advancesIssued,
       advancesRepaid,
       salariesPaid,
-      expected: opening + receipts - refunds - custodyIssued + custodyReturned - advancesIssued + advancesRepaid - salariesPaid,
+      expensesPaid,
+      remitted,
+      expected: opening + receipts - refunds - custodyIssued + custodyReturned - advancesIssued + advancesRepaid - salariesPaid - expensesPaid - remitted,
     };
+  }
+
+  // ---------------------------------------------------------------- remittances and fixed expenses
+
+  /**
+   * What a closed drawer added on its day, in halalas: counted less opening, with any remittance taken from it put back,
+   * since that cash was earlier days' and is already accounted for by its own remittance.
+   */
+  async sessionNet(db: Db, session: Pick<CashSession, 'id' | 'openingBalance' | 'countedCash'>) {
+    const groups = await db.cashMovement.groupBy({ by: ['type'], where: { sessionId: session.id, type: { in: ['REMITTANCE_OUT', 'REMITTANCE_RETURN'] } }, _sum: { amount: true } });
+    const sum = (type: CashMovementType) => toHalalas(groups.find((group) => group.type === type)?._sum.amount ?? 0);
+    return toHalalas(session.countedCash ?? 0) - toHalalas(session.openingBalance) + sum('REMITTANCE_OUT') - sum('REMITTANCE_RETURN');
+  }
+
+  /** The first day whose closed drawers are expected to be remitted; drawers from before the remittances began are left alone. */
+  async remittancesSince(db: Db = this.prisma) {
+    const stored = await db.setting.findUnique({ where: { key: REMITTANCES_SINCE_KEY } });
+    if (stored) return stored.value;
+    const since = `${riyadhToday().slice(0, 7)}-01`;
+    await db.setting.upsert({ where: { key: REMITTANCES_SINCE_KEY }, create: { key: REMITTANCES_SINCE_KEY, value: since }, update: {} });
+    return since;
+  }
+
+  /** A branch's closed drawers not yet remitted, oldest first, each with what it added that day (halalas). */
+  async unremittedSessions(db: Db, branchId: string) {
+    const since = await this.remittancesSince(db);
+    const sessions = await db.cashSession.findMany({
+      where: { branchId, status: 'CLOSED', remittedIn: null, businessDate: { gte: new Date(`${since}T00:00:00Z`) } },
+      orderBy: [{ businessDate: 'asc' }, { openedAt: 'asc' }],
+      select: { id: true, businessDate: true, openingBalance: true, countedCash: true },
+    });
+    return Promise.all(sessions.map(async (session) => ({ id: session.id, businessDate: dateOnly(session.businessDate), net: await this.sessionNet(db, session) })));
+  }
+
+  /** Remittances made after `closedAt` with no drawer open: their cash never passed through a drawer movement. */
+  private async remittedWhileClosed(db: Db, branchId: string, closedAt: Date) {
+    const rows = await db.cashRemittance.findMany({
+      where: { branchId, createdAt: { gt: closedAt }, status: { not: 'CANCELLED' } },
+      select: { id: true, amount: true },
+    });
+    if (!rows.length) return 0;
+    const moved = new Set(
+      (await db.cashMovement.findMany({ where: { remittanceId: { in: rows.map((row) => row.id) }, type: 'REMITTANCE_OUT' }, select: { remittanceId: true } })).map((row) => row.remittanceId),
+    );
+    return rows.filter((row) => !moved.has(row.id)).reduce((sum, row) => sum + toHalalas(row.amount), 0);
+  }
+
+  /** The branch's drawer that is open right now, if any. An open drawer from an earlier day has to be closed first. */
+  async todaysDrawer(db: Db, branchId: string) {
+    const session = await db.cashSession.findFirst({ where: { branchId, status: 'OPEN' } });
+    if (!session) return null;
+    const date = dateOnly(session.businessDate);
+    if (date !== riyadhToday()) throw new ConflictException(`صندوق يوم ${date} ما زال مفتوحًا، أقفله أولًا`);
+    return session;
+  }
+
+  /**
+   * Money out of, or back into, today's drawer for a fixed expense or a remittance. It takes the branch lock like every
+   * other drawer write, and money out cannot exceed what the drawer should hold.
+   */
+  async ledgerMovement(
+    tx: Db,
+    actor: CashActor,
+    branchId: string,
+    type: 'EXPENSE_PAYMENT' | 'EXPENSE_REVERSAL' | 'REMITTANCE_OUT' | 'REMITTANCE_RETURN',
+    amount: number,
+    link: { fixedPaymentId?: string; remittanceId?: string },
+    session?: CashSession,
+  ) {
+    const branch = await this.lockBranch(tx, branchId);
+    const drawer = session ?? (await this.currentSession(tx, branchId));
+    if (type === 'EXPENSE_PAYMENT' || type === 'REMITTANCE_OUT') {
+      const { expected } = await this.balanceOf(tx, drawer);
+      if (toHalalas(amount) > expected) throw new ConflictException(`المبلغ أكبر من الرصيد المتوقع في صندوق ${branch.name} (${formatSar(toSar(expected))})`);
+    }
+    await tx.cashMovement.create({ data: { sessionId: drawer.id, type, amount, ...link, createdById: actor.userId, createdByName: actor.name ?? null } });
+    return drawer;
+  }
+
+  /** Takes the branch's money lock inside a transaction, for writes that change what its drawers hold. */
+  async lockBranchFor(tx: Db, branchId: string) {
+    return this.lockBranch(tx, branchId);
   }
 
   private async netCashOf(db: Db, bookingId: string) {

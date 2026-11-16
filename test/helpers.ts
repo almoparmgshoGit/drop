@@ -22,7 +22,8 @@ export async function resetDatabase(prisma: PrismaService) {
   await prisma.$executeRawUnsafe(`
     TRUNCATE "PayrollRun","AppPresence","ChatMessage","Conversation","AppEvent","BookingCollection","CustodyAttachment","CashMovement","Custody","CashSession","Branch","AuditLog","BookingEvent","LoyaltyTransaction","LoyaltyRule","LoyaltyVoucher","TripLocation","HotelRoom","HotelBooking","Hotel","Payment","Ticket","BookingPassenger","Booking","Seat","BoardingPoint","ItineraryStop",
     "TripSupervisor","TripDriver","Accommodation","TripVisit","TripService","TripImage","Trip","Bus","BusOfficePayment","BusOfficeRate","BusOffice","PackageService",
-    "PackageImage","Package","Service","RefreshToken","WalletTransaction","Coupon","Setting","NotificationTemplate","MessageDelivery","WhatsAppTemplate","Campaign","StationAlertRule","TripStationRule","StationAlert","User" CASCADE`);
+    "PackageImage","Package","Service","RefreshToken","WalletTransaction","Coupon","Setting","NotificationTemplate","MessageDelivery","WhatsAppTemplate","Campaign","StationAlertRule","TripStationRule","StationAlert",
+    "MonthSettlementApproval","AccountClosing","FixedExpensePosting","FixedExpensePayment","FixedExpenseAttachment","FixedExpense","RemittedSession","CashRemittanceAttachment","CashRemittance","GeneralExpense","User" CASCADE`);
 }
 
 /** Test trips leave days from now; this opens one to its crew and starts its boarding. */

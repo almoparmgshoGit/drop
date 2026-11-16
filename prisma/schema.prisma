@@ -270,6 +270,14 @@ enum CashMovementType {
   ADVANCE_REPAYMENT
   /// A salary or a final settlement paid in cash.
   SALARY_PAYMENT
+  /// A rent or another fixed expense paid out of the drawer.
+  EXPENSE_PAYMENT
+  /// A voided fixed-expense payment put back into the drawer: the reversing entry, since nothing is deleted.
+  EXPENSE_REVERSAL
+  /// Earlier days' cash handed to the owner or taken to the bank while today's drawer was open.
+  REMITTANCE_OUT
+  /// A withdrawn remittance's cash put back into the drawer.
+  REMITTANCE_RETURN
 }
 
 enum CustodyStatus {
@@ -1073,6 +1081,8 @@ model Booking {
   category              BookingCategory      @default(FAMILY)
   /// The room type the customer asked for; staff place them in actual rooms later.
   roomChoice            RoomType?
+  /// How many private rooms the booking took: more than one when the travellers outnumber what one room holds.
+  privateRooms          Int                  @default(1)
   /// What housing added to the subtotal when booked, kept so later price changes do not rewrite it.
   housingAmount         Decimal              @default(0) @db.Decimal(10, 2)
   source                BookingSource        @default(APP)
@@ -1118,6 +1128,8 @@ model Booking {
   /// Confirmed as returned to the customer's card, network or transfer.
   externalRefunded      Decimal              @default(0) @db.Decimal(10, 2)
   idempotencyKey        String?              @unique
+  /// Hidden by staff from the customer's bookings list in the app; the booking itself is unchanged.
+  appHidden             Boolean              @default(false)
   createdAt             DateTime             @default(now())
   updatedAt             DateTime             @updatedAt
   passengers            BookingPassenger[]
@@ -1637,12 +1649,70 @@ model CustomerComplaint {
   /// The employee who answered it, so their record counts it; the name stays for the screen.
   resolvedById    String?
   resolvedByName  String?
+  /// The support employee handling it. Empty while it waits in «جديدة» for someone to take it.
+  assignedToId    String?
+  assignedToName  String?
+  assignedAt      DateTime?
+  priority        SupportTicketPriority     @default(NORMAL)
+  /// The last message or change, so the lists sort by what moved most recently.
+  lastActivityAt  DateTime                  @default(now())
+  /// True while the customer wrote last and nobody on staff has answered yet.
+  awaitingReply   Boolean                   @default(true)
+  /// Staff replies the customer has not opened yet, for the app's badge.
+  customerUnread  Int                       @default(0)
   createdAt       DateTime                  @default(now())
   updatedAt       DateTime                  @updatedAt
+  messages        ComplaintMessage[]
 
   @@index([status, category])
   @@index([userId])
   @@index([resolvedById])
+  @@index([status, assignedToId])
+}
+
+enum SupportTicketPriority {
+  LOW
+  NORMAL
+  HIGH
+  URGENT
+}
+
+/// CUSTOMER and STAFF are the conversation the customer sees; NOTE is internal to staff; EVENT records a claim, a transfer, closing or reopening.
+enum ComplaintMessageKind {
+  CUSTOMER
+  STAFF
+  NOTE
+  EVENT
+}
+
+/// One entry in a complaint's thread. The author's name is copied so the history survives the employee leaving.
+model ComplaintMessage {
+  id          String                @id @default(uuid())
+  complaintId String
+  complaint   CustomerComplaint     @relation(fields: [complaintId], references: [id], onDelete: Cascade)
+  kind        ComplaintMessageKind
+  body        String                @default("")
+  authorId    String?
+  authorName  String?
+  createdAt   DateTime              @default(now())
+  attachments ComplaintAttachment[]
+
+  @@index([complaintId, createdAt])
+}
+
+/// An image sent with a complaint message, by the customer or by staff. Stored in the database like the crew's report photos.
+model ComplaintAttachment {
+  id           String           @id @default(uuid())
+  messageId    String
+  message      ComplaintMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  fileName     String
+  mimeType     String
+  size         Int
+  data         Bytes
+  uploadedById String?
+  createdAt    DateTime         @default(now())
+
+  @@index([messageId])
 }
 
 /// Append-only history of a booking; a database trigger rejects UPDATE and DELETE.
@@ -1790,6 +1860,9 @@ model Branch {
   collections  BookingCollection[]
   refunds      PaymentTransaction[]
   generalExpenses GeneralExpense[]
+  remittances  CashRemittance[]
+  fixedExpenses FixedExpense[]
+  fixedExpensePayments FixedExpensePayment[]
 
   @@index([managerId])
 }
@@ -1836,6 +1909,7 @@ model CashSession {
   closedAt        DateTime?
   movements       CashMovement[]
   issuedCustodies Custody[]
+  remittedIn      RemittedSession?
 
   @@index([branchId, openedAt])
 }
@@ -1855,6 +1929,10 @@ model CashMovement {
   advance       SalaryAdvance?   @relation(fields: [advanceId], references: [id], onDelete: Restrict)
   /// The employee a salary or settlement was paid to, so the drawer's ledger names them.
   employeeId    String?
+  /// The fixed-expense payment (rent, bills) this cash paid or put back.
+  fixedPaymentId String?
+  /// The remittance this cash left with or came back from.
+  remittanceId   String?
   createdById   String
   createdByName String?
   createdAt     DateTime         @default(now())
@@ -2226,6 +2304,8 @@ model MessageDelivery {
   templateName      String
   /// The values for the template, removed once the message has left or given up.
   params            Json?
+  /// The whole message as plain text, for a provider that needs no template (UltraMsg). Removed with params. Empty templateName means text only.
+  text              String?
   status            MessageDeliveryStatus @default(PENDING)
   attempts          Int                   @default(0)
   nextAttemptAt     DateTime              @default(now())
@@ -3148,6 +3228,8 @@ enum GeneralExpenseCategory {
   GOVERNMENT
   MARKETING
   HOSPITALITY
+  /// A marketer's approved commission, entered by hand until the company has a marketers system.
+  MARKETER_COMMISSION
   OTHER
 }
 
@@ -3241,4 +3323,222 @@ model AccountClosing {
 
   @@index([kind, fromDate])
   @@index([tripId])
+}
+
+/// The owner's final approval of a month's settlement, after the accountant approved its comprehensive closing.
+/// It belongs to that closing: voiding the closing takes the approval with it.
+model MonthSettlementApproval {
+  id             String   @id @default(uuid())
+  closingId      String   @unique
+  month          String
+  approvedById   String
+  approvedByName String?
+  approvedAt     DateTime @default(now())
+
+  @@index([month])
+}
+
+/// How cash left a branch's drawers for the owner.
+enum RemittanceMethod {
+  /// Into the company's bank account, with the deposit slip.
+  BANK_DEPOSIT
+  /// Handed to the owner in person.
+  CASH_HANDOVER
+}
+
+enum RemittanceStatus {
+  /// Waiting for the owner (cash) or the bank match (deposit).
+  PENDING
+  /// The owner confirmed receiving it in hand.
+  RECEIVED
+  /// It showed in the company's bank account in full.
+  MATCHED
+  /// What arrived differs from what was declared: charged to whoever made it until explained.
+  DIFFERENCE
+  /// The owner said nothing reached him: charged in full to whoever made it until explained.
+  REJECTED
+  /// Withdrawn by staff before anyone confirmed it; its drawers can be remitted again.
+  CANCELLED
+}
+
+/// Cash taken out of a branch's closed drawers for the owner or the bank (توريد). Counts as received only once the owner
+/// confirms it or the bank shows it.
+model CashRemittance {
+  id              String                     @id @default(uuid())
+  number          Int                        @unique @default(autoincrement())
+  branchId        String
+  branch          Branch                     @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  method          RemittanceMethod
+  /// What its creator declared: the sum of the drawers it carries.
+  amount          Decimal                    @db.Decimal(12, 2)
+  /// The first and last business day of those drawers.
+  fromDate        DateTime                   @db.Date
+  toDate          DateTime                   @db.Date
+  status          RemittanceStatus           @default(PENDING)
+  receivedAmount  Decimal?                   @db.Decimal(12, 2)
+  /// Received less declared: negative is money missing.
+  difference      Decimal?                   @db.Decimal(12, 2)
+  note            String?
+  idempotencyKey  String?                    @unique
+  createdById     String
+  createdByName   String?
+  createdAt       DateTime                   @default(now())
+  /// OWNER_CODE (WhatsApp code), OWNER (no code channel yet) or BANK (matched by the accountant).
+  confirmedVia    String?
+  confirmedById   String?
+  confirmedByName String?
+  confirmedAt     DateTime?
+  rejectReason    String?
+  /// Why a difference or a refusal happened, once someone explains it.
+  justification   String?
+  justifiedByName String?
+  justifiedAt     DateTime?
+  cancelledByName String?
+  cancelReason    String?
+  sessions        RemittedSession[]
+  attachments     CashRemittanceAttachment[]
+
+  @@index([branchId, createdAt])
+  @@index([status])
+}
+
+/// One closed drawer carried by a remittance. A drawer is remitted once; cancelling the remittance frees it.
+model RemittedSession {
+  sessionId    String         @id
+  session      CashSession    @relation(fields: [sessionId], references: [id], onDelete: Restrict)
+  remittanceId String
+  remittance   CashRemittance @relation(fields: [remittanceId], references: [id], onDelete: Cascade)
+  /// What this drawer added that day (counted less opening), kept so later reading cannot change the remittance.
+  amount       Decimal        @db.Decimal(12, 2)
+
+  @@index([remittanceId])
+}
+
+model CashRemittanceAttachment {
+  id           String         @id @default(uuid())
+  remittanceId String
+  remittance   CashRemittance @relation(fields: [remittanceId], references: [id], onDelete: Restrict)
+  fileName     String
+  mimeType     String
+  size         Int
+  data         Bytes
+  uploadedById String
+  createdAt    DateTime       @default(now())
+
+  @@index([remittanceId])
+}
+
+/// How often a fixed expense falls due. VARIABLE is a bill whose amount is only known when it arrives.
+enum FixedExpenseCycle {
+  MONTHLY
+  QUARTERLY
+  SEMIANNUAL
+  ANNUAL
+  VARIABLE
+}
+
+/// Where a fixed-expense payment came from.
+enum FixedPaymentSource {
+  BANK_TRANSFER
+  /// Out of the branch's drawer today.
+  BRANCH_CASH
+  /// The owner paid it personally: the company owes it to him.
+  OWNER_PERSONAL
+}
+
+/// A rent or another recurring expense, entered once (المصاريف الثابتة). Its monthly share is charged to its branch on the
+/// 1st of every month whenever the money is actually paid, so every month's profit carries its own share.
+model FixedExpense {
+  id           String                   @id @default(uuid())
+  number       Int                      @unique @default(autoincrement())
+  category     GeneralExpenseCategory
+  title        String
+  /// Empty with allBranches false: the head office, shared across the branches by revenue.
+  branchId     String?
+  branch       Branch?                  @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  /// Shared equally by every active branch, such as one internet bill for all.
+  allBranches  Boolean                  @default(false)
+  lessorName   String?
+  lessorPhone  String?
+  /// What is paid each cycle; for a VARIABLE bill, the usual month's estimate.
+  amount       Decimal                  @db.Decimal(12, 2)
+  cycle        FixedExpenseCycle
+  /// The day of the month a payment falls due.
+  dueDay       Int                      @default(1)
+  startDate    DateTime                 @db.Date
+  endDate      DateTime?                @db.Date
+  notes        String?
+  createdById  String
+  createdByName String?
+  createdAt    DateTime                 @default(now())
+  updatedAt    DateTime                 @updatedAt
+  /// Stopped early (the office left, the line cut): no posting after this day.
+  stoppedAt    DateTime?                @db.Date
+  stoppedByName String?
+  stopReason   String?
+  postings     FixedExpensePosting[]
+  payments     FixedExpensePayment[]
+  attachments  FixedExpenseAttachment[]
+
+  @@index([branchId])
+}
+
+/// One month's share of a fixed expense, charged on the 1st. Written once and never changed, so a later edit of the
+/// contract cannot rewrite a month already posted.
+model FixedExpensePosting {
+  id        String       @id @default(uuid())
+  expenseId String
+  expense   FixedExpense @relation(fields: [expenseId], references: [id], onDelete: Restrict)
+  month     String
+  amount    Decimal      @db.Decimal(12, 2)
+  postedAt  DateTime     @default(now())
+
+  @@unique([expenseId, month])
+  @@index([month])
+}
+
+/// Money actually paid on a fixed expense. Never deleted: a mistake is voided, and cash out of a drawer goes back by a reversing entry.
+model FixedExpensePayment {
+  id             String                   @id @default(uuid())
+  number         Int                      @unique @default(autoincrement())
+  expenseId      String
+  expense        FixedExpense             @relation(fields: [expenseId], references: [id], onDelete: Restrict)
+  /// The due it pays, by the first month of its cycle (YYYY-MM).
+  period         String
+  amount         Decimal                  @db.Decimal(12, 2)
+  paidOn         DateTime                 @db.Date
+  source         FixedPaymentSource
+  /// The drawer's branch, for cash.
+  branchId       String?
+  branch         Branch?                  @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  note           String?
+  idempotencyKey String?                  @unique
+  createdById    String
+  createdByName  String?
+  createdAt      DateTime                 @default(now())
+  voidedAt       DateTime?
+  voidedByName   String?
+  voidReason     String?
+  attachments    FixedExpenseAttachment[]
+
+  @@index([expenseId, period])
+  @@index([paidOn])
+}
+
+/// The signed contract of a fixed expense, or the receipt of one of its payments.
+model FixedExpenseAttachment {
+  id           String               @id @default(uuid())
+  expenseId    String?
+  expense      FixedExpense?        @relation(fields: [expenseId], references: [id], onDelete: Restrict)
+  paymentId    String?
+  payment      FixedExpensePayment? @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  fileName     String
+  mimeType     String
+  size         Int
+  data         Bytes
+  uploadedById String
+  createdAt    DateTime             @default(now())
+
+  @@index([expenseId])
+  @@index([paymentId])
 }

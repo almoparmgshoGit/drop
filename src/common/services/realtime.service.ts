@@ -13,6 +13,8 @@ export const TRACKING_PERMISSIONS = ['trips.view', 'trips.manage'] as const;
 /** Staff who handle crew reports hear every SOS as it happens, so the dashboard alarm can ring. */
 export const REPORTS_STAFF_ROOM = 'staff:reports';
 export const REPORTS_PERMISSIONS = ['reports.view', 'reports.manage'] as const;
+/** Support staff hear that a customer complaint ticket changed, so the lists and the open ticket refresh at once. */
+export const COMPLAINTS_STAFF_ROOM = 'staff:complaints';
 
 export const REALTIME_EVENTS = {
   NOTIFICATION: 'notification:new',
@@ -29,7 +31,47 @@ export const REALTIME_EVENTS = {
   SOS_CHANGED: 'sos:changed',
   /** A report the crew filed changed (for example the office acknowledged an SOS). */
   REPORT_CHANGED: 'report:changed',
+  /** A support ticket was created, claimed, assigned, answered or closed; carries only ids. */
+  COMPLAINT_CHANGED: 'complaint:changed',
+  /** Some rows were written; carries only model names (topics), so the screen showing them rereads over HTTP. */
+  DATA_CHANGED: 'data:changed',
 } as const;
+
+/** Every employee (any role but passenger) hears every topic: names only, the data itself stays behind each endpoint's permissions. */
+export const STAFF_DATA_ROOM = 'staff:data';
+const DATA_FLUSH_MS = 1000;
+
+/**
+ * What the customer's app shows to everyone: trips, packages and their seats, offers, settings. A change to one of these
+ * reaches every connected app under the topic on the right, so search results and seat maps stay current.
+ */
+const PUBLIC_DATA_TOPICS: Record<string, string> = {
+  Trip: 'Trip',
+  TripImage: 'Trip',
+  TripService: 'Trip',
+  TripVisit: 'Trip',
+  BoardingPoint: 'Trip',
+  ItineraryStop: 'Trip',
+  Accommodation: 'Trip',
+  TripDriver: 'Trip',
+  TripSupervisor: 'Trip',
+  TripStatusUpdate: 'Trip',
+  Seat: 'Seat',
+  Booking: 'Seat',
+  BookingPassenger: 'Seat',
+  HotelRoomBlock: 'Seat',
+  WaitlistEntry: 'Seat',
+  Package: 'Package',
+  PackageImage: 'Package',
+  PackageService: 'Package',
+  Service: 'Service',
+  PromoOffer: 'Offer',
+  Setting: 'Setting',
+  PublicImage: 'Setting',
+  LoyaltyRule: 'Loyalty',
+  VoucherCard: 'Voucher',
+  Branch: 'Setting',
+};
 
 /** What every trip chat event carries besides the message: the unread counts let both sides draw read ticks and badges without asking. */
 export interface TripChatEvent {
@@ -59,10 +101,73 @@ export interface LiveLocation {
 export class RealtimeService {
   private server: Server | null = null;
 
-  constructor(private prisma: PrismaService) {}
+  private pendingStaff = new Set<string>();
+  private pendingPublic = new Set<string>();
+  private pendingOwners = new Map<string, Set<string>>();
+  private pendingBookings = new Map<string, Set<string>>();
+  private flushTimer: ReturnType<typeof setTimeout> | null = null;
+
+  constructor(private prisma: PrismaService) {
+    prisma.onDataChanged((model, ownerIds, bookingIds) => this.dataChanged(model, ownerIds, bookingIds));
+  }
 
   attach(server: Server) {
     this.server = server;
+  }
+
+  /**
+   * Something was written. Staff screens, the owner's own app, and (for the public catalogue) every app hear the model's
+   * name and reread over HTTP behind the usual permission checks. Writes are gathered for a moment, so a bulk job
+   * that touches a thousand rows sends one event, not a thousand.
+   */
+  dataChanged(model: string, ownerIds: string[] = [], bookingIds: string[] = []) {
+    if (!this.server) return;
+    this.pendingStaff.add(model);
+    const publicTopic = PUBLIC_DATA_TOPICS[model];
+    if (publicTopic) this.pendingPublic.add(publicTopic);
+    for (const ownerId of ownerIds) this.addOwnerTopic(ownerId, model);
+    for (const bookingId of bookingIds) {
+      const topics = this.pendingBookings.get(bookingId) ?? new Set<string>();
+      topics.add(model);
+      this.pendingBookings.set(bookingId, topics);
+    }
+    this.flushTimer ??= setTimeout(() => void this.flushDataChanges(), DATA_FLUSH_MS);
+  }
+
+  private addOwnerTopic(ownerId: string, topic: string) {
+    const topics = this.pendingOwners.get(ownerId) ?? new Set<string>();
+    topics.add(topic);
+    this.pendingOwners.set(ownerId, topics);
+  }
+
+  private async flushDataChanges() {
+    this.flushTimer = null;
+    const server = this.server;
+    if (!server) return;
+    if (this.pendingBookings.size) {
+      const pending = this.pendingBookings;
+      this.pendingBookings = new Map();
+      try {
+        const bookings = await this.prisma.booking.findMany({ where: { id: { in: [...pending.keys()] } }, select: { id: true, userId: true } });
+        for (const booking of bookings) {
+          if (!booking.userId) continue;
+          // Their booking changed too, whatever row was written, so a screen that follows Booking refreshes.
+          this.addOwnerTopic(booking.userId, 'Booking');
+          pending.get(booking.id)?.forEach((topic) => this.addOwnerTopic(booking.userId!, topic));
+        }
+      } catch {
+        // Only a missed nudge: the customer sees the change on the next reload.
+      }
+    }
+    if (this.pendingStaff.size) server.to(STAFF_DATA_ROOM).emit(REALTIME_EVENTS.DATA_CHANGED, { topics: [...this.pendingStaff] });
+    // Staff sockets already heard every topic above, so the public catalogue goes to everyone else.
+    if (this.pendingPublic.size) server.except(STAFF_DATA_ROOM).emit(REALTIME_EVENTS.DATA_CHANGED, { topics: [...this.pendingPublic] });
+    for (const [ownerId, topics] of this.pendingOwners) {
+      server.to(userRoom(ownerId)).except(STAFF_DATA_ROOM).emit(REALTIME_EVENTS.DATA_CHANGED, { topics: [...topics] });
+    }
+    this.pendingStaff.clear();
+    this.pendingPublic.clear();
+    this.pendingOwners.clear();
   }
 
   /** Carries no content, so the wording and its permission checks stay in one place: the notifications API. */
@@ -126,6 +231,14 @@ export class RealtimeService {
     const rooms = [...new Set(crewIds)].map(userRoom);
     if (rooms.length === 0) return;
     this.prisma.afterCommit(() => this.server?.to(rooms).emit(REALTIME_EVENTS.REPORT_CHANGED, event));
+  }
+
+  /** Staff lists reread over HTTP; the customer's app is told only about its own ticket. */
+  complaintChanged(complaintId: string, customerId?: string | null) {
+    this.prisma.afterCommit(() => {
+      this.server?.to(COMPLAINTS_STAFF_ROOM).emit(REALTIME_EVENTS.COMPLAINT_CHANGED, { complaintId });
+      if (customerId) this.server?.to(userRoom(customerId)).emit(REALTIME_EVENTS.COMPLAINT_CHANGED, { complaintId });
+    });
   }
 
   disconnectSession(jti: string) {

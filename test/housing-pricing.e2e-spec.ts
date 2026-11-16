@@ -65,6 +65,19 @@ describe('Housing prices chosen by the admin', () => {
     expect((await quote(perRoom, FIVE, 'PRIVATE')).legs[0].housingAmount).toBe(900);
   });
 
+  it('tells a group larger than one private room so, and charges each extra room at one room’s price', async () => {
+    const trip = await createTrip(await createHotel(), ADDED);
+    const told = await quote(trip, FIVE);
+    expect(told.legs[0].housing).toMatchObject({ privateRoomCapacity: 4, privateRoomsNeeded: 2, privateRoomAmount: 900 });
+    // One room for the five stays the customer's choice, at one room's price.
+    expect((await quote(trip, FIVE, 'PRIVATE')).legs[0].housingAmount).toBe(900);
+    const send = (privateRooms: number) => request(http()).post(`${API}/bookings/quote`).set(customer.auth).send({ legs: [{ tripId: trip.id, seats: FIVE, roomChoice: 'PRIVATE', privateRooms }] });
+    const two = (await send(2).expect(201)).body;
+    expect(two.legs[0].housingAmount).toBe(1800);
+    expect(two.legs[0].housing.privateRooms).toBe(2);
+    await send(6).expect(400);
+  });
+
   it('multiplies by the trip nights when priced per night', async () => {
     const trip = await createTrip(await createHotel(), { ...ADDED, housingPricePeriod: 'PER_NIGHT' });
     expect((await quote(trip, ['1', '2'], 'SHARED')).legs[0].housingAmount).toBe(600);

@@ -461,21 +461,31 @@ export class UsersService implements OnModuleInit, OnModuleDestroy {
     };
   }
 
-  async getEmployees(search?: string, page = 1, limit = 50, jobId?: string, branchId?: string) {
+  async getEmployees(search?: string, page = 1, limit = 50, jobId?: string, branchId?: string, rankId?: string, status?: string) {
     const where: any = { role: { not: 'PASSENGER' } };
     if (jobId) where.rank = { jobId };
+    if (rankId) where.rankId = rankId;
     if (branchId) where.branchId = branchId === 'none' ? null : branchId;
+    if (status === 'active') where.blockedAt = null;
+    if (status === 'blocked') where.blockedAt = { not: null };
     if (search) {
+      // Anything staff remember a colleague by: name, phone, email, ID, employee number, rank, job or branch.
+      const number = /^\d{1,7}$/.test(search.trim()) ? Number(search.trim()) : null;
       where.OR = [
         { name: { contains: search, mode: 'insensitive' } },
         { email: { contains: search, mode: 'insensitive' } },
         { phone: { contains: search, mode: 'insensitive' } },
+        { idNumber: { contains: search, mode: 'insensitive' } },
+        { rank: { name: { contains: search, mode: 'insensitive' } } },
+        { rank: { job: { name: { contains: search, mode: 'insensitive' } } } },
+        { branch: { name: { contains: search, mode: 'insensitive' } } },
+        ...(number !== null ? [{ employeeProfile: { is: { employeeNumber: number } } }] : []),
       ];
     }
     const [items, total] = await Promise.all([
       this.prisma.user.findMany({
         where,
-        select: { id: true, phone: true, email: true, name: true, role: true, branchId: true, branch: { select: { id: true, name: true } }, extraPermissions: true, revokedPermissions: true, rank: { select: { id: true, name: true, permissions: true, job: { select: { id: true, name: true } } } }, createdAt: true },
+        select: { id: true, phone: true, email: true, name: true, role: true, blockedAt: true, branchId: true, branch: { select: { id: true, name: true } }, extraPermissions: true, revokedPermissions: true, rank: { select: { id: true, name: true, permissions: true, job: { select: { id: true, name: true } } } }, createdAt: true },
         orderBy: { createdAt: 'desc' },
         skip: (page - 1) * limit,
         take: limit,

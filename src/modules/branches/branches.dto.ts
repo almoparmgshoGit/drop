@@ -235,6 +235,14 @@ export class JourneyQuoteDto {
   @IsOptional()
   @IsBoolean()
   withVisits?: boolean;
+
+  /**
+   * Sent by the bookings register: a round trip there comes back only on the outbound's linked return trip.
+   * The package booking screen leaves it out and may pair any trip back.
+   */
+  @IsOptional()
+  @IsBoolean()
+  pairedReturn?: boolean;
 }
 
 export class CustomerDto {
