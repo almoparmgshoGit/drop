@@ -20,6 +20,8 @@ export const NUMBER_SETTINGS = {
   defaultCrewOpensBeforeMinutes: 1440,
   defaultBoardingOpensBeforeMinutes: 120,
   defaultBoardingClosesAfterMinutes: 60,
+  /** The most travellers one booking takes: the app's search offers up to it, and a new trip starts with it as its own limit. */
+  maxPassengersPerBooking: 5,
   defaultSinglesFromSeat: 26,
   defaultSinglesToSeat: 49,
   otpTtlMinutes: 5,

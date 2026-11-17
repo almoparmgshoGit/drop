@@ -1379,7 +1379,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
       privateRoomPriceBasis: dto.privateRoomPriceBasis ?? 'PER_ROOM',
       housingPricePeriod: dto.housingPricePeriod ?? 'PER_STAY',
     });
-    const windowDefaults = await this.appSettings.numbers('defaultCrewOpensBeforeMinutes', 'defaultBoardingOpensBeforeMinutes', 'defaultBoardingClosesAfterMinutes');
+    const windowDefaults = await this.appSettings.numbers('defaultCrewOpensBeforeMinutes', 'defaultBoardingOpensBeforeMinutes', 'defaultBoardingClosesAfterMinutes', 'maxPassengersPerBooking');
     const crewWindowSettings = {
       crewOpensBeforeMinutes: dto.crewOpensBeforeMinutes ?? windowDefaults.defaultCrewOpensBeforeMinutes,
       boardingOpensBeforeMinutes: dto.boardingOpensBeforeMinutes ?? windowDefaults.defaultBoardingOpensBeforeMinutes,
@@ -1443,7 +1443,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
           totalSeats: seatNumbers.length,
           availableSeats: seatNumbers.length,
           seatLayout: storedSeatLayout(layout),
-          maxSeatsPerBooking: dto.maxSeatsPerBooking ?? 5,
+          maxSeatsPerBooking: dto.maxSeatsPerBooking ?? windowDefaults.maxPassengersPerBooking,
           ...crewWindowSettings,
           miqat: dto.miqat === undefined ? 'ميقات قرن المنازل' : dto.miqat.trim(),
           tripStatus: dto.tripStatus || 'DRAFT',

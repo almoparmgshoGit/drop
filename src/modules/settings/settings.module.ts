@@ -320,6 +320,13 @@ class UpdateSettingsDto {
   @Max(10080)
   defaultCrewOpensBeforeMinutes?: number;
 
+  /** Same ceiling as a trip's own limit on its form. */
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(20)
+  maxPassengersPerBooking?: number;
+
   /** Where singles sit on a trip with no bus yet. */
   @IsOptional()
   @IsInt()
@@ -580,17 +587,20 @@ class SettingsService {
 
   /** What each copy of the app asks for on opening, before anyone signs in. */
   async getAppConfig() {
-    const [appText, contact, google, flags, map, logos] = await Promise.all([
+    const [appText, contact, google, flags, map, logos, numbers] = await Promise.all([
       this.textValues(APP_TEXT_DEFAULTS),
       this.textValues({ supportPhone: '', supportWhatsapp: '' }),
       this.textValues(GOOGLE_SIGN_IN_DEFAULTS),
       this.flagValues(),
       this.integrations.mapConfig(),
       this.logoValues(),
+      this.numberValues(),
     ]);
     return {
       ...appText,
       ...contact,
+      // The travellers the search screen lets a customer ask for.
+      maxPassengersPerBooking: numbers.maxPassengersPerBooking,
       ...google,
       ...flags,
       mapTilesUrl: map.tilesUrl,
@@ -611,6 +621,7 @@ class SettingsService {
         crewOpensBeforeMinutes: numbers.defaultCrewOpensBeforeMinutes,
         boardingOpensBeforeMinutes: numbers.defaultBoardingOpensBeforeMinutes,
         boardingClosesAfterMinutes: numbers.defaultBoardingClosesAfterMinutes,
+        maxSeatsPerBooking: numbers.maxPassengersPerBooking,
       },
     };
   }

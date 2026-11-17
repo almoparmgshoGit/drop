@@ -360,6 +360,7 @@ export const SETTING_LABELS: Record<string, string> = {
   defaultCrewOpensBeforeMinutes: 'فتح الرحلة للطاقم',
   defaultBoardingOpensBeforeMinutes: 'فتح الصعود',
   defaultBoardingClosesAfterMinutes: 'إغلاق الصعود',
+  maxPassengersPerBooking: 'أقصى عدد مسافرين في الحجز',
   defaultSinglesFromSeat: 'بداية مقاعد الأفراد',
   defaultSinglesToSeat: 'نهاية مقاعد الأفراد',
   otpTtlMinutes: 'صلاحية رمز التحقق',
