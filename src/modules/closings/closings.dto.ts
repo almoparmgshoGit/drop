@@ -101,6 +101,12 @@ export class GeneralExpensesQuery {
   @Length(1, 60)
   branchId?: string;
 
+  /** Only the expenses spent on this trip. */
+  @IsOptional()
+  @IsString()
+  @Length(1, 60)
+  tripId?: string;
+
   @IsOptional()
   @Type(() => Number)
   @IsInt()
@@ -117,6 +123,13 @@ export class CreateGeneralExpenseDto {
   @IsString()
   @Length(1, 60)
   branchId?: string;
+
+  /** The trip it was spent on, so it shows on that trip's account. */
+  @IsOptional()
+  @blankToUndefined()
+  @IsString()
+  @Length(1, 60)
+  tripId?: string;
 
   @multipartNumber()
   @IsNumber({ maxDecimalPlaces: 2 }, { message: 'المبلغ غير صحيح' })

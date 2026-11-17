@@ -8,6 +8,7 @@ import { CashModule } from '../cash/cash.module';
 import { CashService } from '../cash/cash.service';
 import { TripsModule } from '../trips/trips.module';
 import { CrewActor, TripsService } from '../trips/trips.service';
+import { SUPERVISOR_ELIGIBLE } from '../../common/utils/crew-eligibility.util';
 
 const LIVE_TRIP = { tripStatus: { in: ['DRAFT', 'PUBLISHED'] } } satisfies Prisma.TripWhereInput;
 const ASSIGNABLE_LIMIT = 60;
@@ -39,8 +40,10 @@ class SupervisorsService {
     const now = new Date();
     const people = await this.prisma.user.findMany({
       where: {
-        rank: { job: { tripRole: 'SUPERVISOR' } },
-        ...(search && { OR: [{ name: { contains: search, mode: 'insensitive' as const } }, { phone: { contains: /^0\d+$/.test(search) ? search.slice(1) : search } }] }),
+        AND: [
+          SUPERVISOR_ELIGIBLE,
+          ...(search ? [{ OR: [{ name: { contains: search, mode: 'insensitive' as const } }, { phone: { contains: /^0\d+$/.test(search) ? search.slice(1) : search } }] }] : []),
+        ],
       },
       orderBy: { name: 'asc' },
       select: {
@@ -51,7 +54,9 @@ class SupervisorsService {
         blockedAt: true,
         blockedReason: true,
         passwordHash: true,
-        rank: { select: { name: true, permissions: true } },
+        canSupervise: true,
+        canDrive: true,
+        rank: { select: { name: true, permissions: true, job: { select: { tripRole: true } } } },
         refreshTokens: { orderBy: { createdAt: 'desc' }, take: 1, select: { createdAt: true } },
         tripSupervisors: {
           where: { trip: { ...LIVE_TRIP, arrivalTime: { gte: now } } },
@@ -60,12 +65,15 @@ class SupervisorsService {
         },
       },
     });
-    return people.map(({ refreshTokens, tripSupervisors, passwordHash, rank, ...person }) => ({
+    return people.map(({ refreshTokens, tripSupervisors, passwordHash, rank, canSupervise, canDrive, ...person }) => ({
       ...person,
       rankName: rank?.name ?? null,
+      // Marked from their account rather than by their rank's job; such a person can be taken off the list again.
+      addedAsSupervisor: canSupervise && rank?.job.tripRole !== 'SUPERVISOR',
+      alsoDrives: canDrive || rank?.job.tripRole === 'DRIVER',
       hasPassword: !!passwordHash,
       // A rank without this cannot open trips in the app, so a trip given to them would go unseen.
-      canWorkTrips: !!rank?.permissions.includes('crew.trips'),
+      canWorkTrips: canSupervise || !!rank?.permissions.includes('crew.trips'),
       lastLoginAt: refreshTokens[0]?.createdAt ?? null,
       trips: tripSupervisors.map((row) => row.trip),
     }));

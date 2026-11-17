@@ -15,6 +15,7 @@ export const PERMISSION_GROUPS = [
       { key: 'trips.manage', label: 'إضافة وتعديل ونشر وإلغاء الرحلات' },
       { key: 'trips.delete', label: 'حذف الرحلات نهائيًا' },
       { key: 'trips.start', label: 'بدء الرحلات وإيقافها وإعادة تشغيلها من لوحة التحكم (بدونه لا تبدأ الرحلة إلا من تطبيق المشرف)' },
+      { key: 'trips.crew', label: 'إسناد الباص والسائقين والمشرفين للرحلات من شاشة الحجز (دون تعديل باقي بيانات الرحلة)' },
     ],
   },
   {
@@ -241,7 +242,11 @@ export const PERMISSION_GROUPS = [
 
 export type Permission = (typeof PERMISSION_GROUPS)[number]['items'][number]['key'];
 
-export const ALL_PERMISSIONS = PERMISSION_GROUPS.flatMap((group) => group.items.map((item) => item.key)) as Permission[];
+/** What the default supervisor and driver ranks hold in the crew app, given to any employee marked as one. */
+export const SUPERVISOR_CREW_PERMISSIONS: Permission[] = ['crew.trips', 'crew.manifest', 'crew.board', 'crew.track', 'crew.status', 'crew.notify', 'crew.custody', 'crew.housing'];
+export const DRIVER_CREW_PERMISSIONS: Permission[] = ['crew.trips', 'crew.manifest', 'crew.board', 'crew.track', 'crew.status', 'crew.custody'];
+
+export const ALL_PERMISSIONS =PERMISSION_GROUPS.flatMap((group) => group.items.map((item) => item.key)) as Permission[];
 
 /** Holding the right to send must not itself make someone a member of a section, so the notifications group is not one. */
 export const NOTIFICATION_SECTIONS = PERMISSION_GROUPS.filter((group) => group.title !== NOTIFICATIONS_GROUP_TITLE).map((group) => ({
@@ -253,9 +258,18 @@ export const NOTIFICATION_SECTIONS = PERMISSION_GROUPS.filter((group) => group.t
  * Admins hold everything, so a new permission can never lock the owner out. Anyone else holds their rank's
  * permissions, adjusted by what was added or removed for them personally; a staff account without a rank holds only what was added.
  */
-export function permissionsOf(user: { role: Role | string; rank?: { permissions: string[] } | null; extraPermissions?: string[]; revokedPermissions?: string[] }): string[] {
+export function permissionsOf(user: {
+  role: Role | string;
+  rank?: { permissions: string[] } | null;
+  extraPermissions?: string[];
+  revokedPermissions?: string[];
+  canSupervise?: boolean;
+  canDrive?: boolean;
+}): string[] {
   if (user.role === 'ADMIN') return ALL_PERMISSIONS;
   if (user.role === 'PASSENGER') return [];
   const revoked = new Set(user.revokedPermissions ?? []);
-  return [...new Set([...(user.rank?.permissions ?? []), ...(user.extraPermissions ?? [])])].filter((permission) => !revoked.has(permission));
+  // An employee marked as a supervisor or a driver works their trips from the crew app, whatever their rank.
+  const crew = [...(user.canSupervise ? SUPERVISOR_CREW_PERMISSIONS : []), ...(user.canDrive ? DRIVER_CREW_PERMISSIONS : [])];
+  return [...new Set([...(user.rank?.permissions ?? []), ...crew, ...(user.extraPermissions ?? [])])].filter((permission) => !revoked.has(permission));
 }

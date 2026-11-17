@@ -29,6 +29,7 @@ import { bookedOnTrips, goOnlyBookings, lockTripsWithLinked, returningBookingIds
 import { RIYADH_OFFSET_MS, addDays, formatRiyadhDate, formatRiyadhTime, riyadhDate, riyadhDayRange, riyadhMonth, riyadhMonthRange, startOfRiyadhMonth, toHijriLabel } from '../../common/utils/time.util';
 import { bookingOpenedWhere, bookingOpensAtFor, startOfNextRiyadhMonth } from '../../common/utils/booking-opens.util';
 import { applyBusServices, busServiceRows } from '../../common/utils/bus-services.util';
+import { fillContractRent } from '../../common/utils/contract-rent.util';
 import { WEEKLY_HORIZON_DAYS, nextWeeklyDate, nextYearlyDate, riyadhWeekday } from '../../common/utils/recurrence.util';
 import { AppSettingsService } from '../../common/services/app-settings.service';
 
@@ -1201,6 +1202,29 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
     return rate?.price ?? null;
   }
 
+  /**
+   * The rent a trip keeps after an edit. An empty price picks up the contract once a bus is chosen. A price that came from
+   * the contract follows it when the bus or the route changes (the form sends the price it loaded, so an unchanged figure
+   * counts as untouched); a price someone typed in is never overwritten.
+   */
+  private async rentAfterEdit(
+    tx: Prisma.TransactionClient,
+    existing: { busId: string | null; origin: string; destination: string; busRentalPrice: Prisma.Decimal | null },
+    next: { busId: string | null; origin: string; destination: string },
+    dto: { busId?: string | null; busRentalPrice?: number },
+  ) {
+    const untouched = dto.busRentalPrice === undefined || (existing.busRentalPrice !== null && existing.busRentalPrice.equals(dto.busRentalPrice));
+    if (!untouched) return dto.busRentalPrice;
+    const moved = next.busId !== existing.busId || next.origin.trim() !== existing.origin.trim() || next.destination.trim() !== existing.destination.trim();
+    if (existing.busRentalPrice === null) {
+      return dto.busId !== undefined || moved ? ((await this.contractRent(tx, next.busId, next.origin, next.destination)) ?? undefined) : dto.busRentalPrice;
+    }
+    if (!moved) return dto.busRentalPrice;
+    const before = await this.contractRent(tx, existing.busId, existing.origin, existing.destination);
+    if (!before?.equals(existing.busRentalPrice)) return dto.busRentalPrice;
+    return this.contractRent(tx, next.busId, next.origin, next.destination);
+  }
+
   private async assertNoScheduleConflict(
     db: Prisma.TransactionClient,
     window: { busId?: string | null; driverIds: string[]; supervisorIds: string[]; start: Date; end: Date; excludeTripIds?: string[]; leaveCheckIds?: string[] },
@@ -1697,6 +1721,50 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
     throw new BadRequestException('لا يمكن نقل الرحلة إلى هذه الحالة');
   }
 
+  /**
+   * The bus, drivers and supervisors of a trip and of the other buses of its convoy, for the crew dialog of the booking
+   * screen. Staff who may only assign crew see this rather than the whole trip form.
+   */
+  async crewSheet(id: string) {
+    const trip = await this.prisma.trip.findUnique({ where: { id }, select: { id: true, convoyLeadId: true } });
+    if (!trip) throw new NotFoundException('الرحلة غير موجودة');
+    const leadId = trip.convoyLeadId ?? trip.id;
+    const person = { orderBy: { isPrimary: 'desc' as const }, select: { userId: true, user: { select: { name: true } } } };
+    const [rows, buses] = await Promise.all([
+      this.prisma.trip.findMany({
+        where: { OR: [{ id: leadId }, { convoyLeadId: leadId }], tripStatus: { not: 'CANCELLED' } },
+        orderBy: { convoyOrder: 'asc' },
+        select: { id: true, tripCode: true, tripStatus: true, departureTime: true, arrivalTime: true, busId: true, bus: { select: { plateNumber: true, model: true } }, drivers: person, supervisors: person },
+      }),
+      this.prisma.bus.findMany({ where: { status: 'ACTIVE' }, orderBy: { plateNumber: 'asc' }, select: { id: true, plateNumber: true, model: true, seatCount: true, fixedDriverId: true } }),
+    ]);
+    return {
+      trips: rows.map(({ drivers, supervisors, ...row }) => ({
+        ...row,
+        drivers: drivers.map((d) => ({ id: d.userId, name: d.user.name })),
+        supervisors: supervisors.map((s) => ({ id: s.userId, name: s.user.name })),
+      })),
+      buses,
+    };
+  }
+
+  /**
+   * Assigning the crew alone, for staff allowed only that. It goes through updateTrip, so the same rules hold as on the
+   * trip form: schedule clashes, eligible staff, seat plans, the linked way back, the crew's notifications and history.
+   */
+  async assignCrew(id: string, dto: { busId?: string | null; driverIds?: string[]; supervisorIds?: string[] }, actor: CrewActor) {
+    const trip = await this.prisma.trip.findUnique({ where: { id }, select: { tripStatus: true, arrivalTime: true } });
+    if (!trip) throw new NotFoundException('الرحلة غير موجودة');
+    if (trip.tripStatus === 'CANCELLED' || trip.tripStatus === 'COMPLETED') throw new BadRequestException('لا يمكن تغيير طاقم رحلة ملغاة أو منتهية');
+    const crew: UpdateTripDto = {
+      ...(dto.busId !== undefined && { busId: dto.busId || '' }),
+      ...(dto.driverIds && { driverIds: [...new Set(dto.driverIds)] }),
+      ...(dto.supervisorIds && { supervisorIds: [...new Set(dto.supervisorIds)] }),
+    };
+    if (Object.keys(crew).length) await this.updateTrip(id, crew, actor, 'من شاشة الحجز');
+    return this.crewSheet(id);
+  }
+
   async updateTrip(id: string, dto: UpdateTripDto, actor?: CrewActor, reason?: string) {
     if (dto.tripStatus === 'CANCELLED') {
       throw new BadRequestException('استخدم إجراء إلغاء الرحلة حتى تُعالج حجوزاتها');
@@ -1895,12 +1963,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
           bookingType: dto.bookingType,
           busId: dto.busId !== undefined ? busId : undefined,
           packageId: dto.packageId !== undefined ? dto.packageId || null : undefined,
-          // An empty price picks up the contract when a bus is first chosen; a price already set is never overwritten.
-          busRentalPrice:
-            dto.busRentalPrice ??
-            (dto.busId !== undefined && existing.busRentalPrice === null
-              ? (await this.contractRent(tx, busId, dto.origin ?? existing.origin, dto.destination ?? existing.destination)) ?? undefined
-              : undefined),
+          busRentalPrice: await this.rentAfterEdit(tx, existing, { busId, origin: dto.origin ?? existing.origin, destination: dto.destination ?? existing.destination }, dto),
           housingPrice: dto.housingPrice,
           privateRoomPrice: dto.privateRoomPrice,
           privateRoomCapacity: dto.privateRoomCapacity,
@@ -2045,7 +2108,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
         ...(change.moved !== 0 && { hijriDate: toHijriLabel(departure), crewOpenAnnouncedAt: null, boardingOpenAnnouncedAt: null, boardingCloseAnnouncedAt: null }),
         ...(busChanged && {
           busId: change.busId,
-          busRentalPrice: reverse.busRentalPrice ?? (await this.contractRent(tx, change.busId, reverse.origin, reverse.destination)) ?? undefined,
+          busRentalPrice: await this.rentAfterEdit(tx, reverse, { busId: change.busId, origin: reverse.origin, destination: reverse.destination }, { busId: change.busId }),
         }),
       },
     });
@@ -2450,6 +2513,8 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
       },
       include: ADMIN_TRIP_INCLUDE,
     });
+    // The way back comes back on the outbound's bus; with no rent of its own yet it takes that office's contract price.
+    if (await fillContractRent(tx, { id: reverse.id })) reverse.busRentalPrice = (await tx.trip.findUniqueOrThrow({ where: { id: reverse.id }, select: { busRentalPrice: true } })).busRentalPrice;
     await this.notifications.toTripCrew(tx, 'CREW_TRIP_ASSIGNED', reverse.id);
     return withSeatPrice(reverse);
   }

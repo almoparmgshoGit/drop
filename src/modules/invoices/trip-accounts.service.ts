@@ -7,6 +7,7 @@ import { halalas, hotelBookingCost, netBookingFigures } from '../../common/utils
 import { riyadhDate, riyadhDayRange, riyadhDaysRange, riyadhMonthRange } from '../../common/utils/time.util';
 import { journeyCodeOf } from '../../common/utils/trip-code.util';
 import { readInvoiceFiles, UploadedInvoice } from '../cash/cash.service';
+import { EXPENSE_CATEGORY_LABELS } from '../closings/general-expenses.service';
 import { AccountView, CreateCategoryDto, CreateEntryDto, TripAccountsQuery, UpdateCategoryDto, UpdateTaxFlagsDto } from './trip-accounts.dto';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -315,6 +316,8 @@ export class TripAccountsService {
       this.prisma.trip.count({ where: { reverseOfTripId: null, AND: [ON_ACCOUNTS_PAGE, CLOSING_WHERE.AWAITING_CLOSE] } }),
     ]);
 
+    // "By trip" fetches the latest trips (newest first, capped), then lists them oldest → newest like every other view.
+    if (view === 'trip') trips.reverse();
     const rows = trips.map((trip) => ({ trip, legs: legsOf(trip), figures: journeyFigures(legsOf(trip)) }));
     const revenue = rows.reduce((sum, row) => sum + row.figures.revenue, 0);
     const expenses = rows.reduce((sum, row) => sum + row.figures.expenses, 0);
@@ -407,7 +410,7 @@ export class TripAccountsService {
     const outbound = trip.reverseOf ?? { ...trip, reverseTrip: trip.reverseTrip };
     const journeyLegs = legsOf(outbound);
 
-    const [pendingCustody, entries, vatRate] = await Promise.all([
+    const [pendingCustody, entries, vatRate, branchExpenses] = await Promise.all([
       this.prisma.custodyExpense.aggregate({ where: { voidedAt: null, custody: { tripId: id, status: 'OPEN' } }, _sum: { amount: true } }),
       this.prisma.tripAccountEntry.findMany({
         where: { tripId: id },
@@ -416,6 +419,12 @@ export class TripAccountsService {
         include: { category: { select: { name: true, group: true } }, attachments: { select: { id: true, fileName: true, size: true }, orderBy: { createdAt: 'asc' } } },
       }),
       this.ledger.vatRate(this.prisma),
+      // Recorded on the expenses page with this trip named: shown here for reference, they stay general expenses outside the profit.
+      this.prisma.generalExpense.findMany({
+        where: { tripId: id, voidedAt: null },
+        orderBy: [{ spentOn: 'desc' }, { number: 'desc' }],
+        select: { id: true, number: true, category: true, description: true, supplierName: true, amount: true, spentOn: true, branch: { select: { name: true } } },
+      }),
     ]);
     const figures = accountFigures(trip);
     const live = trip.tripStatus !== 'CANCELLED';
@@ -458,6 +467,16 @@ export class TripAccountsService {
         ? trip.hotelBookings.map((booking) => ({ id: booking.id, name: booking.hotel.name, amount: sar(hotelBookingCost(booking)), hasTaxInvoice: booking.hasTaxInvoice }))
         : [],
       parties: partyTotals(standing, figures.bus, hotelBills),
+      branchExpenses: branchExpenses.map((row) => ({
+        id: row.id,
+        number: row.number,
+        categoryLabel: EXPENSE_CATEGORY_LABELS[row.category],
+        description: row.description,
+        supplierName: row.supplierName,
+        branchName: row.branch?.name ?? null,
+        amount: Number(row.amount),
+        spentOn: row.spentOn.toISOString().slice(0, 10),
+      })),
       custodies: trip.custodies.map((row) => ({ number: row.number, purpose: row.purpose, recipientName: row.recipientName, settledAt: row.settledAt, spent: Number(row.spentAmount ?? 0) })),
       entries: entries.map((entry) => ({
         id: entry.id,

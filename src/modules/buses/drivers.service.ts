@@ -6,6 +6,7 @@ import { PrismaService } from '../../common/services/prisma.service';
 import { normalizeSaudiPhone } from '../../common/utils/phone.util';
 import { legacyIdentity, staffIdentityData } from '../../common/utils/staff-identity.util';
 import { CreateDriverDto, UpdateDriverDto } from './buses.dto';
+import { DRIVER_ELIGIBLE } from '../../common/utils/crew-eligibility.util';
 import { openTripsWhere, setFixedDriver, splitOpenTrips } from './buses.service';
 
 export interface DriverActor {
@@ -30,7 +31,7 @@ const identityConflict = (err: unknown): never => {
   throw err;
 };
 
-const DRIVER_WHERE = { rank: { job: { tripRole: 'DRIVER' as const } } };
+const DRIVER_WHERE = DRIVER_ELIGIBLE;
 
 @Injectable()
 export class DriversService {
@@ -44,7 +45,9 @@ export class DriversService {
         id: true,
         name: true,
         phone: true,
-        rank: { select: { name: true } },
+        canDrive: true,
+        canSupervise: true,
+        rank: { select: { name: true, job: { select: { tripRole: true } } } },
         driverProfile: true,
         gender: true,
         birthDate: true,
@@ -56,8 +59,11 @@ export class DriversService {
         tripDrivers: { where: { trip: openTripsWhere() }, select: { trip: { select: { tripCode: true, departureTime: true, tripStatus: true } } } },
       },
     });
-    return drivers.map(({ driverProfile, tripDrivers, rank, fixedBus, ...driver }) => ({
+    return drivers.map(({ driverProfile, tripDrivers, rank, fixedBus, canDrive, canSupervise, ...driver }) => ({
       ...driver,
+      // Marked from their account rather than by their rank's job; such a person can be taken off the list again.
+      addedAsDriver: canDrive && rank?.job.tripRole !== 'DRIVER',
+      alsoSupervises: canSupervise || rank?.job.tripRole === 'SUPERVISOR',
       fixedBus,
       fixedBusId: fixedBus?.id ?? null,
       rankName: rank?.name ?? null,

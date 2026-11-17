@@ -1,7 +1,7 @@
 import { Controller, ForbiddenException, Get, Header, Post, Put, Delete, Param, Query, Body, Req, StreamableFile, UploadedFiles, UseInterceptors } from '@nestjs/common';
 import { FilesInterceptor } from '@nestjs/platform-express';
 import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
-import { IsBoolean, IsOptional, IsString, MaxLength } from 'class-validator';
+import { ArrayMaxSize, IsArray, IsBoolean, IsOptional, IsString, MaxLength } from 'class-validator';
 import { MAX_PUBLIC_IMAGE_BYTES, MAX_PUBLIC_IMAGES_PER_UPLOAD, TripsService, UploadedImage } from './trips.service';
 import { AdminOccupancyQuery, AdminTripsQuery, CreateTripDto, DuplicateTripDto, OpenReverseTripDto, ReverseTripsQuery, SeriesMonthDto, StopSeriesDto, UpdateTripDto } from './trips.dto';
 import { Public, RequirePermission } from '../../common/decorators/auth.decorators';
@@ -19,6 +19,27 @@ class TripSearchQuery {
 
 class NextAvailableQuery extends TripSearchQuery {
   @IsOptional() @IsString() @MaxLength(20) after?: string;
+}
+
+class AssignCrewDto {
+  /** Empty takes the bus off the trip; left out keeps it. */
+  @IsOptional()
+  @IsString()
+  busId?: string | null;
+
+  /** The first is the primary driver. */
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(10)
+  @IsString({ each: true })
+  driverIds?: string[];
+
+  /** The first is the primary supervisor. */
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(20)
+  @IsString({ each: true })
+  supervisorIds?: string[];
 }
 
 class CancelTripDto {
@@ -193,6 +214,22 @@ export class TripsController {
   @ApiOperation({ summary: 'Create new trip' })
   async createTrip(@Req() req, @Body() dto: CreateTripDto) {
     return this.tripsService.createTrip(dto, req.user);
+  }
+
+  @Get(':id/crew')
+  @RequirePermission('trips.manage', 'trips.crew')
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'The bus, drivers and supervisors of a trip and its convoy, with the buses to pick from' })
+  async crewSheet(@Param('id') id: string) {
+    return this.tripsService.crewSheet(id);
+  }
+
+  @Put(':id/crew')
+  @RequirePermission('trips.manage', 'trips.crew')
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Assign the bus, drivers and supervisors of one trip (one bus of a convoy)' })
+  async assignCrew(@Req() req, @Param('id') id: string, @Body() dto: AssignCrewDto) {
+    return this.tripsService.assignCrew(id, dto, req.user);
   }
 
   @Put(':id')

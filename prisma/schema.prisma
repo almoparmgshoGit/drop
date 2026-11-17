@@ -361,6 +361,10 @@ model User {
   extraPermissions       String[]              @default([])
   /// Permissions of their rank that this employee does not get.
   revokedPermissions     String[]              @default([])
+  /// Any employee, whatever their job, can be put on trips as a supervisor or a driver (a driver can supervise too).
+  /// Their rank's job still makes them one on its own; these add the role, with the crew app's permissions for it.
+  canSupervise           Boolean               @default(false)
+  canDrive               Boolean               @default(false)
   passwordHash           String?
   isVerified             Boolean               @default(false)
   walletBalance          Decimal               @default(0) @db.Decimal(10, 2)
@@ -635,6 +639,7 @@ model Trip {
   custodies                  Custody[]
   invoices                   Invoice[]
   accountEntries             TripAccountEntry[]
+  generalExpenses            GeneralExpense[]
   busCost                    TripBusCost?
   location                   TripLocation?
   /// Alerts the crew watchdog raised for this trip, one per kind.
@@ -3243,6 +3248,9 @@ model GeneralExpense {
   /// Empty for the head office or the company as a whole.
   branchId       String?
   branch         Branch?                    @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  /// The trip the branch spent it on, as a reference: it shows on that trip's account but stays a general expense, outside the trip's profit.
+  tripId         String?
+  trip           Trip?                      @relation(fields: [tripId], references: [id], onDelete: Restrict)
   amount         Decimal                    @db.Decimal(12, 2)
   /// VAT inside the amount, fixed when entered. Zero unless a tax invoice backs it.
   vat            Decimal                    @default(0) @db.Decimal(12, 2)
@@ -3263,6 +3271,7 @@ model GeneralExpense {
 
   @@index([spentOn])
   @@index([branchId, spentOn])
+  @@index([tripId])
 }
 
 /// Invoices live in the database so they are only reachable through the API's permission checks, never as public files.

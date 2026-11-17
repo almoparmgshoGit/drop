@@ -3,11 +3,13 @@ import { BusStatus, Prisma, SoloTravelerPolicy, VehicleKind } from '@prisma/clie
 import { PrismaService } from '../../common/services/prisma.service';
 import { AppSettingsService } from '../../common/services/app-settings.service';
 import { applyBusServices } from '../../common/utils/bus-services.util';
+import { fillContractRent } from '../../common/utils/contract-rent.util';
 import { BUS_SEAT_COUNT, seatLayoutFor, seatLimitsFor } from '../../common/utils/bus-layout.util';
 import { assertSinglesFitRange, assertValidSinglesRange, singlesRangeFor } from '../../common/utils/singles-seats.util';
 import { applySeatLayout } from '../../common/utils/trip-seats.util';
 import { PublicService, SERVICE_SELECT } from '../../common/utils/services.util';
 import { GALLERY_SELECT, galleryRows } from '../../common/utils/gallery.util';
+import { DRIVER_ELIGIBLE } from '../../common/utils/crew-eligibility.util';
 
 interface BusInput {
   plateNumber?: string;
@@ -36,7 +38,7 @@ const FIXED_DRIVER_SELECT = { select: { id: true, name: true, phone: true } };
 export async function setFixedDriver(tx: Prisma.TransactionClient, busId: string, driverId: string | null) {
   if (driverId) {
     const driver = await tx.user.findFirst({
-      where: { id: driverId, rank: { job: { tripRole: 'DRIVER' } }, blockedAt: null },
+      where: { id: driverId, ...DRIVER_ELIGIBLE, blockedAt: null },
       select: { driverProfile: { select: { isActive: true } } },
     });
     if (!driver) throw new BadRequestException('السائق المحدد غير موجود');
@@ -251,6 +253,8 @@ export class BusesService {
         select: { id: true },
       });
       if (dto.fixedDriverId !== undefined) await setFixedDriver(tx, updated.id, dto.fixedDriverId || null);
+      // A bus newly linked to an office brings its trips' rent onto that office's statement.
+      if (officeChanges && officeId) await fillContractRent(tx, { busId: id });
       const saved = await tx.bus.findUniqueOrThrow({
         where: { id },
         include: { services: SERVICES_SELECT, images: GALLERY_SELECT, fixedDriver: FIXED_DRIVER_SELECT },

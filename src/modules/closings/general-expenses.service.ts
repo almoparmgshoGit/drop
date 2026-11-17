@@ -39,22 +39,24 @@ export class GeneralExpensesService {
     const [first, last] = from <= to ? [from, to] : [to, from];
     if (!riyadhDayRange(first) || !riyadhDayRange(last)) throw new BadRequestException('التاريخ غير صحيح');
     const where: Prisma.GeneralExpenseWhereInput = {
-      spentOn: { gte: new Date(`${first}T00:00:00Z`), lte: new Date(`${last}T00:00:00Z`) },
+      // One trip's expenses are wanted whole, whatever days they fell on.
+      ...(query.tripId ? { tripId: query.tripId } : { spentOn: { gte: new Date(`${first}T00:00:00Z`), lte: new Date(`${last}T00:00:00Z`) } }),
       ...(query.category && { category: query.category }),
       ...(query.branchId && { branchId: query.branchId === 'none' ? null : query.branchId }),
     };
     const page = query.page ?? 1;
-    const [rows, total, groups, branches] = await Promise.all([
+    const [rows, total, groups, branches, trips] = await Promise.all([
       this.prisma.generalExpense.findMany({
         where,
         orderBy: [{ spentOn: 'desc' }, { number: 'desc' }],
         skip: (page - 1) * PAGE_SIZE,
         take: PAGE_SIZE,
-        include: { branch: { select: { name: true } }, attachments: { select: { id: true, fileName: true, size: true }, orderBy: { createdAt: 'asc' } } },
+        include: { branch: { select: { name: true } }, trip: { select: { tripCode: true } }, attachments: { select: { id: true, fileName: true, size: true }, orderBy: { createdAt: 'asc' } } },
       }),
       this.prisma.generalExpense.count({ where }),
       this.prisma.generalExpense.groupBy({ by: ['category'], where: { ...where, voidedAt: null }, _sum: { amount: true, vat: true }, _count: true }),
       this.prisma.branch.findMany({ select: { id: true, name: true, isActive: true }, orderBy: { name: 'asc' } }),
+      this.tripOptions(),
     ]);
     const totalOf = (match: (category: GeneralExpenseCategory) => boolean) =>
       sar(groups.filter((group) => match(group.category)).reduce((sum, group) => sum + halalas(group._sum.amount ?? 0), 0));
@@ -65,6 +67,7 @@ export class GeneralExpensesService {
       pageSize: PAGE_SIZE,
       total,
       branches,
+      trips,
       categories: Object.entries(EXPENSE_CATEGORY_LABELS).map(([key, label]) => ({ key, label })),
       summary: {
         rent: totalOf((category) => category === 'OFFICE_RENT'),
@@ -82,6 +85,8 @@ export class GeneralExpensesService {
         categoryLabel: EXPENSE_CATEGORY_LABELS[row.category],
         branchId: row.branchId,
         branchName: row.branch?.name ?? null,
+        tripId: row.tripId,
+        tripCode: row.trip?.tripCode ?? null,
         amount: Number(row.amount),
         vat: Number(row.vat),
         hasTaxInvoice: row.hasTaxInvoice,
@@ -112,6 +117,11 @@ export class GeneralExpensesService {
       const branch = await this.prisma.branch.count({ where: { id: dto.branchId } });
       if (!branch) throw new BadRequestException('الفرع غير موجود');
     }
+    if (dto.tripId) {
+      const trip = await this.prisma.trip.findUnique({ where: { id: dto.tripId }, select: { tripStatus: true } });
+      if (!trip) throw new BadRequestException('الرحلة غير موجودة');
+      if (trip.tripStatus === 'DRAFT') throw new BadRequestException('هذه الرحلة ما زالت مسودة');
+    }
     await this.assertPeriodOpen(dto.spentOn);
     // Reclaiming VAT needs a document the authority can ask for.
     if (dto.hasTaxInvoice && files.length === 0) throw new BadRequestException('ارفع الفاتورة الضريبية');
@@ -124,6 +134,7 @@ export class GeneralExpensesService {
         data: {
           category: dto.category,
           branchId: dto.branchId ?? null,
+          tripId: dto.tripId ?? null,
           amount: dto.amount,
           vat: vat / 100,
           hasTaxInvoice: dto.hasTaxInvoice,
@@ -159,6 +170,17 @@ export class GeneralExpensesService {
     });
     if (voided.count === 0) throw new ConflictException('هذا المصروف ملغى مسبقًا');
     return { success: true };
+  }
+
+  /** The trips an expense can be spent on: the recent ones, newest first. */
+  private tripOptions() {
+    const since = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
+    return this.prisma.trip.findMany({
+      where: { tripStatus: { notIn: ['DRAFT', 'CANCELLED'] }, departureTime: { gte: since } },
+      select: { id: true, tripCode: true, origin: true, destination: true, departureTime: true },
+      orderBy: { departureTime: 'desc' },
+      take: 300,
+    });
   }
 
   async attachment(id: string) {

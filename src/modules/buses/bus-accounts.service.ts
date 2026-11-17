@@ -3,11 +3,10 @@ import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../common/services/prisma.service';
 import { riyadhDaysRange, riyadhMonth, riyadhMonthRange } from '../../common/utils/time.util';
 import { toHalalas, toSar } from '../bookings/bookings.service';
+import { fillContractRent, routeKey } from '../../common/utils/contract-rent.util';
 import { CreateBusOfficeDto, CreateOfficePaymentDto, UpdateBusOfficeDto, UpdateTripCostDto } from './buses.dto';
 
 const TX_OPTIONS = { maxWait: 10_000, timeout: 30_000 };
-
-const routeKey = (origin: string, destination: string) => `${origin.trim()}→${destination.trim()}`;
 
 const assertDistinctRoutes = (rates: { origin: string; destination: string }[] = []) => {
   const routes = rates.map((rate) => routeKey(rate.origin, rate.destination));
@@ -82,6 +81,8 @@ export class BusAccountsService {
       if (rates) {
         await tx.busOfficeRate.deleteMany({ where: { officeId: id } });
         await tx.busOfficeRate.createMany({ data: rates.map((rate) => ({ ...rate, officeId: id })) });
+        // Trips that got this office's bus before the table listed their route take the price now.
+        await fillContractRent(tx, { bus: { officeId: id } });
       }
       // Buses show their owner through this text, including to customers in the app.
       if (dto.name && dto.name !== office.name) await tx.bus.updateMany({ where: { officeId: id }, data: { company: dto.name } });
@@ -97,6 +98,8 @@ export class BusAccountsService {
   async statement(id: string, query: { month?: string; from?: string; to?: string } = {}) {
     const office = await this.prisma.busOffice.findUnique({ where: { id }, include: { rates: { orderBy: { origin: 'asc' } } } });
     if (!office) throw new NotFoundException('مكتب الباصات غير موجود');
+    // A trip whose bus was assigned before its route had a price shows its rent here without anyone retyping it.
+    await fillContractRent(this.prisma, { bus: { officeId: id } });
     let period: { gte: Date; lt: Date };
     let from: string;
     let to: string;

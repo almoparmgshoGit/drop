@@ -57,7 +57,7 @@ export interface PanelLoginOptions {
   deviceToken?: string;
 }
 
-type BranchAccount = { id: string; role: string; branchId: string | null; extraPermissions: string[]; revokedPermissions: string[]; rank: { permissions: string[] } | null };
+type BranchAccount = { id: string; role: string; branchId: string | null; extraPermissions: string[]; revokedPermissions: string[]; canSupervise?: boolean; canDrive?: boolean; rank: { permissions: string[] } | null };
 
 /** A refreshed session moves the last-login time only when it is older than this, so frequent refreshes do not each write to the account. */
 const LAST_LOGIN_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
@@ -89,7 +89,9 @@ const AUTH_USER_SELECT = {
   branch: { select: { id: true, name: true } },
   extraPermissions: true,
   revokedPermissions: true,
-  rank: { select: { id: true, name: true, permissions: true } },
+  canSupervise: true,
+  canDrive: true,
+  rank: { select: { id: true, name: true, permissions: true, job: { select: { tripRole: true } } } },
 } as const;
 
 @Injectable()
@@ -357,7 +359,7 @@ export class AuthService {
   async sessionBranches(userId: string) {
     const user = await this.prisma.user.findUniqueOrThrow({
       where: { id: userId },
-      select: { id: true, role: true, branchId: true, extraPermissions: true, revokedPermissions: true, rank: { select: { permissions: true } } },
+      select: { id: true, role: true, branchId: true, extraPermissions: true, revokedPermissions: true, canSupervise: true, canDrive: true, rank: { select: { permissions: true } } },
     });
     const allBranches = this.worksInEveryBranch(user);
     const branches = await this.prisma.branch.findMany({
@@ -402,7 +404,7 @@ export class AuthService {
     const user = await this.verifyStaffPassword(rawIdentifier, password, ip);
     const full = await this.prisma.user.findUniqueOrThrow({
       where: { id: user.id },
-      select: { id: true, phone: true, role: true, branchId: true, passwordHash: true, extraPermissions: true, revokedPermissions: true, rank: { select: { permissions: true } } },
+      select: { id: true, phone: true, role: true, branchId: true, passwordHash: true, extraPermissions: true, revokedPermissions: true, canSupervise: true, canDrive: true, rank: { select: { permissions: true } } },
     });
     const branch = await this.accountBranch(full);
 
@@ -587,7 +589,14 @@ export class AuthService {
 
   async getMe(userId: string) {
     const { rank, extraPermissions, revokedPermissions, ...user } = await this.prisma.user.findUniqueOrThrow({ where: { id: userId }, select: AUTH_USER_SELECT });
-    return { ...user, rank: rank && { id: rank.id, name: rank.name }, permissions: permissionsOf({ role: user.role, rank, extraPermissions, revokedPermissions }) };
+    return {
+      ...user,
+      rank: rank && { id: rank.id, name: rank.name },
+      permissions: permissionsOf({ role: user.role, rank, extraPermissions, revokedPermissions, canSupervise: user.canSupervise, canDrive: user.canDrive }),
+      // What the crew app shows: a driver who also supervises gets the supervisor's tools, by their job or by their mark.
+      supervises: user.canSupervise || rank?.job.tripRole === 'SUPERVISOR',
+      drives: user.canDrive || rank?.job.tripRole === 'DRIVER',
+    };
   }
 
   /** refreshed marks a session refresh rather than a sign-in: it moves the last-login time only when that is a few minutes old. */

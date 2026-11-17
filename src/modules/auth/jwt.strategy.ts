@@ -30,7 +30,7 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     if (payload.jti && (await this.redis.get(revokedTokenKey(payload.jti)))) throw new UnauthorizedException('Token has been revoked');
     const user = await this.prisma.user.findUnique({
       where: { id: payload.sub },
-      select: { id: true, role: true, name: true, phone: true, blockedAt: true, branchId: true, extraPermissions: true, revokedPermissions: true, rank: { select: { permissions: true } } },
+      select: { id: true, role: true, name: true, phone: true, blockedAt: true, branchId: true, extraPermissions: true, revokedPermissions: true, canSupervise: true, canDrive: true, rank: { select: { permissions: true } } },
     });
     // Checked on every request, so a block ends a session that is already open.
     if (!user || user.blockedAt) throw new UnauthorizedException();

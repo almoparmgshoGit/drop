@@ -15,6 +15,7 @@ import { NATIONALITIES } from '../../common/profile-options';
 import { CustomerLookupService, LOOKUP_RESULT_LIMIT, LookupActor } from '../../common/services/customer-lookup.service';
 import { CustomerLookup, identityData, parseCustomerLookup } from '../../common/utils/identity.util';
 import { imageTypeOf } from '../../common/utils/image-type.util';
+import { DRIVER_ELIGIBLE, SUPERVISOR_ELIGIBLE } from '../../common/utils/crew-eligibility.util';
 import { legacyIdentity, staffIdentityData, StaffIdentityInput } from '../../common/utils/staff-identity.util';
 
 export interface UserActor {
@@ -499,16 +500,20 @@ export class UsersService implements OnModuleInit, OnModuleDestroy {
     // The rank and phone tell apart two staff with the same name, so the right account gets the trip.
     const select = { id: true, name: true, phone: true, role: true, rank: { select: { name: true } } } as const;
     // Someone whose rank cannot open their trips in the app would be assigned work they cannot see.
-    const crewRank = (tripRole: 'DRIVER' | 'SUPERVISOR') => ({ job: { tripRole }, permissions: { has: 'crew.trips' } });
+    // An employee marked as a supervisor or a driver on their account gets the crew app with it, whatever their rank.
+    const crewRank = (tripRole: 'DRIVER' | 'SUPERVISOR') => ({
+      role: { not: 'PASSENGER' as const },
+      OR: [{ rank: { job: { tripRole }, permissions: { has: 'crew.trips' } } }, tripRole === 'DRIVER' ? { canDrive: true } : { canSupervise: true }],
+    });
     // Blocked, suspended and departed staff cannot be given a trip, so they are not offered.
     const working = { blockedAt: null, NOT: { employeeProfile: { is: { status: { in: ['TERMINATED', 'SUSPENDED'] as ('TERMINATED' | 'SUSPENDED')[] } } } } };
     const [drivers, supervisors] = await Promise.all([
       this.prisma.user.findMany({
-        where: { rank: crewRank('DRIVER'), ...working, AND: [{ NOT: { driverProfile: { is: { isActive: false } } } }] },
+        where: { ...working, AND: [crewRank('DRIVER'), { NOT: { driverProfile: { is: { isActive: false } } } }] },
         select: { ...select, driverProfile: { select: { iqamaNumber: true } } },
         orderBy: { name: 'asc' },
       }),
-      this.prisma.user.findMany({ where: { rank: crewRank('SUPERVISOR'), ...working }, select, orderBy: { name: 'asc' } }),
+      this.prisma.user.findMany({ where: { ...working, AND: [crewRank('SUPERVISOR')] }, select, orderBy: { name: 'asc' } }),
     ]);
     return { drivers, supervisors };
   }
@@ -666,6 +671,54 @@ export class UsersService implements OnModuleInit, OnModuleDestroy {
     });
     if (rankChanges) await this.prisma.refreshToken.updateMany({ where: { userId }, data: { revoked: true } });
     return updated;
+  }
+
+  /**
+   * Any employee can also supervise or drive trips, on top of their own job: a branch employee, an office clerk, or a driver
+   * who supervises. The mark brings the crew app's permissions for that role. It cannot be taken away while the person
+   * is on an upcoming trip in that role, unless their rank's job already makes them one.
+   */
+  async updateCrewRoles(actor: UserActor, userId: string, data: { canSupervise?: boolean; canDrive?: boolean }) {
+    const target = await this.prisma.user.findUnique({ where: { id: userId }, include: { rank: { include: { job: { select: { tripRole: true } } } } } });
+    if (!target || target.role === 'PASSENGER') throw new NotFoundException('الموظف غير موجود');
+    const next = { canSupervise: data.canSupervise ?? target.canSupervise, canDrive: data.canDrive ?? target.canDrive };
+    // Nobody hands out access beyond their own, the crew app's included.
+    this.assertWithinOwnAccess(actor, permissionsOf({ ...target, ...next }));
+
+    const jobRole = target.rank?.job.tripRole;
+    const upcoming = { tripStatus: { in: ['DRAFT', 'PUBLISHED'] as ('DRAFT' | 'PUBLISHED')[] }, arrivalTime: { gte: new Date() } };
+    if (target.canSupervise && !next.canSupervise && jobRole !== 'SUPERVISOR') {
+      const open = await this.prisma.tripSupervisor.findFirst({ where: { userId, trip: upcoming }, select: { trip: { select: { tripCode: true } } } });
+      if (open) throw new ConflictException(`الموظف مشرف على الرحلة ${open.trip.tripCode}، غيّر إسنادها أولًا`);
+    }
+    if (target.canDrive && !next.canDrive && jobRole !== 'DRIVER') {
+      const open = await this.prisma.tripDriver.findFirst({ where: { userId, trip: upcoming }, select: { trip: { select: { tripCode: true } } } });
+      if (open) throw new ConflictException(`الموظف سائق في الرحلة ${open.trip.tripCode}، غيّر إسنادها أولًا`);
+    }
+
+    return this.prisma.$transaction(async (tx) => {
+      // Someone who stops driving no longer holds a bus, unless their job is driving.
+      if (target.canDrive && !next.canDrive && jobRole !== 'DRIVER') await tx.bus.updateMany({ where: { fixedDriverId: userId }, data: { fixedDriverId: null } });
+      return tx.user.update({ where: { id: userId }, data: next, select: { id: true, name: true, canSupervise: true, canDrive: true } });
+    });
+  }
+
+  /** Working employees not yet able to take this role, to add them from the supervisors or drivers page. */
+  async getCrewCandidates(role: 'SUPERVISOR' | 'DRIVER', search?: string) {
+    const term = search?.trim();
+    const phone = term && /^0\d+$/.test(term) ? term.slice(1) : term;
+    const already = role === 'SUPERVISOR' ? SUPERVISOR_ELIGIBLE : DRIVER_ELIGIBLE;
+    return this.prisma.user.findMany({
+      where: {
+        role: { in: ['STAFF', 'DRIVER', 'ADMIN'] },
+        blockedAt: null,
+        NOT: [already, { employeeProfile: { is: { status: { in: ['TERMINATED', 'SUSPENDED'] } } } }],
+        ...(term && { OR: [{ name: { contains: term, mode: 'insensitive' as const } }, { phone: { contains: phone } }] }),
+      },
+      select: { id: true, name: true, phone: true, rank: { select: { name: true, job: { select: { name: true } } } }, branch: { select: { name: true } } },
+      orderBy: { name: 'asc' },
+      take: 30,
+    });
   }
 
   private assertCanManage(actor: UserActor, user: { role: string; rank: { permissions: string[] } | null }) {

@@ -133,6 +133,26 @@ class CreateStaffDto {
   branchId?: string;
 }
 
+class UpdateCrewRolesDto {
+  @IsOptional()
+  @IsBoolean()
+  canSupervise?: boolean;
+
+  @IsOptional()
+  @IsBoolean()
+  canDrive?: boolean;
+}
+
+class CrewCandidatesQuery {
+  @IsIn(['SUPERVISOR', 'DRIVER'])
+  role: 'SUPERVISOR' | 'DRIVER';
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(60)
+  search?: string;
+}
+
 class UpdateAccessDto {
   @IsOptional()
   @IsString()
@@ -586,8 +606,15 @@ export class UsersController {
     return this.achievements.forEmployee(id, query);
   }
 
+  @Get('crew-candidates')
+  @RequirePermission('employees.manage')
+  @ApiOperation({ summary: 'Working employees who are not yet supervisors (or drivers), to add them as one' })
+  async getCrewCandidates(@Query() query: CrewCandidatesQuery) {
+    return this.usersService.getCrewCandidates(query.role, query.search);
+  }
+
   @Get('crew')
-  @RequirePermission('trips.manage')
+  @RequirePermission('trips.manage', 'trips.crew')
   @ApiOperation({ summary: 'Drivers and supervisors who can be assigned to a trip' })
   async getCrew() {
     return this.usersService.getCrew();
@@ -682,6 +709,13 @@ export class UsersController {
   @ApiOperation({ summary: 'Update a customer or employee' })
   async updateUserAdmin(@Req() req, @Param('id') id: string, @Body() dto: UpdateUserAdminDto) {
     return this.usersService.updateUserAdmin(req.user, id, dto);
+  }
+
+  @Put(':id/crew-roles')
+  @RequirePermission('employees.manage')
+  @ApiOperation({ summary: 'Mark an employee, whatever their job, as able to supervise or drive trips' })
+  async updateCrewRoles(@Req() req, @Param('id') id: string, @Body() dto: UpdateCrewRolesDto) {
+    return this.usersService.updateCrewRoles(req.user, id, dto);
   }
 
   @Put(':id/access')
