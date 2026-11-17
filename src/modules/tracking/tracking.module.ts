@@ -1,4 +1,5 @@
 import { Body, Controller, ForbiddenException, ConflictException, Delete, Get, HttpCode, Injectable, Module, NotFoundException, Param, Post, Put, Req } from '@nestjs/common';
+import { TRIP_STOP_REASON_LABELS } from '../../common/utils/trip-status.util';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
 import { Type } from 'class-transformer';
@@ -468,6 +469,8 @@ class TrackingService {
             tripStatus: true,
             liveStatus: true,
             liveStatusAt: true,
+            stopReason: true,
+            originalDepartureTime: true,
             currentBoardingPointId: true,
             boardingPoints: { select: { id: true, name: true, time: true, address: true, lat: true, lng: true } },
             statusUpdates: { orderBy: { createdAt: 'desc' }, select: { id: true, status: true, boardingPointId: true, pointName: true, createdAt: true } },
@@ -560,6 +563,13 @@ class TrackingService {
       stage,
       liveStatus: trip.liveStatus,
       liveStatusAt: trip.liveStatusAt,
+      // An office stop is not explained to passengers; a breakdown or an emergency is.
+      stopReason: stage === 'STOPPED' && trip.stopReason && trip.stopReason !== 'OFFICE' ? TRIP_STOP_REASON_LABELS[trip.stopReason] : null,
+      // Minutes the departure moved since it was first published, while the bus has not left.
+      delayMinutes:
+        trip.liveStatus === 'NOT_STARTED' && trip.originalDepartureTime && trip.departureTime > trip.originalDepartureTime
+          ? Math.round((trip.departureTime.getTime() - trip.originalDepartureTime.getTime()) / 60_000)
+          : 0,
       points,
       // A straight line, so the app words it as approximate. Pointless once the bus has been there.
       distanceToMyPointKm: (() => {

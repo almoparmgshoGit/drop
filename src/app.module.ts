@@ -15,6 +15,7 @@ import { AuthModule } from './modules/auth/auth.module';
 import { TripsModule } from './modules/trips/trips.module';
 import { BookingsModule } from './modules/bookings/bookings.module';
 import { TicketsModule } from './modules/tickets/tickets.module';
+import { TripStatusModule } from './modules/trip-status/trip-status.module';
 import { UsersModule } from './modules/users/users.module';
 import { BusesModule } from './modules/buses/buses.module';
 import { PackagesModule } from './modules/packages/packages.module';
@@ -70,6 +71,7 @@ import { BulkModule } from './modules/bulk/bulk.module';
     TripsModule,
     BookingsModule,
     TicketsModule,
+    TripStatusModule,
     UsersModule,
     BusesModule,
     PackagesModule,

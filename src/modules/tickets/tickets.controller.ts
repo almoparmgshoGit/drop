@@ -1,7 +1,7 @@
 import { Controller, Get, Post, Param, Body, Req } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
 import { Transform, Type } from 'class-transformer';
-import { ArrayMaxSize, IsArray, IsBoolean, IsDateString, IsEnum, IsOptional, IsString, IsNotEmpty, MaxLength, ValidateNested } from 'class-validator';
+import { ArrayMaxSize, IsArray, IsBoolean, IsDateString, IsEnum, IsIn, IsOptional, IsString, IsNotEmpty, MaxLength, ValidateNested } from 'class-validator';
 import { TripLiveStatus } from '@prisma/client';
 import { TicketsService } from './tickets.service';
 import { CreateReportDto } from '../trip-reports/trip-reports.dto';
@@ -103,6 +103,16 @@ class SyncOfflineBoardingsDto {
   @ValidateNested({ each: true })
   @Type(() => OfflineBoardingItemDto)
   items: OfflineBoardingItemDto[];
+}
+
+class ReportBreakdownDto {
+  @IsIn(['BREAKDOWN', 'EMERGENCY'])
+  reason: 'BREAKDOWN' | 'EMERGENCY';
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(500)
+  note?: string;
 }
 
 class UpdateLiveStatusDto {
@@ -214,6 +224,20 @@ export class TicketsController {
   @ApiOperation({ summary: 'The office starts a trip from the dashboard, for a crew that cannot press start in the app' })
   async startTripFromOffice(@Req() req, @Param('tripId') tripId: string) {
     return this.ticketsService.startTrip(req.user, tripId, { fromOffice: true });
+  }
+
+  @Post('trips/:tripId/breakdown')
+  @RequirePermission('crew.status')
+  @ApiOperation({ summary: 'The crew reports a breakdown or an emergency: the trip stops and the passengers and the office are told' })
+  async reportBreakdown(@Req() req, @Param('tripId') tripId: string, @Body() dto: ReportBreakdownDto) {
+    return this.ticketsService.stopTrip(req.user, tripId, { reason: dto.reason, note: dto.note, fromCrew: true });
+  }
+
+  @Post('trips/:tripId/breakdown/resolve')
+  @RequirePermission('crew.status')
+  @ApiOperation({ summary: 'The crew resumes a trip it stopped for a breakdown or an emergency; an office stop is resumed by the office only' })
+  async resolveBreakdown(@Req() req, @Param('tripId') tripId: string) {
+    return this.ticketsService.resumeTrip(req.user, tripId, { fromCrew: true });
   }
 
   @Post('trips/:tripId/office-stop')

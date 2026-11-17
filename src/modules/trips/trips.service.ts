@@ -263,10 +263,18 @@ const sameMembers = (a: string[], b: string[]) => a.length === b.length && a.eve
  * Transport alone is sold on every trip whose stay can be left out: plain transport, and trips with a hotel that are not part of a
  * package and price the stay on top of the seat. A seat that already includes the stay has no price without it. Any other type matches itself.
  */
+const SEAT_SELLS_ALONE: Prisma.TripWhereInput = { OR: [{ bookingType: 'TRANSPORT_ONLY' }, { bookingType: 'WITH_HOTEL', packageId: null, housingPriceMode: { not: 'INCLUDED_IN_BASE' } }] };
+
 export const bookingTypeWhere = (bookingType: string): Prisma.TripWhereInput =>
   bookingType === 'TRANSPORT_ONLY'
-    ? { OR: [{ bookingType: 'TRANSPORT_ONLY' }, { bookingType: 'WITH_HOTEL', packageId: null, housingPriceMode: { not: 'INCLUDED_IN_BASE' } }] }
-    : { bookingType };
+    ? SEAT_SELLS_ALONE
+    : // The app's transport + stay: any seat sold alone, to which the customer adds a hotel, and a trip whose price includes its own.
+      bookingType === 'WITH_STAY'
+      ? { OR: [SEAT_SELLS_ALONE, { bookingType: 'WITH_HOTEL', packageId: null, housingPriceMode: 'INCLUDED_IN_BASE' }] }
+      : // The app's transport + stay tab books a trip and its stay directly; a package's trips are booked from the packages tab.
+      bookingType === 'WITH_HOTEL'
+      ? { bookingType, packageId: null }
+      : { bookingType };
 
 /** A package's trips go on sale with it: while the package is a draft or archived, its trips stay out of the app. */
 const ON_SALE_PACKAGE: Prisma.TripWhereInput = { OR: [{ packageId: null }, { package: { status: 'PUBLISHED' } }] };
@@ -275,7 +283,8 @@ const ON_SALE_PACKAGE: Prisma.TripWhereInput = { OR: [{ packageId: null }, { pac
 export function appTripWhere(filters: Pick<TripSearchFilters, 'origin' | 'destination' | 'date'>): Prisma.TripWhereInput {
   const now = new Date();
   // A trip waiting for its booking to open stays out of the app until then: the app has nowhere to show the opening date.
-  const where: Prisma.TripWhereInput = { tripStatus: 'PUBLISHED', channelApp: true, departureTime: { gt: now }, AND: [ON_SALE_PACKAGE, bookingOpenedWhere(now)] };
+  // Once the crew starts the trip it leaves the app's search: only those already booked follow it, from their bookings.
+  const where: Prisma.TripWhereInput = { tripStatus: 'PUBLISHED', channelApp: true, salesClosedAt: null, liveStatus: 'NOT_STARTED', departureTime: { gt: now }, AND: [ON_SALE_PACKAGE, bookingOpenedWhere(now)] };
   if (filters.origin) where.origin = { contains: filters.origin, mode: 'insensitive' };
   if (filters.destination) where.destination = { contains: filters.destination, mode: 'insensitive' };
   if (filters.date) {
@@ -293,7 +302,7 @@ export interface CrewActor {
 }
 
 /** A clock time (HH:mm) moved to keep its distance, within half a day either way, from one departure to another. */
-function shiftClock(time: string, from: Date, to: Date) {
+export function shiftClock(time: string, from: Date, to: Date) {
   const match = /^(\d{1,2}):(\d{2})$/.exec(time.trim());
   if (!match) return time;
   const minutesOf = (date: Date) => {
@@ -990,7 +999,10 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
       take: 100,
       include: PUBLIC_TRIP_INCLUDE,
     });
-    return oneBusPerConvoy(trips).map((trip) => toPublicTrip(withSeatPrice(trip, filters.bookingType === 'TRANSPORT_ONLY')));
+    // With transport + stay, a seat sold alone is priced alone and the customer adds a hotel; a trip including its stay keeps its offer.
+    const seatAlone = (trip: { housingPriceMode: string }) =>
+      filters.bookingType === 'TRANSPORT_ONLY' || (filters.bookingType === 'WITH_STAY' && trip.housingPriceMode !== 'INCLUDED_IN_BASE');
+    return oneBusPerConvoy(trips).map((trip) => toPublicTrip(withSeatPrice(trip, seatAlone(trip))));
   }
 
   /**
@@ -1001,7 +1013,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
   async searchOptions() {
     const trips = await this.prisma.trip.findMany({
       where: appTripWhere({}),
-      select: { origin: true, destination: true, bookingType: true, packageId: true, boardingPoints: { select: { lat: true, lng: true } } },
+      select: { origin: true, destination: true, bookingType: true, packageId: true, housingPriceMode: true, boardingPoints: { select: { lat: true, lng: true } } },
       orderBy: { departureTime: 'asc' },
       take: 2000,
     });
@@ -1014,7 +1026,8 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
     const origins = new Map<string, { lat: number; lng: number; points: number }>();
     const routes = new Map<string, { origin: string; destination: string; bookingType: string; isPackage: boolean }>();
     for (const trip of trips) {
-      typeCounts.set(trip.bookingType, (typeCounts.get(trip.bookingType) ?? 0) + 1);
+      // Counted as the tab finds it: a package's hotel trip belongs to the packages tab, not transport + stay.
+      if (!(trip.bookingType === 'WITH_HOTEL' && trip.packageId)) typeCounts.set(trip.bookingType, (typeCounts.get(trip.bookingType) ?? 0) + 1);
       const place = origins.get(trip.origin) ?? { lat: 0, lng: 0, points: 0 };
       for (const point of trip.boardingPoints) {
         if (point.lat === null || point.lng === null) continue;
@@ -1025,8 +1038,9 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
       origins.set(trip.origin, place);
       const isPackage = !!trip.packageId;
       routes.set(`${trip.origin}|${trip.destination}|${trip.bookingType}|${isPackage}`, { origin: trip.origin, destination: trip.destination, bookingType: trip.bookingType, isPackage });
-      // A trip with a hotel also sells its seat alone, so its route is on the transport tab too.
-      if (trip.bookingType === 'WITH_HOTEL' && !isPackage) {
+      // A trip whose stay is added on top of the seat also sells the seat alone, so its route is on the transport tab too,
+      // as the transport search finds it (bookingTypeWhere). One whose stay is in the price is sold with the stay only.
+      if (trip.bookingType === 'WITH_HOTEL' && !isPackage && trip.housingPriceMode !== 'INCLUDED_IN_BASE') {
         routes.set(`${trip.origin}|${trip.destination}|TRANSPORT_ONLY|false`, { origin: trip.origin, destination: trip.destination, bookingType: 'TRANSPORT_ONLY', isPackage: false });
         typeCounts.set('TRANSPORT_ONLY', (typeCounts.get('TRANSPORT_ONLY') ?? 0) + 1);
       }
@@ -1170,7 +1184,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
 
   async getTripById(id: string) {
     const trip = await this.prisma.trip.findFirst({
-      where: { id, tripStatus: 'PUBLISHED', channelApp: true, ...ON_SALE_PACKAGE },
+      where: { id, tripStatus: 'PUBLISHED', channelApp: true, liveStatus: 'NOT_STARTED', ...ON_SALE_PACKAGE },
       include: PUBLIC_TRIP_INCLUDE,
     });
     if (!trip) throw new NotFoundException('Trip not found');
@@ -2551,6 +2565,85 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
   }
 
   /** Cancelling a trip's first bus cancels the whole trip, every bus of it; any other bus can be cancelled on its own. */
+  /**
+   * Delays (or brings back) a trip that has not started. The move goes through the usual edit, so the arrival, the way back
+   * and the other buses move with it, the bus and crew are checked for clashes, and passengers and crew hear the new time.
+   * The gathering points, the itinerary and each booking's gathering time then move by the same amount on every trip that
+   * moved. The first departure is kept so the delay can be shown; moving back to it or earlier clears the delay.
+   */
+  async delayTrip(id: string, target: Date, actor: CrewActor, reason?: string) {
+    const trip = await this.prisma.trip.findUnique({
+      where: { id },
+      select: { tripStatus: true, liveStatus: true, departureTime: true, originalDepartureTime: true, convoyLeadId: true },
+    });
+    if (!trip) throw new NotFoundException('Trip not found');
+    if ((trip.tripStatus !== 'DRAFT' && trip.tripStatus !== 'PUBLISHED') || trip.liveStatus !== 'NOT_STARTED') {
+      throw new ConflictException('يمكن تأخير الرحلة قبل انطلاقها فقط');
+    }
+    // The other buses follow the first, so they are moved from it.
+    if (trip.convoyLeadId) throw new ConflictException('هذه حافلة إضافية في رحلة متعددة الحافلات، أخّر الحافلة الأولى فتتبعها البقية');
+    if (Number.isNaN(target.getTime())) throw new BadRequestException('الموعد الجديد غير صحيح');
+    if (target.getTime() === trip.departureTime.getTime()) throw new BadRequestException('الموعد الجديد هو نفس الموعد الحالي');
+    if (target <= new Date()) throw new BadRequestException('الموعد الجديد يجب أن يكون في المستقبل');
+
+    const family = await this.prisma.trip.findMany({
+      where: { OR: [{ id }, { convoyLeadId: id }, { reverseOfTripId: id }, { reverseOf: { convoyLeadId: id } }] },
+      select: { id: true, departureTime: true },
+    });
+    await this.updateTrip(id, { departureTime: target.toISOString() } as UpdateTripDto, actor, reason?.trim() || 'تأخير موعد الرحلة');
+
+    const original = trip.originalDepartureTime ?? trip.departureTime;
+    const isLate = target > original;
+    await this.prisma.$transaction(async (tx) => {
+      const after = await tx.trip.findMany({ where: { id: { in: family.map((row) => row.id) } }, select: { id: true, departureTime: true } });
+      for (const row of after) {
+        const before = family.find((item) => item.id === row.id)!.departureTime;
+        if (before.getTime() === row.departureTime.getTime()) continue;
+        const clock = (time: string) => shiftClock(time, before, row.departureTime);
+        const points = await tx.boardingPoint.findMany({ where: { tripId: row.id }, select: { id: true, time: true } });
+        for (const point of points) await tx.boardingPoint.update({ where: { id: point.id }, data: { time: clock(point.time) } });
+        const stops = await tx.itineraryStop.findMany({ where: { tripId: row.id }, select: { id: true, time: true } });
+        for (const stop of stops) await tx.itineraryStop.update({ where: { id: stop.id }, data: { time: clock(stop.time) } });
+        // Each booking keeps a copy of its gathering time for its ticket and reminders.
+        const bookings = await tx.booking.findMany({ where: { tripId: row.id, boardingPointTime: { not: null } }, select: { id: true, boardingPointTime: true } });
+        for (const booking of bookings) await tx.booking.update({ where: { id: booking.id }, data: { boardingPointTime: clock(booking.boardingPointTime!) } });
+      }
+      await tx.trip.update({
+        where: { id },
+        data: { originalDepartureTime: isLate ? original : null, delayReason: isLate ? reason?.trim() || null : null },
+      });
+    }, TRIP_TX_OPTIONS);
+    return { departureTime: target, delayMinutes: isLate ? Math.round((target.getTime() - original.getTime()) / 60_000) : 0 };
+  }
+
+  /**
+   * Brings a cancelled trip back as a draft, for a trip cancelled by mistake. Its bookings stay cancelled, since their money
+   * was already returned; the trip is sold again once republished. Its bus and crew must still be free at its time.
+   */
+  async restoreCancelledTrip(id: string) {
+    return this.prisma.$transaction(async (tx) => {
+      await lockTripsWithLinked(tx, [id]);
+      const trip = await tx.trip.findUnique({
+        where: { id },
+        select: { tripStatus: true, departureTime: true, arrivalTime: true, busId: true, drivers: { select: { userId: true } }, supervisors: { select: { userId: true } } },
+      });
+      if (!trip) throw new NotFoundException('Trip not found');
+      if (trip.tripStatus !== 'CANCELLED') throw new ConflictException('هذه الرحلة غير ملغاة');
+      if (trip.departureTime <= new Date()) throw new ConflictException('فات موعد هذه الرحلة، انسخها إلى موعد جديد بدلًا من استعادتها');
+      await this.assertNoScheduleConflict(tx, {
+        busId: trip.busId,
+        driverIds: trip.drivers.map((member) => member.userId),
+        supervisorIds: trip.supervisors.map((member) => member.userId),
+        start: trip.departureTime,
+        end: trip.arrivalTime,
+        excludeTripIds: [id],
+        leaveCheckIds: [],
+      });
+      await tx.trip.update({ where: { id }, data: { tripStatus: 'DRAFT', liveStatus: 'NOT_STARTED', liveStatusAt: null, stopReason: null, stopNote: null } });
+      return { tripStatus: 'DRAFT' as const };
+    }, TRIP_TX_OPTIONS);
+  }
+
   async cancelTrip(id: string, adminId: string, reason?: string, acknowledgeReturning = false) {
     const followers = await this.prisma.trip.findMany({
       where: { convoyLeadId: id, tripStatus: { in: ['DRAFT', 'PUBLISHED'] } },

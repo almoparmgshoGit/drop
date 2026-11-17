@@ -221,6 +221,13 @@ enum UnpaidBoardingPolicy {
   WARN
 }
 
+/// Why a started trip is stopped. OFFICE is the office's own decision and is not told to passengers; the others are.
+enum TripStopReason {
+  OFFICE
+  BREAKDOWN
+  EMERGENCY
+}
+
 enum TripLiveStatus {
   NOT_STARTED
   AT_POINT
@@ -586,6 +593,15 @@ model Trip {
   /// Where the crew says the bus is, as opposed to tripStatus, which is the trip's place in the office's workflow.
   liveStatus                 TripLiveStatus        @default(NOT_STARTED)
   liveStatusAt               DateTime?
+  /// Why the trip is stopped while liveStatus is STOPPED, and what whoever stopped it wrote. A crew can resume a breakdown it reported.
+  stopReason                 TripStopReason?
+  stopNote                   String?
+  /// The office closed the trip to new bookings in the app and the branches without touching its channels; the trip still runs.
+  salesClosedAt              DateTime?
+  salesClosedByName          String?
+  /// The departure before the trip was first delayed, so the delay can be shown; null while the trip is on time.
+  originalDepartureTime      DateTime?
+  delayReason                String?
   currentBoardingPointId     String?
   currentBoardingPoint       BoardingPoint?        @relation("TripCurrentPoint", fields: [currentBoardingPointId], references: [id], onDelete: SetNull)
   statusUpdates              TripStatusUpdate[]

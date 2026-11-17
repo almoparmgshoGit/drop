@@ -21,6 +21,7 @@ import { includesHousing, includesVisits } from '../../common/utils/booking-type
 import { serviceTypeOf } from '../../common/utils/booking-kinds.util';
 import { nextBookingNumber } from '../../common/utils/booking-number.util';
 import { GALLERY_SELECT } from '../../common/utils/gallery.util';
+import { riyadhDate } from '../../common/utils/time.util';
 import { housingCharge, HousingTerms, isRoomSellable, privateRoomsNeeded } from '../../common/utils/housing-price.util';
 import { applicableRule, daysUntil, parseCancellationRules } from '../../common/utils/cancellation-policy.util';
 import { paymentFigures } from '../../common/utils/payment.util';
@@ -167,6 +168,29 @@ export function allocate(total: number, weights: number[]): number[] {
   });
 }
 
+/** What the customer reads about a hotel they add to a transport booking, and what prices it. */
+const CHOSEN_STAY_HOTEL_SELECT = {
+  id: true,
+  name: true,
+  city: true,
+  address: true,
+  description: true,
+  services: SERVICE_SELECT,
+  offersSharedRoom: true,
+  offersPrivateRoom: true,
+  bedPrice: true,
+  privateRoomPrice: true,
+  privateRoomCapacity: true,
+  privateRoomPriceBasis: true,
+  housingPricePeriod: true,
+} satisfies Prisma.HotelSelect;
+
+/** The place as the customer reads it; the rates stay on the server. */
+const publicStayHotel = (hotel: Prisma.HotelGetPayload<{ select: typeof CHOSEN_STAY_HOTEL_SELECT }>) => {
+  const { id, name, city, address, description, services } = hotel;
+  return { id, ...withHotelServices({ name, city, address, description, services }) };
+};
+
 const roomOptionsOf = (hotel: { offersSharedRoom: boolean; offersPrivateRoom: boolean }): RoomType[] => [
   ...(hotel.offersSharedRoom ? (['SHARED'] as const) : []),
   ...(hotel.offersPrivateRoom ? (['PRIVATE'] as const) : []),
@@ -194,13 +218,17 @@ export class BookingsService {
   ) {}
 
   private assertBookable(
-    trip: { tripStatus: string; departureTime: Date; channelApp: boolean; bookingOpensAt: Date | null; packageId: string | null; package?: { status: string } | null } | null,
+    trip: { tripStatus: string; liveStatus: string; departureTime: Date; channelApp: boolean; salesClosedAt: Date | null; bookingOpensAt: Date | null; packageId: string | null; package?: { status: string } | null } | null,
   ) {
     if (!trip) throw new NotFoundException('الرحلة غير موجودة');
     if (trip.tripStatus !== 'PUBLISHED' || !trip.channelApp) throw new BadRequestException('هذه الرحلة غير متاحة للحجز');
+    // The office closed the trip to new bookings; it still runs for those already booked.
+    if (trip.salesClosedAt) throw new BadRequestException('أُغلق الحجز في هذه الرحلة');
     // A package's trips go on sale with it: a draft or archived package keeps them off the app.
     if (trip.packageId && trip.package?.status !== 'PUBLISHED') throw new BadRequestException('هذه الرحلة غير متاحة للحجز');
     if (trip.departureTime <= new Date()) throw new BadRequestException('انتهى موعد الحجز لهذه الرحلة');
+    // The crew may start before the departure time; from then the app sells nothing on the trip.
+    if (trip.liveStatus !== 'NOT_STARTED') throw new BadRequestException('انطلقت الرحلة ولم يعد الحجز فيها متاحًا من التطبيق');
     assertBookingOpened(trip);
   }
 
@@ -240,7 +268,7 @@ export class BookingsService {
   async getSeatMap(userId: string, tripId: string) {
     const now = new Date();
     const trip = await this.prisma.trip.findFirst({
-      where: { id: tripId, tripStatus: 'PUBLISHED', channelApp: true, OR: [{ packageId: null }, { package: { status: 'PUBLISHED' } }] },
+      where: { id: tripId, tripStatus: 'PUBLISHED', channelApp: true, salesClosedAt: null, liveStatus: 'NOT_STARTED', OR: [{ packageId: null }, { package: { status: 'PUBLISHED' } }] },
       include: { seats: true, package: { select: PACKAGE_PRICE_SELECT } },
     });
     if (!trip) throw new NotFoundException('الرحلة غير موجودة');
@@ -344,7 +372,7 @@ export class BookingsService {
           where: { status: 'CONFIRMED' },
           orderBy: { number: 'asc' },
           take: 1,
-          select: { hotel: { select: { name: true, city: true, address: true, description: true, services: SERVICE_SELECT, offersSharedRoom: true, offersPrivateRoom: true } } },
+          select: { hotelId: true, hotel: { select: { name: true, city: true, address: true, description: true, services: SERVICE_SELECT, offersSharedRoom: true, offersPrivateRoom: true } } },
         },
       },
     });
@@ -368,6 +396,10 @@ export class BookingsService {
       details: { ...builtStay.details, ...(skipsCustomStay && { choice: null }), canSkip: true, withoutHousing: skipsCustomStay },
     };
     const customStay = skipsCustomStay ? null : builtStay;
+    // A hotel the customer added to transport, like the counter's "transport with stay"; it rides on the outbound.
+    if (dto.stay && customPackage) throw new BadRequestException('الباقة المصممة لها سكنها، فلا يُضاف لها فندق آخر');
+    if (dto.stay && !dto.transportOnly) throw new BadRequestException('الفندق المختار يُضاف إلى حجز نقل');
+    const chosenStay = dto.stay ? await this.priceChosenStay(db, dto.stay, seated) : null;
 
     const listedLegs = seated.map(({ leg, trip, seats }, index) => {
       // A package charges its total for the group's size; an ordinary trip charges each seat.
@@ -381,7 +413,7 @@ export class BookingsService {
       if (dto.transportOnly && includesHousing(trip.bookingType) && trip.housingPriceMode === 'INCLUDED_IN_BASE') {
         throw new BadRequestException('السكن مشمول في سعر هذه الرحلة، ولا يمكن حجزها بدون سكن');
       }
-      const stay = customStayLeg ? (index === 0 ? customStayLeg : null) : dto.transportOnly ? null : this.priceStay(trip, leg, seats.length);
+      const stay = customStayLeg ? (index === 0 ? customStayLeg : null) : chosenStay ? (index === 0 ? chosenStay : null) : dto.transportOnly ? null : this.priceStay(trip, leg, seats.length);
       const housingAmount = stay?.amount ?? 0;
       return { leg, trip, seats, unitPrice, pricing, stay, seatsSubtotal, housingAmount, subtotal: seatsSubtotal + housingAmount, roundShare: false };
     });
@@ -497,6 +529,7 @@ export class BookingsService {
       coupon,
       housing,
       customStay,
+      chosenStay,
       skipsCustomStay,
       walletUsed,
       walletOnTickets,
@@ -547,6 +580,124 @@ export class BookingsService {
         vatRate,
         vatIncluded: toSar(vat),
         currency: 'SAR',
+      },
+    };
+  }
+
+  /**
+   * The housing terms a hotel is sold on with these trips, the counter's rule: a trip already sold with this hotel, then a
+   * trip with its own housing price, else the hotel's own rates charged on top of the seats. The period is the hotel's, as
+   * the nights are chosen here rather than set by the trip.
+   */
+  private stayTerms(
+    hotel: {
+      id: string;
+      bedPrice: Prisma.Decimal | null;
+      privateRoomPrice: Prisma.Decimal | null;
+      privateRoomCapacity: number | null;
+      privateRoomPriceBasis: HousingTerms['privateRoomPriceBasis'];
+      housingPricePeriod: HousingTerms['housingPricePeriod'];
+    },
+    trips: (HousingTerms & { hotelBookings: { hotelId: string }[] })[],
+  ): HousingTerms {
+    const tripTerms =
+      trips.find((trip) => trip.hotelBookings.some((booking) => booking.hotelId === hotel.id)) ??
+      trips.find((trip) => trip.housingPrice !== null || trip.privateRoomPrice !== null);
+    if (tripTerms) {
+      const { housingPrice, privateRoomPrice, privateRoomCapacity, housingPriceMode, privateRoomPriceBasis } = tripTerms;
+      return { housingPrice, privateRoomPrice, privateRoomCapacity, housingPriceMode, privateRoomPriceBasis, housingPricePeriod: hotel.housingPricePeriod };
+    }
+    return {
+      housingPrice: hotel.bedPrice,
+      privateRoomPrice: hotel.privateRoomPrice,
+      privateRoomCapacity: hotel.privateRoomCapacity,
+      housingPriceMode: 'ADDED_TO_BASE',
+      privateRoomPriceBasis: hotel.privateRoomPriceBasis,
+      housingPricePeriod: hotel.housingPricePeriod,
+    };
+  }
+
+  /** The hotels a customer may add to a transport trip, the trip's own and its destination's first, with the rooms each can sell. */
+  async stayHotels(tripId: string) {
+    const trip = await this.prisma.trip.findFirst({
+      where: { id: tripId, tripStatus: 'PUBLISHED', channelApp: true },
+      select: {
+        destination: true,
+        packageId: true,
+        housingPrice: true,
+        privateRoomPrice: true,
+        privateRoomCapacity: true,
+        housingPriceMode: true,
+        privateRoomPriceBasis: true,
+        housingPricePeriod: true,
+        hotelBookings: { where: { status: 'CONFIRMED' }, select: { hotelId: true } },
+      },
+    });
+    if (!trip) throw new NotFoundException('الرحلة غير موجودة');
+    if (trip.packageId) throw new BadRequestException('الباقة تشمل سكنها');
+    const hotels = await this.prisma.hotel.findMany({ where: { isActive: true }, orderBy: { name: 'asc' }, select: CHOSEN_STAY_HOTEL_SELECT });
+    const own = new Set(trip.hotelBookings.map((booking) => booking.hotelId));
+    const destination = trip.destination.trim();
+    return hotels
+      .map((hotel) => {
+        const terms = this.stayTerms(hotel, [trip]);
+        return {
+          ...publicStayHotel(hotel),
+          options: roomOptionsOf(hotel).filter((room) => isRoomSellable(terms, room)),
+          isTripHotel: own.has(hotel.id),
+          inDestination: hotel.city.trim() === destination,
+        };
+      })
+      .filter((hotel) => hotel.options.length > 0)
+      .sort((a, b) => Number(b.isTripHotel) - Number(a.isTripHotel) || Number(b.inDestination) - Number(a.inDestination));
+  }
+
+  /** A hotel the customer added to a transport booking: checked in on the outbound's day for the nights chosen, priced like the counter. */
+  private async priceChosenStay(
+    db: Prisma.TransactionClient,
+    stay: { hotelId: string; roomType: RoomType; nights: number; privateRooms?: number },
+    seated: { trip: HousingTerms & { package: unknown; departureTime: Date; hotelBookings: { hotelId: string }[] }; seats: string[] }[],
+  ) {
+    if (seated.some((row) => row.trip.package)) throw new BadRequestException('الباقة تشمل سكنها، فلا يُضاف لها فندق آخر');
+    // The stay starts with the outbound, which the app sends first; a return leaving before it would put the stay in the wrong place.
+    if (seated.length > 1 && seated[1].trip.departureTime < seated[0].trip.departureTime) throw new BadRequestException('أرسل رحلة الذهاب أولًا ثم رحلة العودة');
+    const persons = seated[0].seats.length;
+    const checkInDay = riyadhDate(seated[0].trip.departureTime);
+    const checkIn = new Date(`${checkInDay}T00:00:00Z`);
+    const checkOut = new Date(checkIn.getTime() + stay.nights * 24 * 3_600_000);
+    if (seated[1] && checkOut.toISOString().slice(0, 10) > riyadhDate(seated[1].trip.departureTime)) {
+      throw new BadRequestException('ليالي السكن تتجاوز موعد رحلة العودة، قلّل عدد الليالي');
+    }
+    const hotel = await db.hotel.findUnique({ where: { id: stay.hotelId }, select: { ...CHOSEN_STAY_HOTEL_SELECT, isActive: true } });
+    if (!hotel?.isActive) throw new BadRequestException('الفندق غير موجود أو موقوف');
+    if (!roomOptionsOf(hotel).includes(stay.roomType)) throw new BadRequestException('نوع السكن المختار غير متاح في هذا الفندق');
+    const terms = this.stayTerms(hotel, seated.map((row) => row.trip));
+    if (!isRoomSellable(terms, stay.roomType)) throw new BadRequestException(`لا يوجد سعر لهذا النوع من السكن في ${hotel.name}`);
+    const rooms = stay.roomType === 'PRIVATE' ? stay.privateRooms ?? 1 : 1;
+    if (rooms > persons) throw new BadRequestException('عدد الغرف أكثر من عدد المسافرين');
+    const amount = housingCharge(terms, stay.roomType, persons, stay.nights, rooms);
+    return {
+      hotelId: hotel.id,
+      checkIn,
+      checkOut,
+      nights: stay.nights,
+      amount,
+      // Shaped like a trip's own stay, with the one room already picked, so every screen shows it the same way.
+      details: {
+        ...publicStayHotel(hotel),
+        chosenStay: true,
+        nights: stay.nights,
+        checkIn: checkInDay,
+        checkOut: checkOut.toISOString().slice(0, 10),
+        options: [stay.roomType],
+        choice: stay.roomType,
+        optionAmounts: { [stay.roomType]: toSar(amount) },
+        privateRoomCapacity: terms.privateRoomCapacity,
+        privateRoomsNeeded: privateRoomsNeeded(terms.privateRoomCapacity, persons),
+        privateRoomAmount: toSar(housingCharge(terms, 'PRIVATE', persons, stay.nights, 1)),
+        privateRooms: rooms,
+        canSkip: false,
+        withoutHousing: false,
       },
     };
   }
@@ -693,7 +844,7 @@ export class BookingsService {
           // Which rows are sold as transport alone: all of them when the customer asked for transport or left a built package's stay
           // out, otherwise each trip whose hotel they left out. The kind tells the rooming sheet and the crew there is no stay.
           const asTransport = quote.pricedLegs.map(
-            (leg) => quote.skipsCustomStay || (!quote.customStay && (!!dto.transportOnly || !!leg.leg.withoutHousing)),
+            (leg) => quote.skipsCustomStay || (!quote.customStay && !quote.chosenStay && (!!dto.transportOnly || !!leg.leg.withoutHousing)),
           );
           const allTransport = asTransport.every(Boolean);
           const transportKind = (legIndex: number) =>
@@ -757,6 +908,17 @@ export class BookingsService {
                     stayCheckIn: quote.customStay.checkIn,
                     stayCheckOut: quote.customStay.checkOut,
                     stayNights: quote.customStay.nights,
+                  }),
+                }),
+                // Transport with a hotel the customer picked: recorded as the counter records it, the stay on the outbound.
+                ...(quote.chosenStay && {
+                  kind: quote.pricedLegs.length > 1 ? ('PACKAGE_ROUND_STAY' as const) : ('PACKAGE_OUTBOUND_STAY' as const),
+                  leg: legIndex === 0 ? ('OUTBOUND' as const) : ('RETURN' as const),
+                  ...(legIndex === 0 && {
+                    stayHotelId: quote.chosenStay.hotelId,
+                    stayCheckIn: quote.chosenStay.checkIn,
+                    stayCheckOut: quote.chosenStay.checkOut,
+                    stayNights: quote.chosenStay.nights,
                   }),
                 }),
                 // Named as transport, so the rooming sheet and the crew know this booking has no stay even on a trip with a hotel.

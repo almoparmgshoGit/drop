@@ -62,7 +62,7 @@ describe('Chat, presence, blocking and promotional credit', () => {
       expect(thread.body.customer.phone).toBe(customer.phone);
     });
 
-    it('notifies a customer who is away from the chat screen, and not one reading it', async () => {
+    it('notifies the customer of every reply, even with the chat screen last reported, and reading the chat clears it', async () => {
       const customer = await loginPassenger(app);
       const { list } = await startThread(customer);
       const row = list.items.find((item: any) => item.customer.phone === customer.phone);
@@ -72,9 +72,24 @@ describe('Chat, presence, blocking and promotional credit', () => {
       await http().post(`${API}/chat/conversations/${row.id}/messages`).set(admin.auth).send({ body: 'رد أول' }).expect(201);
       expect(await count()).toBe(1);
 
+      // The presence row can outlive the app going to the background, so it no longer holds the reply back.
       await http().post(`${API}/presence`).set(customer.auth).send({ screen: 'Chat', platform: 'android' }).expect(201);
       await http().post(`${API}/chat/conversations/${row.id}/messages`).set(admin.auth).send({ body: 'رد ثانٍ' }).expect(201);
-      expect(await count()).toBe(1);
+      expect(await count()).toBe(2);
+
+      await http().post(`${API}/chat/mine/read`).set(customer.auth).expect(201);
+      expect(await count()).toBe(0);
+    });
+
+    it('tells staff of the first unread customer message, not of every line after it', async () => {
+      const customer = await loginPassenger(app);
+      const staffCount = async () => (await http().get(`${API}/notifications/mine/summary`).set(admin.auth).expect(200)).body.unreadCount;
+      await http().post(`${API}/notifications/mine/read-all`).set(admin.auth).expect(201);
+
+      await http().post(`${API}/chat/mine/messages`).set(customer.auth).send({ body: 'السلام عليكم' }).expect(201);
+      expect(await staffCount()).toBe(1);
+      await http().post(`${API}/chat/mine/messages`).set(customer.auth).send({ body: 'عندي سؤال' }).expect(201);
+      expect(await staffCount()).toBe(1);
     });
 
     it('does not post a retried message twice', async () => {

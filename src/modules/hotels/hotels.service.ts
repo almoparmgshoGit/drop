@@ -41,7 +41,7 @@ const MAX_PLANNED_PASSENGERS = 300;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const RIYADH_OFFSET_MS = 3 * 60 * 60 * 1000;
 const DEFAULT_ROOM_CAPACITY = 4;
-const HOUSED_STATUSES: BookingStatus[] = ['CONFIRMED', 'BOARDED', 'PENDING_CANCELLATION_REVIEW'];
+export const HOUSED_STATUSES: BookingStatus[] = ['CONFIRMED', 'BOARDED', 'PENDING_CANCELLATION_REVIEW'];
 // A cancelled traveler may have stayed before cancelling, so a complaint can still name them; an unpaid booking never stayed.
 const COMPLAINT_BOOKING_STATUSES: BookingStatus[] = [...HOUSED_STATUSES, 'CANCELLED'];
 const MAX_OPEN_TRAVELER_COMPLAINTS = 5;
@@ -303,7 +303,8 @@ export class HotelsService {
       await this.notifications.toStaff(
         tx,
         'STAFF_HOTEL_COMPLAINT',
-        ['hotels.view'],
+        // Customer support works the hotel tab of the complaints page too, so a traveler's complaint reaches them as well.
+        ['hotels.view', 'complaints.view'],
         { hotelName: complaint.hotel.name, complaintReference: complaintReference(complaint.number), complaintSubject: data.subject, complaintAuthor: data.createdByName },
         { exceptUserId: data.createdById ?? undefined },
       );

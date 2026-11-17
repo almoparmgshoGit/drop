@@ -24,6 +24,12 @@ export class BookingsController {
     return this.bookingsService.quote(req.user.userId, dto);
   }
 
+  @Get('stay-hotels/:tripId')
+  @ApiOperation({ summary: 'Hotels a customer may add to a transport booking on this trip, with the room types each sells' })
+  async getStayHotels(@Param('tripId') tripId: string) {
+    return this.bookingsService.stayHotels(tripId);
+  }
+
   @Get('seat-map/:tripId')
   @ApiOperation({ summary: 'Seat map of a trip from the current user point of view' })
   async getSeatMap(@Req() req, @Param('tripId') tripId: string) {

@@ -22,6 +22,8 @@ const TRIP_FOR_WAITLIST = {
   hijriDate: true,
   tripStatus: true,
   channelApp: true,
+  salesClosedAt: true,
+  liveStatus: true,
   bookingOpensAt: true,
   maxSeatsPerBooking: true,
   totalSeats: true,
@@ -36,6 +38,8 @@ type WaitlistTrip = Prisma.TripGetPayload<{ select: typeof TRIP_FOR_WAITLIST }>;
 const isOnSale = (trip: WaitlistTrip, now: Date) =>
   trip.tripStatus === 'PUBLISHED' &&
   trip.channelApp &&
+  !trip.salesClosedAt &&
+  trip.liveStatus === 'NOT_STARTED' &&
   trip.departureTime > now &&
   (!trip.packageId || trip.package?.status === 'PUBLISHED') &&
   (!trip.bookingOpensAt || trip.bookingOpensAt <= now);
@@ -255,7 +259,7 @@ export class WaitlistService {
     const stale = await this.prisma.waitlistEntry.findMany({
       where: {
         status: { in: ACTIVE },
-        trip: { OR: [{ tripStatus: { not: 'PUBLISHED' } }, { departureTime: { lte: now } }, { channelApp: false }] },
+        trip: { OR: [{ tripStatus: { not: 'PUBLISHED' } }, { departureTime: { lte: now } }, { channelApp: false }, { salesClosedAt: { not: null } }, { liveStatus: { not: 'NOT_STARTED' } }] },
       },
       select: { id: true },
       take: SWEEP_BATCH,

@@ -82,6 +82,28 @@ export class PassengerDto {
   nationality?: string;
 }
 
+/** A hotel the customer adds to a transport booking, as the branch counter does: checked in on the outbound's day. */
+export class CustomerStayDto {
+  @IsString()
+  @Length(1, 60)
+  hotelId: string;
+
+  @IsEnum(RoomType)
+  roomType: RoomType;
+
+  @IsInt()
+  @Min(1)
+  @Max(60)
+  nights: number;
+
+  /** Private rooms for a group larger than one room holds; one by default. */
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(20)
+  privateRooms?: number;
+}
+
 export class QuoteDto {
   @IsArray()
   @ArrayMinSize(1)
@@ -119,6 +141,12 @@ export class QuoteDto {
   @IsString()
   @Length(1, 60)
   customPackageId?: string;
+
+  /** A hotel the customer adds to a transport booking (transportOnly): it sits on the first leg, the outbound. */
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => CustomerStayDto)
+  stay?: CustomerStayDto;
 }
 
 export class CreateBookingDto extends QuoteDto {

@@ -52,6 +52,7 @@ const JOURNEY_TRIP = {
   departureTime: true,
   tripStatus: true,
   channelBranch: true,
+  salesClosedAt: true,
   bookingOpensAt: true,
   price: true,
   pricingRules: true,
@@ -152,6 +153,7 @@ export class BranchBookingsService {
     const open: Prisma.TripWhereInput = {
       tripStatus: 'PUBLISHED' as const,
       channelBranch: true,
+      salesClosedAt: null,
       departureTime: { gt: now },
       // The counter sells only what the app could: a trip waiting for its opening day stays out of the picker.
       AND: [{ OR: [{ packageId: null }, { package: { status: 'PUBLISHED' as const } }] }, bookingOpenedWhere(now), ...(city ? [cityTripWhere(city)] : [])],
@@ -212,7 +214,7 @@ export class BranchBookingsService {
 
   async seatMap(tripId: string) {
     const trip = await this.prisma.trip.findFirst({
-      where: { id: tripId, tripStatus: 'PUBLISHED', channelBranch: true, OR: [{ packageId: null }, { package: { status: 'PUBLISHED' } }] },
+      where: { id: tripId, tripStatus: 'PUBLISHED', channelBranch: true, salesClosedAt: null, OR: [{ packageId: null }, { package: { status: 'PUBLISHED' } }] },
       select: { totalSeats: true, availableSeats: true, seatLayout: true, busId: true, seats: { select: { seatNumber: true, isBooked: true, heldUntil: true } } },
     });
     if (!trip) throw new NotFoundException('الرحلة غير موجودة');
@@ -427,6 +429,7 @@ export class BranchBookingsService {
   private assertSellable(trip: JourneyTrip | undefined): asserts trip is JourneyTrip {
     if (!trip) throw new NotFoundException('الرحلة غير موجودة');
     if (trip.tripStatus !== 'PUBLISHED' || !trip.channelBranch) throw new BadRequestException(`الرحلة ${trip.tripCode} غير متاحة للحجز من الفروع`);
+    if (trip.salesClosedAt) throw new BadRequestException(`أُغلق الحجز في الرحلة ${trip.tripCode}`);
     // A package's trips go on sale with it, the same rule as the app.
     if (trip.package && trip.package.status !== 'PUBLISHED') throw new BadRequestException(`باقة الرحلة ${trip.tripCode} غير منشورة`);
     if (trip.departureTime <= new Date()) throw new BadRequestException(`انتهى موعد الحجز للرحلة ${trip.tripCode}`);

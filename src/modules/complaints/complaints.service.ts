@@ -5,7 +5,7 @@ import { NotificationsService } from '../../common/services/notifications.servic
 import { PrismaService } from '../../common/services/prisma.service';
 import { RealtimeService } from '../../common/services/realtime.service';
 import { cleanFileName } from '../cash/cash.service';
-import { complaintReference, hotelBookingReference } from '../hotels/hotels.service';
+import { complaintReference, hotelBookingReference, HOUSED_STATUSES } from '../hotels/hotels.service';
 import { CreateCustomerComplaintDto, ListCustomerComplaintsQuery, ListHotelComplaintsQuery, TicketView } from './complaints.dto';
 
 const TX_OPTIONS = { maxWait: 10_000, timeout: 30_000 };
@@ -144,22 +144,60 @@ export class ComplaintsService {
 
   // ---------------------------------------------------------------- the customer
 
-  /** The customer's complaints, and the bookings a complaint about a trip or a supervisor can name. */
+  /**
+   * The customer's complaints, and the bookings a complaint about a trip, a supervisor, a bus or a hotel can name.
+   * A hotel complaint lives in the hotel's own table (sent through /bookings/:id/hotel-complaints), so its list comes
+   * separately and the app shows it beside the tickets.
+   */
   async mine(userId: string) {
-    const [complaints, bookings] = await Promise.all([
+    const [complaints, bookings, hotelComplaints] = await Promise.all([
       this.prisma.customerComplaint.findMany({ where: { userId }, orderBy: { lastActivityAt: 'desc' }, select: CUSTOMER_VIEW_SELECT }),
       // An unpaid booking never travelled, so there is nothing to complain about on it.
       this.prisma.booking.findMany({
         where: { userId, status: { not: 'PENDING' } },
         orderBy: { trip: { departureTime: 'desc' } },
         take: MAX_BOOKING_CHOICES,
-        select: BOOKING_CHOICE_SELECT,
+        select: {
+          ...BOOKING_CHOICE_SELECT,
+          status: true,
+          passengers: { orderBy: { position: 'asc' }, select: { id: true, fullName: true } },
+          trip: {
+            select: {
+              ...BOOKING_CHOICE_SELECT.trip.select,
+              hotelBookings: { where: { status: 'CONFIRMED' }, orderBy: { number: 'asc' }, select: { id: true, hotel: { select: { name: true, city: true } } } },
+            },
+          },
+        },
+      }),
+      // Only what the customer sent; a complaint the hotel raised about them stays internal.
+      this.prisma.hotelComplaint.findMany({
+        where: { submittedByTraveler: true, booking: { userId } },
+        orderBy: { createdAt: 'desc' },
+        select: {
+          id: true,
+          number: true,
+          status: true,
+          subject: true,
+          details: true,
+          travelerName: true,
+          resolution: true,
+          resolvedAt: true,
+          createdAt: true,
+          hotel: { select: { name: true } },
+          booking: { select: { bookingReference: true } },
+        },
       }),
     ]);
     return {
       complaints: complaints.map(({ number, booking, ...complaint }) => ({
         ...complaint,
         reference: customerComplaintReference(number),
+        bookingReference: booking?.bookingReference ?? null,
+      })),
+      hotelComplaints: hotelComplaints.map(({ number, hotel, booking, ...complaint }) => ({
+        ...complaint,
+        reference: complaintReference(number),
+        hotelName: hotel.name,
         bookingReference: booking?.bookingReference ?? null,
       })),
       bookings: bookings.map((booking) => ({
@@ -172,6 +210,11 @@ export class ComplaintsService {
         supervisors: supervisorNamesOf(booking),
         // Lets the customer recognise the bus they mean when complaining about it.
         busPlate: booking.trip.bus?.plateNumber ?? null,
+        // The hotels a complaint about one can name: only while the booking still holds its rooms, as the hotel endpoint checks.
+        hotels: HOUSED_STATUSES.includes(booking.status)
+          ? booking.trip.hotelBookings.map((stay) => ({ hotelBookingId: stay.id, name: stay.hotel.name, city: stay.hotel.city }))
+          : [],
+        passengers: booking.passengers,
       })),
     };
   }
@@ -294,12 +337,16 @@ export class ComplaintsService {
           ...(ticket.status === 'RESOLVED' && { status: 'OPEN', resolution: null, resolvedAt: null, resolvedById: null, resolvedByName: null }),
         },
       });
+      const values = {
+        complaintReference: customerComplaintReference(ticket.number),
+        complaintCategory: COMPLAINT_CATEGORY_LABELS[ticket.category],
+        customerName: user.name || user.phone,
+      };
       if (ticket.assignedToId) {
-        await this.notifications.toUser(tx, 'COMPLAINT_CUSTOMER_REPLIED', ticket.assignedToId, {
-          complaintReference: customerComplaintReference(ticket.number),
-          complaintCategory: COMPLAINT_CATEGORY_LABELS[ticket.category],
-          customerName: user.name || user.phone,
-        });
+        await this.notifications.toUser(tx, 'COMPLAINT_CUSTOMER_REPLIED', ticket.assignedToId, values);
+      } else {
+        // Nobody holds it yet, so the reply goes to everyone who answers complaints, as the ticket itself did.
+        await this.notifications.toStaff(tx, 'STAFF_COMPLAINT_CUSTOMER_REPLY', ['complaints.view'], values);
       }
     }, TX_OPTIONS);
     this.realtime.complaintChanged(id, userId);

@@ -19,7 +19,6 @@ const NOTIFY_LENGTH = 200;
 const ONLINE_WINDOW_MS = 2 * 60_000;
 const ABANDON_WINDOW_MS = 60 * 60_000;
 const PAYMENT_ROUTE = 'Payment';
-const CHAT_ROUTE = 'Chat';
 
 const trimmed = () => Transform(({ value }) => (typeof value === 'string' ? value.trim() : value));
 
@@ -254,10 +253,21 @@ export class ChatService {
 
   private async postFromCustomer(customerId: string, conversationId: string, body: string, clientId?: string, bookingCard?: Prisma.InputJsonValue) {
     const sent = await this.post(conversationId, clientId, CUSTOMER_MESSAGE_SELECT, async (tx) => {
+      const before = await tx.conversation.findUniqueOrThrow({
+        where: { id: conversationId },
+        select: { status: true, staffUnread: true, assignedToId: true, customer: { select: { name: true, phone: true } } },
+      });
       const message = await tx.chatMessage.create({
         data: { conversationId, sender: 'CUSTOMER', body, bookingCard, clientId },
         select: CUSTOMER_MESSAGE_SELECT,
       });
+      // Staff hear of the first message nobody has read yet (or one that reopens a closed chat); the rest of the
+      // burst only raises the unread count, so a customer typing several lines does not ring the office several times.
+      if (before.staffUnread === 0 || before.status === 'CLOSED') {
+        const values = { customerName: before.customer.name || before.customer.phone || 'عميل', message: preview(body, NOTIFY_LENGTH) };
+        if (before.assignedToId) await this.notifications.toUser(tx, 'STAFF_CHAT_MESSAGE', before.assignedToId, values);
+        else await this.notifications.toStaff(tx, 'STAFF_CHAT_MESSAGE', ['chat.reply'], values);
+      }
       await tx.conversation.update({
         where: { id: conversationId },
         data: {
@@ -278,6 +288,10 @@ export class ChatService {
   async markMineRead(user: { userId: string; role: string }) {
     this.assertCustomer(user.role);
     await this.prisma.conversation.updateMany({ where: { customerId: user.userId, customerUnread: { gt: 0 } }, data: { customerUnread: 0 } });
+    // The replies are read in the chat itself, so their notifications must not pop up again when the customer leaves it.
+    const cleared = await this.prisma.notification.updateMany({ where: { userId: user.userId, event: 'CHAT_STAFF_REPLY', readAt: null }, data: { readAt: new Date() } });
+    // Same signal as a new one, so the badges in the app count again.
+    if (cleared.count > 0) this.realtime.notificationsCreated([user.userId]);
     return { unread: 0 };
   }
 
@@ -408,7 +422,7 @@ export class ChatService {
   async sendAsStaff(staff: Staff, id: string, dto: StaffMessageDto) {
     const conversation = await this.prisma.conversation.findUnique({
       where: { id },
-      select: { id: true, assignedToId: true, customerId: true, customer: { select: { blockedAt: true, appPresence: { select: { screen: true, lastSeenAt: true } } } } },
+      select: { id: true, assignedToId: true, customerId: true, customer: { select: { blockedAt: true } } },
     });
     if (!conversation) throw new NotFoundException('المحادثة غير موجودة');
     if (conversation.customer.blockedAt) throw new ConflictException('هذا العميل محظور، فلا تصله الرسائل');
@@ -421,9 +435,6 @@ export class ChatService {
       body ||= `أرسلنا لك كوبون خصم ${coupon.code}. استخدمه عند إتمام حجزك.`;
     }
     if (!body) throw new BadRequestException('اكتب رسالة أو اختر كوبونًا');
-
-    const presence = conversation.customer.appPresence;
-    const isReading = !!presence && presence.screen === CHAT_ROUTE && presence.lastSeenAt >= this.onlineSince();
 
     const sent = await this.post(id, dto.clientId, STAFF_MESSAGE_SELECT, async (tx) => {
       const message = await tx.chatMessage.create({
@@ -445,8 +456,10 @@ export class ChatService {
           ...(conversation.assignedToId ? {} : { assignedToId: staff.userId, assignedToName: staff.name ?? null }),
         },
       });
-      // Someone looking at the thread already sees the reply; a sheet on top of it would only get in the way.
-      if (!isReading) await this.notifications.toUser(tx, 'CHAT_STAFF_REPLY', conversation.customerId, { message: preview(body, NOTIFY_LENGTH) });
+      // Always sent: the presence row can still say «in the chat» for a while after the app went to the background, and
+      // skipping on it lost the reply. A customer who is reading the chat sees no sheet (the chat is a quiet screen, and
+      // the phone stays silent in the foreground), and reading it marks this notification read (markMineRead).
+      await this.notifications.toUser(tx, 'CHAT_STAFF_REPLY', conversation.customerId, { message: preview(body, NOTIFY_LENGTH) });
       return message;
     });
     this.realtime.chatMessage(conversation.customerId, id, sent, dto.clientId);
