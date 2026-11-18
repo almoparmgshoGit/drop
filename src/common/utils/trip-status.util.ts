@@ -40,6 +40,7 @@ export const TRIP_STATUS_ACTIONS = [
   'STOP',
   'RESUME',
   'UNDO_ARRIVAL',
+  'UNDO_START',
   'CANCEL',
   'RESTORE',
 ] as const;
@@ -115,6 +116,7 @@ export const ACTION_LABELS: Record<TripStatusAction, string> = {
   STOP: 'إيقاف الرحلة',
   RESUME: 'استئناف الرحلة',
   UNDO_ARRIVAL: 'التراجع عن الوصول',
+  UNDO_START: 'إرجاعها لم تنطلق',
   CANCEL: 'إلغاء الرحلة',
   RESTORE: 'استعادة الرحلة الملغاة',
 };
@@ -133,6 +135,7 @@ export const ACTION_EFFECTS: Record<TripStatusAction, string> = {
   STOP: 'يتجمد تحديث الحالة ومسح التذاكر. العطل والظرف الطارئ يُبلَّغ بهما المسافرون والمكتب، والإيقاف الإداري لا يُبلَّغ للمسافرين.',
   RESUME: 'تعود الرحلة من آخر مكان سجله الطاقم، ويُبلَّغ المسافرون إن كانوا قد أُبلغوا بالتوقف.',
   UNDO_ARRIVAL: 'تعود الرحلة جارية في الطريق ليُكمل الطاقم تحديثها. متاح قبل إقفال حسابها وخلال مهلة التتبع.',
+  UNDO_START: 'تعود الرحلة "لم تنطلق" كأنها لم تبدأ: يتوقف تحديث مكان الحافلة حتى تُبدأ من جديد، ويعود الحجز من التطبيق إن لم يحن موعدها. متاح فقط ما دام لم يصعد أي راكب.',
   CANCEL: 'تُلغى كل الحجوزات ويُعاد المبلغ للمحافظ، وتُلغى رحلة العودة وباقي الحافلات وحجوزات الفنادق، ويُبلَّغ الجميع.',
   RESTORE: 'تعود الرحلة مسودة بنفس بياناتها لتُنشر من جديد. حجوزاتها الملغاة تبقى ملغاة.',
 };
@@ -151,6 +154,7 @@ export const ACTION_PERMISSION: Record<TripStatusAction, 'trips.manage' | 'trips
   STOP: 'trips.start',
   RESUME: 'trips.start',
   UNDO_ARRIVAL: 'trips.start',
+  UNDO_START: 'trips.start',
   CANCEL: 'trips.manage',
   RESTORE: 'trips.manage',
 };
@@ -194,6 +198,8 @@ export function tripStatusView(trip: TripStatusTrip, now = new Date()) {
     salesClosed: !!trip.salesClosedAt,
     salesClosedByName: trip.salesClosedByName,
     stopReason: key === 'STOPPED' ? trip.stopReason ?? 'OFFICE' : null,
+    // Once the bus has left, the app sells only the points ahead of it, and nothing after the last; the branches still can.
+    bookingNote: key === 'AT_POINT' || key === 'ON_ROAD' || key === 'STOPPED' ? 'انطلقت الرحلة: التطبيق يبيع من نقاط التجمع التي لم تصلها الحافلة فقط، وبعد مغادرتها كل النقاط تظهر مغلقة ويكون الحجز من المكتب والفروع فقط.' : null,
     stopNote: key === 'STOPPED' ? trip.stopNote : null,
   };
 }
@@ -226,6 +232,8 @@ export function tripStatusActions(trip: TripStatusTrip, permissions: string[], o
     }
     if (isMoving(trip)) open.push('AT_POINT', 'ON_ROAD', 'ARRIVED', 'STOP');
     if (trip.liveStatus === 'STOPPED') open.push('RESUME');
+    // Started by mistake: back to not started while nobody has boarded (the server checks the boardings).
+    if (isMoving(trip) || trip.liveStatus === 'STOPPED') open.push('UNDO_START');
     open.push('CANCEL');
   }
   // Arriving by mistake can be taken back while the trip's account is open and the tracking window has not closed;

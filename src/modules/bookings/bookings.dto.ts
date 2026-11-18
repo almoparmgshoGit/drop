@@ -136,6 +136,11 @@ export class QuoteDto {
   @IsBoolean()
   transportOnly?: boolean;
 
+  /** One trip back, bought alone ("عودة فقط"): recorded as a return, with transportOnly and a single leg. */
+  @IsOptional()
+  @IsBoolean()
+  returnOnly?: boolean;
+
   /** A package the customer builds: legs are its outbound then its return, and the first leg's roomChoice is the stay's room. */
   @IsOptional()
   @IsString()

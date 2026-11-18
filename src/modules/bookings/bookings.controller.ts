@@ -1,4 +1,4 @@
-import { Controller, Post, Get, Delete, Param, Body, Req, Headers } from '@nestjs/common';
+import { Controller, Post, Get, Delete, Param, Body, Req, Headers, Query } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
 import { BookingsService } from './bookings.service';
 import { RequirePermission } from '../../common/decorators/auth.decorators';
@@ -26,8 +26,9 @@ export class BookingsController {
 
   @Get('stay-hotels/:tripId')
   @ApiOperation({ summary: 'Hotels a customer may add to a transport booking on this trip, with the room types each sells' })
-  async getStayHotels(@Param('tripId') tripId: string) {
-    return this.bookingsService.stayHotels(tripId);
+  async getStayHotels(@Param('tripId') tripId: string, @Query('returnOnly') returnOnly?: string) {
+    // Return only: the customer stays where the trip leaves from, before taking it back.
+    return this.bookingsService.stayHotels(tripId, { returnOnly: returnOnly === 'true' });
   }
 
   @Get('seat-map/:tripId')

@@ -40,6 +40,7 @@ import { customPackageStay, loadCustomPackage } from '../../common/utils/custom-
 import { assertBookingOpened } from '../../common/utils/booking-opens.util';
 import { seatPricing } from '../../common/utils/dynamic-pricing.util';
 import { WaitlistService } from '../../common/services/waitlist.service';
+import { APP_SALES_INCLUDE, AppSalesTrip, appOpenPoints, appStillSells, hasSetOff } from '../../common/utils/app-boarding.util';
 
 const DEFAULT_VAT_RATE = 15;
 const CANCELLATION_TX_OPTIONS = { maxWait: 10_000, timeout: 30_000 };
@@ -218,7 +219,11 @@ export class BookingsService {
   ) {}
 
   private assertBookable(
-    trip: { tripStatus: string; liveStatus: string; departureTime: Date; channelApp: boolean; salesClosedAt: Date | null; bookingOpensAt: Date | null; packageId: string | null; package?: { status: string } | null } | null,
+    trip:
+      | (AppSalesTrip & { tripStatus: string; channelApp: boolean; salesClosedAt: Date | null; bookingOpensAt: Date | null; packageId: string | null; package?: { status: string } | null })
+      | null
+      | undefined,
+    boardingPointId?: string,
   ) {
     if (!trip) throw new NotFoundException('الرحلة غير موجودة');
     if (trip.tripStatus !== 'PUBLISHED' || !trip.channelApp) throw new BadRequestException('هذه الرحلة غير متاحة للحجز');
@@ -226,9 +231,15 @@ export class BookingsService {
     if (trip.salesClosedAt) throw new BadRequestException('أُغلق الحجز في هذه الرحلة');
     // A package's trips go on sale with it: a draft or archived package keeps them off the app.
     if (trip.packageId && trip.package?.status !== 'PUBLISHED') throw new BadRequestException('هذه الرحلة غير متاحة للحجز');
-    if (trip.departureTime <= new Date()) throw new BadRequestException('انتهى موعد الحجز لهذه الرحلة');
-    // The crew may start before the departure time; from then the app sells nothing on the trip.
-    if (trip.liveStatus !== 'NOT_STARTED') throw new BadRequestException('انطلقت الرحلة ولم يعد الحجز فيها متاحًا من التطبيق');
+    // Once the bus sets off (by the crew's word or the clock), the app sells only from the points ahead of it; a package not at all.
+    if (hasSetOff(trip)) {
+      if (trip.packageId) throw new BadRequestException('انطلقت الرحلة ولم يعد الحجز فيها متاحًا من التطبيق');
+      const open = appOpenPoints(trip);
+      if (open.length === 0) throw new BadRequestException('انطلقت الحافلة ولم تبقَ أمامها نقطة تجمع متاحة للحجز');
+      if (boardingPointId && !open.some((point) => point.id === boardingPointId)) {
+        throw new BadRequestException('تجاوزت الحافلة نقطة التجمع هذه، اختر نقطة تجمع أمامها');
+      }
+    }
     assertBookingOpened(trip);
   }
 
@@ -268,10 +279,11 @@ export class BookingsService {
   async getSeatMap(userId: string, tripId: string) {
     const now = new Date();
     const trip = await this.prisma.trip.findFirst({
-      where: { id: tripId, tripStatus: 'PUBLISHED', channelApp: true, salesClosedAt: null, liveStatus: 'NOT_STARTED', OR: [{ packageId: null }, { package: { status: 'PUBLISHED' } }] },
-      include: { seats: true, package: { select: PACKAGE_PRICE_SELECT } },
+      where: { id: tripId, tripStatus: 'PUBLISHED', channelApp: true, salesClosedAt: null, liveStatus: { in: ['NOT_STARTED', 'ON_ROAD', 'AT_POINT'] }, OR: [{ packageId: null }, { package: { status: 'PUBLISHED' } }] },
+      include: { seats: true, package: { select: PACKAGE_PRICE_SELECT }, ...APP_SALES_INCLUDE },
     });
-    if (!trip) throw new NotFoundException('الرحلة غير موجودة');
+    // Under way, the seats show while a point ahead of the bus can still be booked; a package's trips only before it sets off.
+    if (!trip || (trip.liveStatus !== 'NOT_STARTED' && (trip.packageId || !appStillSells(trip)))) throw new NotFoundException('الرحلة غير موجودة');
     const { range: singles, soloPolicy } = await this.appSettings.seatRules(trip.busId);
 
     const seats = trip.seats
@@ -311,7 +323,7 @@ export class BookingsService {
     return this.prisma.$transaction(async (tx) => {
       // Holds touch both directions, so opposite requests would otherwise deadlock on each other's seats.
       await lockTripsWithLinked(tx, [dto.tripId]);
-      const trip = await tx.trip.findUnique({ where: { id: dto.tripId }, include: { package: { select: { status: true } } } });
+      const trip = await tx.trip.findUnique({ where: { id: dto.tripId }, include: { package: { select: { status: true } }, ...APP_SALES_INCLUDE } });
       this.assertBookable(trip);
       await this.assertSeatRules(trip, seats, dto.category);
 
@@ -367,6 +379,7 @@ export class BookingsService {
       include: {
         package: { select: { ...PACKAGE_PRICE_SELECT, status: true } },
         accommodations: { select: { nights: true } },
+        ...APP_SALES_INCLUDE,
         // The customer reads about the place and picks a room type; room counts and numbers stay with staff.
         hotelBookings: {
           where: { status: 'CONFIRMED' },
@@ -379,9 +392,13 @@ export class BookingsService {
     // A package the customer builds: its two trips are sold as transport, and its stay is priced by the night on the outbound.
     const customPackage = dto.customPackageId ? await loadCustomPackage(db, dto.customPackageId) : null;
     if (customPackage && dto.legs.length !== 2) throw new BadRequestException('اختر رحلة الذهاب ورحلة العودة للباقة');
+    // Return only is one trip back, as transport, with or without a hotel before it.
+    if (dto.returnOnly && (dto.legs.length !== 1 || !dto.transportOnly || customPackage)) {
+      throw new BadRequestException('العودة فقط تُحجز لرحلة واحدة');
+    }
     const seated = dto.legs.map((leg) => {
       const trip = trips.find((t) => t.id === leg.tripId);
-      this.assertBookable(trip);
+      this.assertBookable(trip, leg.boardingPointId);
       return { leg, trip, seats: normalizeSeats(leg.seats) };
     });
     // Leaving out the stay of a package the customer builds leaves its two trips, priced as plain transport like any other.
@@ -399,7 +416,7 @@ export class BookingsService {
     // A hotel the customer added to transport, like the counter's "transport with stay"; it rides on the outbound.
     if (dto.stay && customPackage) throw new BadRequestException('الباقة المصممة لها سكنها، فلا يُضاف لها فندق آخر');
     if (dto.stay && !dto.transportOnly) throw new BadRequestException('الفندق المختار يُضاف إلى حجز نقل');
-    const chosenStay = dto.stay ? await this.priceChosenStay(db, dto.stay, seated) : null;
+    const chosenStay = dto.stay ? await this.priceChosenStay(db, dto.stay, seated, { returnOnly: !!dto.returnOnly }) : null;
 
     const listedLegs = seated.map(({ leg, trip, seats }, index) => {
       // A package charges its total for the group's size; an ordinary trip charges each seat.
@@ -617,11 +634,15 @@ export class BookingsService {
     };
   }
 
-  /** The hotels a customer may add to a transport trip, the trip's own and its destination's first, with the rooms each can sell. */
-  async stayHotels(tripId: string) {
+  /**
+   * The hotels a customer may add to a transport trip, the trip's own and its destination's first (on return only, the city
+   * the trip leaves from, where the customer stays before it), with the rooms each can sell.
+   */
+  async stayHotels(tripId: string, { returnOnly = false } = {}) {
     const trip = await this.prisma.trip.findFirst({
       where: { id: tripId, tripStatus: 'PUBLISHED', channelApp: true },
       select: {
+        origin: true,
         destination: true,
         packageId: true,
         housingPrice: true,
@@ -637,7 +658,7 @@ export class BookingsService {
     if (trip.packageId) throw new BadRequestException('الباقة تشمل سكنها');
     const hotels = await this.prisma.hotel.findMany({ where: { isActive: true }, orderBy: { name: 'asc' }, select: CHOSEN_STAY_HOTEL_SELECT });
     const own = new Set(trip.hotelBookings.map((booking) => booking.hotelId));
-    const destination = trip.destination.trim();
+    const destination = (returnOnly ? trip.origin : trip.destination).trim();
     return hotels
       .map((hotel) => {
         const terms = this.stayTerms(hotel, [trip]);
@@ -652,19 +673,25 @@ export class BookingsService {
       .sort((a, b) => Number(b.isTripHotel) - Number(a.isTripHotel) || Number(b.inDestination) - Number(a.inDestination));
   }
 
-  /** A hotel the customer added to a transport booking: checked in on the outbound's day for the nights chosen, priced like the counter. */
+  /**
+   * A hotel the customer added to a transport booking, priced like the counter: checked in on the outbound's day for the
+   * nights chosen, or on return only, the nights before the trip back, checking out on its day.
+   */
   private async priceChosenStay(
     db: Prisma.TransactionClient,
     stay: { hotelId: string; roomType: RoomType; nights: number; privateRooms?: number },
     seated: { trip: HousingTerms & { package: unknown; departureTime: Date; hotelBookings: { hotelId: string }[] }; seats: string[] }[],
+    { returnOnly = false } = {},
   ) {
     if (seated.some((row) => row.trip.package)) throw new BadRequestException('الباقة تشمل سكنها، فلا يُضاف لها فندق آخر');
     // The stay starts with the outbound, which the app sends first; a return leaving before it would put the stay in the wrong place.
     if (seated.length > 1 && seated[1].trip.departureTime < seated[0].trip.departureTime) throw new BadRequestException('أرسل رحلة الذهاب أولًا ثم رحلة العودة');
     const persons = seated[0].seats.length;
-    const checkInDay = riyadhDate(seated[0].trip.departureTime);
-    const checkIn = new Date(`${checkInDay}T00:00:00Z`);
-    const checkOut = new Date(checkIn.getTime() + stay.nights * 24 * 3_600_000);
+    const tripDay = new Date(`${riyadhDate(seated[0].trip.departureTime)}T00:00:00Z`);
+    const checkIn = returnOnly ? new Date(tripDay.getTime() - stay.nights * 24 * 3_600_000) : tripDay;
+    const checkInDay = checkIn.toISOString().slice(0, 10);
+    const checkOut = returnOnly ? tripDay : new Date(checkIn.getTime() + stay.nights * 24 * 3_600_000);
+    if (returnOnly && checkInDay < riyadhDate(new Date())) throw new BadRequestException('ليالي السكن تبدأ قبل اليوم، قلّل عدد الليالي');
     if (seated[1] && checkOut.toISOString().slice(0, 10) > riyadhDate(seated[1].trip.departureTime)) {
       throw new BadRequestException('ليالي السكن تتجاوز موعد رحلة العودة، قلّل عدد الليالي');
     }
@@ -851,7 +878,9 @@ export class BookingsService {
             allTransport
               ? quote.pricedLegs.length > 1
                 ? ('TRANSPORT_ROUND' as const)
-                : ('TRANSPORT_OUTBOUND' as const)
+                : dto.returnOnly
+                  ? ('TRANSPORT_RETURN' as const)
+                  : ('TRANSPORT_OUTBOUND' as const)
               : legIndex === 0
                 ? ('TRANSPORT_OUTBOUND' as const)
                 : ('TRANSPORT_RETURN' as const);
@@ -881,6 +910,8 @@ export class BookingsService {
             await takeLinkedSeats(tx, leg.trip.id, leg.seats, holdAvailableTo(userId, now), { returnsOnOtherLeg: quote.pricedLegs.length > 1 });
 
             const boardingPoint = await this.resolveBoardingPoint(tx, leg.leg, leg.trip.id);
+            // Under way, the bus picks the customer up only at a point ahead of it, so one must be chosen (the quote checked it is ahead).
+            if (!boardingPoint && hasSetOff(leg.trip, now.getTime())) throw new BadRequestException('اختر نقطة تجمع أمام الحافلة');
             // The same numbering as a branch's bookings; the plain client, so the counter is not held while this one saves.
             const bookingReference = await nextBookingNumber(this.prisma);
             // Stored on the booking, so every screen reads what was bought here rather than what the trip offers.
@@ -912,8 +943,8 @@ export class BookingsService {
                 }),
                 // Transport with a hotel the customer picked: recorded as the counter records it, the stay on the outbound.
                 ...(quote.chosenStay && {
-                  kind: quote.pricedLegs.length > 1 ? ('PACKAGE_ROUND_STAY' as const) : ('PACKAGE_OUTBOUND_STAY' as const),
-                  leg: legIndex === 0 ? ('OUTBOUND' as const) : ('RETURN' as const),
+                  kind: quote.pricedLegs.length > 1 ? ('PACKAGE_ROUND_STAY' as const) : dto.returnOnly ? ('PACKAGE_STAY_RETURN' as const) : ('PACKAGE_OUTBOUND_STAY' as const),
+                  leg: legIndex === 0 && !dto.returnOnly ? ('OUTBOUND' as const) : ('RETURN' as const),
                   ...(legIndex === 0 && {
                     stayHotelId: quote.chosenStay.hotelId,
                     stayCheckIn: quote.chosenStay.checkIn,

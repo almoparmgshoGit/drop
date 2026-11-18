@@ -8,7 +8,7 @@ import {
   OnModuleInit,
 } from '@nestjs/common';
 import { randomUUID } from 'crypto';
-import { Prisma, TripCalendar, TripScheduleType } from '@prisma/client';
+import { Prisma, TripCalendar, TripLiveStatus, TripScheduleType } from '@prisma/client';
 import { PrismaService } from '../../common/services/prisma.service';
 import { MADINAH_PLACES, TripMetricsService, UMRAH_PLACES, placeWhere } from '../../common/services/trip-metrics.service';
 import { BookingCancellationService } from '../../common/services/booking-cancellation.service';
@@ -44,6 +44,7 @@ import { PublicService, SERVICE_SELECT, withHotelServices } from '../../common/u
 import { assignTripCode, journeyCodeOf, reverseCodeOf } from '../../common/utils/trip-code.util';
 import { approvedLeaveWhere, crewClashResources, scheduleOverlapWhere } from '../../common/utils/schedule-conflict.util';
 import { oneBusPerConvoy } from '../../common/utils/convoy.util';
+import { APP_SALES_STATUS_UPDATES, AppSalesTrip, appOpenPoints, appSellingWindowWhere, appStillSells, hasSetOff } from '../../common/utils/app-boarding.util';
 
 const DEFAULT_TRIP_DURATION_MS = 8 * 60 * 60 * 1000;
 const COMPLETION_SWEEP_MS = 5 * 60 * 1000;
@@ -197,6 +198,18 @@ export const toPublicTrip = <T extends object>(trip: T) => {
   return copy as unknown as Omit<T, (typeof INTERNAL_TRIP_FIELDS)[number]>;
 };
 
+/**
+ * The trip as the app books it: only the points a customer can still book from (those ahead of the bus once it has set
+ * off), and whether it is already on its way. The crew's reports read for this stay on the server.
+ */
+function withAppOpenPoints<T extends AppSalesTrip>(trip: T, now = Date.now()) {
+  const { statusUpdates: _statusUpdates, ...rest } = trip;
+  const open = appOpenPoints(trip, now);
+  const isEnRoute = hasSetOff(trip, now);
+  // Left every point: still shown, marked closed, and booked from the office or a branch only.
+  return { ...rest, boardingPoints: open, isEnRoute, isBookingClosed: isEnRoute && open.length === 0 };
+}
+
 type PricedTrip = HousingTerms & {
   price: Prisma.Decimal;
   bookingType: string;
@@ -280,17 +293,36 @@ export const bookingTypeWhere = (bookingType: string): Prisma.TripWhereInput =>
 const ON_SALE_PACKAGE: Prisma.TripWhereInput = { OR: [{ packageId: null }, { package: { status: 'PUBLISHED' } }] };
 
 /** The trips a customer can find and book in the app, narrowed to what they searched for. */
-export function appTripWhere(filters: Pick<TripSearchFilters, 'origin' | 'destination' | 'date'>): Prisma.TripWhereInput {
+export function appTripWhere(filters: Pick<TripSearchFilters, 'origin' | 'destination' | 'date'>, { enRoute = false, showClosed = false } = {}): Prisma.TripWhereInput {
   const now = new Date();
   // A trip waiting for its booking to open stays out of the app until then: the app has nowhere to show the opening date.
-  // Once the crew starts the trip it leaves the app's search: only those already booked follow it, from their bookings.
-  const where: Prisma.TripWhereInput = { tripStatus: 'PUBLISHED', channelApp: true, salesClosedAt: null, liveStatus: 'NOT_STARTED', departureTime: { gt: now }, AND: [ON_SALE_PACKAGE, bookingOpenedWhere(now)] };
+  // Once the bus sets off, a trip stays out unless asked for en route: then it stays while a point ahead of the bus can be
+  // booked, which the caller checks with appStillSells (packages leave the app when the bus sets off).
+  const where: Prisma.TripWhereInput = {
+    tripStatus: 'PUBLISHED',
+    channelApp: true,
+    salesClosedAt: null,
+    ...(!enRoute && { liveStatus: 'NOT_STARTED', departureTime: { gt: now } }),
+    AND: [
+      ON_SALE_PACKAGE,
+      bookingOpenedWhere(now),
+      ...(enRoute
+        ? [
+            showClosed
+              ? // The search also shows a trip whose bus has left every point, marked closed, until it arrives.
+                { OR: [appSellingWindowWhere(now), { packageId: null, liveStatus: { in: ['AT_POINT', 'ON_ROAD', 'STOPPED'] as TripLiveStatus[] }, arrivalTime: { gt: now } }] }
+              : appSellingWindowWhere(now),
+          ]
+        : []),
+    ],
+  };
   if (filters.origin) where.origin = { contains: filters.origin, mode: 'insensitive' };
   if (filters.destination) where.destination = { contains: filters.destination, mode: 'insensitive' };
   if (filters.date) {
     const range = riyadhDayRange(filters.date);
     if (!range) throw new BadRequestException('صيغة التاريخ غير صحيحة');
-    where.departureTime = { gte: range.start > now ? range.start : now, lt: range.end };
+    // En route, the selling window above already keeps out what has gone; the day's start is enough here.
+    where.departureTime = { gte: !enRoute && range.start <= now ? now : range.start, lt: range.end };
   }
   return where;
 }
@@ -988,21 +1020,25 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
   }
 
   async searchTrips(filters: TripSearchFilters) {
-    const where = appTripWhere(filters);
+    // A package's trips leave the app when the bus sets off; any other trip stays while a point ahead of the bus is open.
+    const where = appTripWhere(filters, { enRoute: !filters.packageId, showClosed: !filters.packageId });
     if (filters.busType) where.busType = filters.busType;
     if (filters.bookingType) (where.AND as Prisma.TripWhereInput[]).push(bookingTypeWhere(filters.bookingType));
     if (filters.packageId) where.packageId = filters.packageId;
 
-    const trips = await this.prisma.trip.findMany({
-      where,
-      orderBy: { departureTime: 'asc' },
-      take: 100,
-      include: PUBLIC_TRIP_INCLUDE,
-    });
+    const now = Date.now();
+    const trips = (
+      await this.prisma.trip.findMany({
+        where,
+        orderBy: { departureTime: 'asc' },
+        take: 100,
+        include: { ...PUBLIC_TRIP_INCLUDE, statusUpdates: APP_SALES_STATUS_UPDATES },
+      })
+    ).filter((trip) => !trip.packageId || trip.liveStatus === 'NOT_STARTED');
     // With transport + stay, a seat sold alone is priced alone and the customer adds a hotel; a trip including its stay keeps its offer.
     const seatAlone = (trip: { housingPriceMode: string }) =>
       filters.bookingType === 'TRANSPORT_ONLY' || (filters.bookingType === 'WITH_STAY' && trip.housingPriceMode !== 'INCLUDED_IN_BASE');
-    return oneBusPerConvoy(trips).map((trip) => toPublicTrip(withSeatPrice(trip, seatAlone(trip))));
+    return oneBusPerConvoy(trips).map((trip) => toPublicTrip(withSeatPrice(withAppOpenPoints(trip, now), seatAlone(trip))));
   }
 
   /**
@@ -1011,12 +1047,28 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
    * Tabs and city lists follow this, so a new type or route appears in the app as soon as a trip uses it.
    */
   async searchOptions() {
-    const trips = await this.prisma.trip.findMany({
-      where: appTripWhere({}),
-      select: { origin: true, destination: true, bookingType: true, packageId: true, housingPriceMode: true, boardingPoints: { select: { lat: true, lng: true } } },
-      orderBy: { departureTime: 'asc' },
-      take: 2000,
-    });
+    const now = Date.now();
+    // A trip under way still offers its route while a point ahead of the bus is open; a package's trips only before it sets off.
+    const trips = (
+      await this.prisma.trip.findMany({
+        where: appTripWhere({}, { enRoute: true }),
+        select: {
+          origin: true,
+          destination: true,
+          bookingType: true,
+          packageId: true,
+          housingPriceMode: true,
+          liveStatus: true,
+          arrivalTime: true,
+          currentBoardingPointId: true,
+          ...CREW_WINDOW_SELECT,
+          boardingPoints: { select: { id: true, name: true, time: true, lat: true, lng: true } },
+          statusUpdates: APP_SALES_STATUS_UPDATES,
+        },
+        orderBy: { departureTime: 'asc' },
+        take: 2000,
+      })
+    ).filter((trip) => (trip.packageId ? !hasSetOff(trip, now) : appStillSells(trip, now)));
     // A package the customer builds runs on transport trips, so its route is on the packages tab though no trip belongs to it.
     const customPackages = await this.prisma.package.findMany({
       where: { kind: 'CUSTOM', status: 'PUBLISHED', origin: { not: null }, destination: { not: null }, hotel: { isActive: true } },
@@ -1184,11 +1236,12 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
 
   async getTripById(id: string) {
     const trip = await this.prisma.trip.findFirst({
-      where: { id, tripStatus: 'PUBLISHED', channelApp: true, liveStatus: 'NOT_STARTED', ...ON_SALE_PACKAGE },
-      include: PUBLIC_TRIP_INCLUDE,
+      where: { id, tripStatus: 'PUBLISHED', channelApp: true, liveStatus: { in: ['NOT_STARTED', 'ON_ROAD', 'AT_POINT', 'STOPPED'] }, ...ON_SALE_PACKAGE },
+      include: { ...PUBLIC_TRIP_INCLUDE, statusUpdates: APP_SALES_STATUS_UPDATES },
     });
-    if (!trip) throw new NotFoundException('Trip not found');
-    return toPublicTrip(withSeatPrice(trip));
+    // Under way, the trip is shown with the points ahead of the bus, or marked closed once it has left them all; a package's trips only before it sets off.
+    if (!trip || (trip.liveStatus !== 'NOT_STARTED' && trip.packageId)) throw new NotFoundException('Trip not found');
+    return toPublicTrip(withSeatPrice(withAppOpenPoints(trip)));
   }
 
   private async assertAssignableStaff(db: Prisma.TransactionClient, userIds: string[] = []) {

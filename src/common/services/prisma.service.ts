@@ -7,7 +7,7 @@ export type DataChangeListener = (model: string, ownerIds: string[], bookingIds:
 
 const WRITE_ACTIONS = new Set(['create', 'createMany', 'update', 'updateMany', 'upsert', 'delete', 'deleteMany']);
 /** Fields that name the customer or employee a row belongs to, so that person's app hears about it. */
-const OWNER_FIELDS = ['userId', 'customerId', 'employeeId', 'supervisorId', 'driverId'] as const;
+const OWNER_FIELDS = ['userId', 'customerId', 'employeeId', 'supervisorId', 'driverId', 'buyerId', 'ownerUserId', 'recipientId'] as const;
 /** Bookkeeping that no screen shows, or that changes so often (GPS pings, presence) that announcing it would only add load. */
 const SILENT_MODELS = new Set([
   'RefreshToken',
@@ -67,20 +67,38 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
 
   private dataChangeListener: DataChangeListener | null = null;
 
-  private reportWrite(model: string | undefined, action: string, result: unknown) {
+  private reportWrite(model: string | undefined, action: string, result: unknown, args?: Record<string, unknown>) {
     if (!model || !this.dataChangeListener || !WRITE_ACTIONS.has(action) || SILENT_MODELS.has(model)) return;
     const owners = new Set<string>();
     const bookingIds = new Set<string>();
+    // A value is a plain id, or a filter such as { in: [...] } or { equals: id } when it comes from a where clause.
+    const ids = (value: unknown): string[] => {
+      if (typeof value === 'string') return [value];
+      if (!value || typeof value !== 'object') return [];
+      const filter = value as { in?: unknown; equals?: unknown };
+      if (Array.isArray(filter.in)) return filter.in.filter((id): id is string => typeof id === 'string');
+      return typeof filter.equals === 'string' ? [filter.equals] : [];
+    };
     const collect = (row: unknown) => {
       if (!row || typeof row !== 'object') return;
       const record = row as Record<string, unknown>;
-      for (const key of OWNER_FIELDS) if (typeof record[key] === 'string') owners.add(record[key] as string);
-      if (model === 'User' && typeof record.id === 'string') owners.add(record.id);
+      for (const key of OWNER_FIELDS) ids(record[key]).forEach((id) => owners.add(id));
+      if (model === 'User') ids(record.id).forEach((id) => owners.add(id));
       // Payments, tickets and passengers name only their booking; the booking's customer is looked up later.
-      if (model !== 'Booking' && typeof record.bookingId === 'string') bookingIds.add(record.bookingId);
+      // A booking row that already names its customer needs no lookup; a bulk filter on booking ids does.
+      if (model === 'Booking') {
+        if (!('userId' in record)) ids(record.id).forEach((id) => bookingIds.add(id));
+      }
+      else ids(record.bookingId).forEach((id) => bookingIds.add(id));
     };
     if (Array.isArray(result)) result.forEach(collect);
     else collect(result);
+    // updateMany, deleteMany and createMany return a count, not rows, so whose rows they were is read from the call itself.
+    if (action === 'updateMany' || action === 'deleteMany') collect(args?.where);
+    if (action === 'createMany') {
+      const data = args?.data;
+      (Array.isArray(data) ? data : [data]).forEach(collect);
+    }
     const listener = this.dataChangeListener;
     this.afterCommit(() => listener(model, [...owners], [...bookingIds]));
   }
@@ -101,7 +119,7 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
         }
       }
       const result = await next(params);
-      this.reportWrite(params.model, params.action, result);
+      this.reportWrite(params.model, params.action, result, params.args);
       return result;
     });
     await this.$connect();

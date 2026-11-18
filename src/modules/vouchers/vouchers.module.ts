@@ -17,7 +17,6 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { ApiBearerAuth, ApiOperation, ApiTags, PartialType } from '@nestjs/swagger';
-import { Throttle } from '@nestjs/throttler';
 import { Prisma } from '@prisma/client';
 import { Transform, Type } from 'class-transformer';
 import { IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, Length, Matches, Max, MaxLength, Min, ValidateNested } from 'class-validator';
@@ -28,10 +27,7 @@ import { formatSar, NotificationsService } from '../../common/services/notificat
 import { PrismaService } from '../../common/services/prisma.service';
 import { WalletService } from '../../common/services/wallet.service';
 
-const DAY_MS = 24 * 60 * 60 * 1000;
 const TX_OPTIONS = { maxWait: 10_000, timeout: 30_000 };
-/** What the QR holds: a prefix so the app knows it is a top-up card, then the code. */
-export const QR_PREFIX = 'DUROB-TOPUP:';
 /** No 0/O or 1/I, so a code read off a printed card is never mistyped. */
 const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const HEX = /^#[0-9a-fA-F]{6}$/;
@@ -78,10 +74,6 @@ class PurchaseVoucherDto {
   @IsOptional() @IsIn(['mada', 'card', 'wallet']) paymentMethod?: string;
 }
 
-class RedeemCardDto {
-  @IsString() @Length(4, 80) code: string;
-}
-
 class CardsQuery {
   @IsOptional() @IsIn(['AVAILABLE', 'REDEEMED', 'EXPIRED']) status?: string;
   @IsOptional() @IsString() @MaxLength(60) search?: string;
@@ -89,8 +81,8 @@ class CardsQuery {
 
 /** The code as people read it, in groups of four. */
 const formatCode = (code: string) => code.match(/.{1,4}/g)!.join('-');
-/** Accepts the code typed with or without dashes and spaces, or the whole text of a scanned QR. */
-const normalizeCode = (raw: string) => raw.trim().toUpperCase().replace(QR_PREFIX, '').replace(/[^A-Z0-9]/g, '');
+/** Accepts a card number typed with or without dashes and spaces, for staff searching the cards sold. */
+const normalizeCode = (raw: string) => raw.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
 
 function newCode() {
   const bytes = crypto.randomBytes(16);
@@ -277,29 +269,70 @@ export class VouchersService {
           paymentStatus,
         },
       });
-      const expiresAt = new Date(Date.now() + voucher.validDays * DAY_MS);
-      await tx.voucherCard.createMany({
-        data: Array.from({ length: dto.quantity }, () => ({
-          code: newCode(),
-          voucherId: voucher.id,
-          purchaseId: purchase.id,
-          buyerId: userId,
-          value: voucher.value,
-          bonusPoints: voucher.bonusPoints,
-          transportOnly: voucher.creditTransportOnly,
-          name: voucher.name,
-          imageUrl: voucher.imageUrl,
-          design: (voucher.design ?? DEFAULT_DESIGN) as Prisma.InputJsonValue,
-          expiresAt,
-        })),
-      });
-      return purchase;
+      // The card tops up the buyer's own account the moment it is bought; there is no code to enter later.
+      const now = new Date();
+      const cards = Array.from({ length: dto.quantity }, () => ({
+        id: crypto.randomUUID(),
+        code: newCode(),
+        voucherId: voucher.id,
+        purchaseId: purchase.id,
+        buyerId: userId,
+        value: voucher.value,
+        bonusPoints: voucher.bonusPoints,
+        transportOnly: voucher.creditTransportOnly,
+        name: voucher.name,
+        imageUrl: voucher.imageUrl,
+        design: (voucher.design ?? DEFAULT_DESIGN) as Prisma.InputJsonValue,
+        expiresAt: now,
+        redeemedAt: now,
+        redeemedById: userId,
+      }));
+      await tx.voucherCard.createMany({ data: cards });
+
+      const value = Number(voucher.value);
+      let walletBalance: Prisma.Decimal | null = null;
+      for (const card of cards) {
+        if (value > 0) {
+          // The card's number goes in the wallet record, which is where the customer sees it.
+          walletBalance = await this.wallet.apply(tx, {
+            userId,
+            amount: value,
+            type: 'VOUCHER_TOPUP',
+            description: `شحن بطاقة ${voucher.name} رقم ${formatCode(card.code)}${voucher.creditTransportOnly ? ' • للنقل فقط' : ''}`,
+            transportAmount: voucher.creditTransportOnly ? value : 0,
+          });
+        }
+        if (voucher.bonusPoints > 0) {
+          await this.loyalty.grant(tx, {
+            userId,
+            points: voucher.bonusPoints,
+            type: 'VOUCHER_BONUS',
+            description: `نقاط بطاقة ${voucher.name} رقم ${formatCode(card.code)}`,
+            uniqueKey: `voucher:${card.id}`,
+          });
+        }
+      }
+      if (walletBalance !== null) {
+        await this.notifications.toUser(tx, 'WALLET_CREDITED', userId, { amount: formatSar(value * dto.quantity), walletBalance: formatSar(walletBalance) });
+      }
+      return { ...purchase, credited: value * dto.quantity, bonusPoints: voucher.bonusPoints * dto.quantity };
     }, TX_OPTIONS);
 
-    return { reference: result.reference, quantity: result.quantity, amount: Number(result.amount), points: result.points, cards: await this.mine(userId, result.id) };
+    const after = await this.prisma.user.findUniqueOrThrow({ where: { id: userId }, select: { walletBalance: true, loyaltyPoints: true } });
+    return {
+      reference: result.reference,
+      quantity: result.quantity,
+      amount: Number(result.amount),
+      points: result.points,
+      credited: result.credited,
+      bonusPoints: result.bonusPoints,
+      walletBalance: Number(after.walletBalance),
+      loyaltyPoints: after.loyaltyPoints,
+      cards: await this.mine(userId, result.id),
+    };
   }
 
-  /** Cards the customer bought, newest first, with their code and QR text. */
+  /** Cards the customer bought, newest first. Each topped up their own account when bought; its number is kept for the record. */
   async mine(userId: string, purchaseId?: string) {
     const now = new Date();
     const cards = await this.prisma.voucherCard.findMany({
@@ -312,7 +345,6 @@ export class VouchersService {
       id: card.id,
       name: card.name,
       code: formatCode(card.code),
-      qr: `${QR_PREFIX}${card.code}`,
       status: cardStatus(card, now),
       value: Number(card.value),
       bonusPoints: card.bonusPoints,
@@ -325,49 +357,6 @@ export class VouchersService {
       purchaseReference: card.purchase.reference,
       createdAt: card.createdAt,
     }));
-  }
-
-  /** Whoever enters or scans the code first gets its balance and points. */
-  async redeem(userId: string, rawCode: string) {
-    const code = normalizeCode(rawCode);
-    const user = await this.prisma.user.findUnique({ where: { id: userId }, select: { role: true, blockedAt: true } });
-    if (!user || user.role !== 'PASSENGER') throw new ForbiddenException('الشحن متاح لحسابات العملاء');
-    if (user.blockedAt) throw new ForbiddenException('حسابك موقوف');
-
-    return this.prisma.$transaction(async (tx) => {
-      const card = await tx.voucherCard.findUnique({ where: { code } });
-      if (!card) throw new NotFoundException('رقم الشحن غير صحيح');
-      if (card.redeemedAt) throw new ConflictException('استُخدمت هذه القسيمة من قبل');
-      if (card.expiresAt <= new Date()) throw new ConflictException('انتهت صلاحية هذه القسيمة');
-      // Claimed first, so the same card scanned on two phones at once is credited once.
-      const claimed = await tx.voucherCard.updateMany({ where: { id: card.id, redeemedAt: null }, data: { redeemedAt: new Date(), redeemedById: userId } });
-      if (claimed.count === 0) throw new ConflictException('استُخدمت هذه القسيمة من قبل');
-
-      const value = Number(card.value);
-      let walletBalance: Prisma.Decimal | null = null;
-      if (value > 0) {
-        walletBalance = await this.wallet.apply(tx, {
-          userId,
-          amount: value,
-          type: 'VOUCHER_TOPUP',
-          description: `شحن قسيمة ${card.name} (${formatCode(card.code).slice(-4)})${card.transportOnly ? ' • للنقل فقط' : ''}`,
-          transportAmount: card.transportOnly ? value : 0,
-        });
-        await this.notifications.toUser(tx, 'WALLET_CREDITED', userId, { amount: formatSar(value), walletBalance: formatSar(walletBalance) });
-      }
-      if (card.bonusPoints > 0) {
-        await this.loyalty.grant(tx, { userId, points: card.bonusPoints, type: 'VOUCHER_BONUS', description: `نقاط قسيمة ${card.name}`, uniqueKey: `voucher:${card.id}` });
-      }
-      const after = await tx.user.findUniqueOrThrow({ where: { id: userId }, select: { walletBalance: true, loyaltyPoints: true } });
-      return {
-        name: card.name,
-        value,
-        bonusPoints: card.bonusPoints,
-        transportOnly: card.transportOnly,
-        walletBalance: Number(after.walletBalance),
-        loyaltyPoints: after.loyaltyPoints,
-      };
-    }, TX_OPTIONS);
   }
 }
 
@@ -419,23 +408,15 @@ export class VouchersController {
   }
 
   @Post(':id/purchase')
-  @ApiOperation({ summary: 'Buy one or more cards of a voucher, with money or points' })
+  @ApiOperation({ summary: 'Buy cards of a voucher with money or points; their balance and points are added to the buyer at once' })
   purchase(@Req() req, @Param('id') id: string, @Body() dto: PurchaseVoucherDto) {
     return this.vouchers.purchase(req.user.userId, id, dto);
   }
 
   @Get('mine')
-  @ApiOperation({ summary: 'Cards the customer bought, with their code and QR' })
+  @ApiOperation({ summary: 'Cards the customer bought, each already credited to their account' })
   mine(@Req() req) {
     return this.vouchers.mine(req.user.userId);
-  }
-
-  @Post('redeem')
-  // Codes are worth money, so guessing them is slowed down.
-  @Throttle({ default: { limit: 10, ttl: 60_000 } })
-  @ApiOperation({ summary: 'Top up the wallet and points with a card code or its scanned QR' })
-  redeem(@Req() req, @Body() dto: RedeemCardDto) {
-    return this.vouchers.redeem(req.user.userId, dto.code);
   }
 }
 

@@ -151,7 +151,6 @@ export const AUDIT_EVENTS: Record<string, Event> = {
   'POST /loyalty/vouchers': on('loyalty', 'إضافة قسيمة'),
   'PATCH /loyalty/vouchers/:id': on('loyalty', 'تعديل قسيمة'),
   'POST /vouchers/:id/purchase': on('account', 'شراء قسائم شحن'),
-  'POST /vouchers/redeem': on('account', 'شحن الرصيد بقسيمة'),
   'POST /loyalty/customers/:id/adjust': on('loyalty', 'تعديل نقاط عميل يدويًا'),
 
   'POST /users': on('customers', 'إضافة موظف'),

@@ -189,6 +189,9 @@ export class TripStatusService {
       case 'UNDO_ARRIVAL':
         await this.undoArrival(actor, id, name);
         break;
+      case 'UNDO_START':
+        await this.undoStart(actor, id, name);
+        break;
       case 'CANCEL':
         await this.trips.cancelTrip(id, actor.userId, input.note, input.acknowledgeReturning);
         break;
@@ -205,6 +208,37 @@ export class TripStatusService {
     await this.prisma.trip.updateMany({
       where: { OR: [{ id }, { convoyLeadId: id }], tripStatus: 'PUBLISHED' },
       data: close ? { salesClosedAt: new Date(), salesClosedByName: byName } : { salesClosedAt: null, salesClosedByName: null },
+    });
+  }
+
+  /**
+   * Takes back a start made by mistake: the trip is as if it never started, so the crew starts it again from the app or the
+   * office from here, and the app sells it again until it leaves. Refused once anyone has boarded, since their boarding hangs
+   * on the bus having left.
+   */
+  private async undoStart(actor: Actor, id: string, name: string | null) {
+    await this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT "id" FROM "Trip" WHERE "id" = ${id} FOR UPDATE`;
+      const trip = await tx.trip.findUniqueOrThrow({ where: { id }, select: { tripStatus: true, liveStatus: true, reverseOfTripId: true } });
+      if (trip.tripStatus !== 'PUBLISHED' || !['AT_POINT', 'ON_ROAD', 'STOPPED'].includes(trip.liveStatus)) throw new ConflictException('هذه الرحلة لم تنطلق');
+      const boarded = await tx.ticket.count({ where: { booking: { tripId: id }, isBoarded: true } });
+      // Riders coming back on a reverse board on their outbound booking's tickets.
+      const returningBoarded = trip.reverseOfTripId
+        ? await tx.ticket.count({ where: { returnBoardedAt: { not: null }, booking: { tripId: trip.reverseOfTripId } } })
+        : 0;
+      if (boarded + returningBoarded > 0) {
+        throw new ConflictException(`صعد ${boarded + returningBoarded} راكب على هذه الرحلة، فلا يمكن إرجاعها لم تنطلق. ألغِ تسجيل صعودهم أولًا أو أوقف الرحلة`);
+      }
+      await tx.trip.update({
+        where: { id },
+        data: { liveStatus: 'NOT_STARTED', liveStatusAt: new Date(), currentBoardingPointId: null, stopReason: null, stopNote: null },
+      });
+      await tx.tripStatusUpdate.create({ data: { tripId: id, status: 'NOT_STARTED', actorId: actor.userId, actorName: name } });
+      this.realtime.tripChanged(id);
+      await this.notifications.toTripCrew(tx, 'CREW_TRIP_STATUS_CHANGED', id, {
+        exceptUserId: actor.userId,
+        extra: { senderName: name, currentPoint: 'أُعيدت الرحلة إلى "لم تنطلق"، ابدأها من جديد عند الانطلاق' },
+      });
     });
   }
 
