@@ -42,7 +42,7 @@ import { assertTripFitsPackage } from '../../common/utils/package-window.util';
 import { PACKAGE_PRICE_SELECT, PackagePrices, packagePriceTiers } from '../../common/utils/package-price.util';
 import { cityTripWhere, servedCity } from '../../common/utils/branch-city.util';
 import { PublicService, SERVICE_SELECT, withHotelServices } from '../../common/utils/services.util';
-import { assignTripCode, journeyCodeOf, reverseCodeOf } from '../../common/utils/trip-code.util';
+import { assignTripCode, codePeriodOf, draftPlaceholderCode, lockPeriods, journeyCodeOf, renumberPeriods, reverseCodeOf, syncTripCode } from '../../common/utils/trip-code.util';
 import { approvedLeaveWhere, crewClashResources, scheduleOverlapWhere } from '../../common/utils/schedule-conflict.util';
 import { oneBusPerConvoy } from '../../common/utils/convoy.util';
 import { APP_SALES_STATUS_UPDATES, AppSalesTrip, appOpenPoints, appSellingWindowWhere, appStillSells, hasSetOff } from '../../common/utils/app-boarding.util';
@@ -378,6 +378,19 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
       if (process.env.NODE_ENV !== 'test') this.openPendingReverses().catch((err) => console.error('Reverse trip sweep failed:', err.message));
     }, CREW_WINDOW_SWEEP_MS);
     this.crewWindowTimer.unref();
+    if (process.env.NODE_ENV !== 'test') this.renumberOpenMonths().catch((err) => console.error('Trip renumbering failed:', err.message));
+  }
+
+  /**
+   * Puts this month's and later months' trip numbers in departure order, for trips numbered by creation order before the
+   * numbers followed the date. Past months keep their numbers. It writes only what is out of order, so a later start does nothing.
+   */
+  async renumberOpenMonths() {
+    const from = codePeriodOf(new Date());
+    const rows = await this.prisma.trip.findMany({ where: { codePeriod: { gte: from } }, distinct: ['codePeriod'], select: { codePeriod: true } });
+    for (const { codePeriod } of rows) {
+      await this.prisma.$transaction((tx) => renumberPeriods(tx, [codePeriod]), CONVOY_TX_OPTIONS);
+    }
   }
 
   onModuleDestroy() {
@@ -990,6 +1003,9 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
           convoy: { leadId: draft.id, order, code: convoyCodeOf(draft.tripCode, order) },
         });
       }
+      // The copy takes its place among the month's numbers by its departure date.
+      await renumberPeriods(tx, [draft.codePeriod]);
+      return tx.trip.findUniqueOrThrow({ where: { id: draft.id } });
     }
     return draft;
   }
@@ -1488,8 +1504,10 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
         data: {
           id,
           seriesId,
-          // The number is the system's: the month's next one, whatever the form showed.
-          ...(await assignTripCode(tx, departure)),
+          // The number is the system's, by departure date within the month (renumbered below). A draft may wait for its number.
+          ...((dto.tripStatus || 'DRAFT') === 'DRAFT' && dto.assignCode === false
+            ? { tripCode: draftPlaceholderCode(), codePeriod: null, codeNumber: null }
+            : await assignTripCode(tx, departure)),
           title: dto.title || 'رحلة عمرة',
           origin: dto.origin,
           destination: dto.destination,
@@ -1559,8 +1577,9 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
       await this.logCrew(tx, trip.id, { drivers: [], supervisors: [] }, { drivers: dto.driverIds ?? [], supervisors: dto.supervisorIds ?? [] }, actor);
       // Crew only see published trips, so a draft is announced when it is published.
       if (trip.tripStatus === 'PUBLISHED') await this.notifications.toTripCrew(tx, 'CREW_TRIP_ASSIGNED', trip.id);
-      if (!dto.extraBuses?.length) return withSeatPrice(trip);
-      for (const [idx, entry] of dto.extraBuses.entries()) await this.addConvoyBus(tx, trip, entry, idx + 2, actor);
+      for (const [idx, entry] of (dto.extraBuses ?? []).entries()) await this.addConvoyBus(tx, trip, entry, idx + 2, actor);
+      // The month's numbers follow the departure dates, so a trip made later for an earlier day takes the earlier number.
+      await renumberPeriods(tx, [trip.codePeriod]);
       return withSeatPrice(await tx.trip.findUniqueOrThrow({ where: { id: trip.id }, include: ADMIN_TRIP_INCLUDE }));
     }, dto.extraBuses?.length ? CONVOY_TX_OPTIONS : TRIP_TX_OPTIONS);
     if (seriesId) this.extendSeriesLater(seriesId);
@@ -1848,10 +1867,18 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
     const flags = { startsSeries: false };
     const multiBus = !!dto.extraBuses?.length || (await this.prisma.trip.count({ where: { convoyLeadId: id, tripStatus: { not: 'CANCELLED' } } })) > 0;
     const { result, followerIds } = await this.prisma.$transaction(async (tx) => {
+      // The month's numbering lock comes before the trip's row lock, as in every renumbering, so two edits cannot deadlock.
+      const current = await tx.trip.findUnique({ where: { id }, select: { departureTime: true, codePeriod: true } });
+      if (current) await lockPeriods(tx, [current.codePeriod, codePeriodOf(current.departureTime), dto.departureTime ? codePeriodOf(new Date(dto.departureTime)) : null]);
       const saved = await this.updateOne(tx, id, dto, flags, actor, reason);
       const followerIds = multiBus || dto.extraBuses ? await this.syncConvoy(tx, id, dto, actor, reason) : [];
-      // The list of buses changed after the first was read, so it is read again.
-      const result = followerIds.length || dto.extraBuses ? withSeatPrice(await tx.trip.findUniqueOrThrow({ where: { id }, include: ADMIN_TRIP_INCLUDE })) : saved;
+      // A new date, a publish or the draft's code choice can change the trip's number and its month's order.
+      const codeBefore = saved.tripCode;
+      await syncTripCode(tx, id, dto.assignCode);
+      const recoded = (await tx.trip.findUniqueOrThrow({ where: { id }, select: { tripCode: true } })).tripCode !== codeBefore;
+      // The list of buses or the codes changed after the first was read, so it is read again.
+      const result =
+        followerIds.length || dto.extraBuses || recoded ? withSeatPrice(await tx.trip.findUniqueOrThrow({ where: { id }, include: ADMIN_TRIP_INCLUDE })) : saved;
       return { result, followerIds };
     }, multiBus ? CONVOY_TX_OPTIONS : TRIP_TX_OPTIONS);
     const startsSeries = flags.startsSeries;
@@ -2925,8 +2952,11 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
     }
     // With no bookings nobody was ever placed in its rooms, so its hotel stays go with it; they would otherwise hold the trip in place.
     await this.prisma.$transaction(async (tx) => {
+      await lockPeriods(tx, [trip.codePeriod]);
       await tx.hotelBooking.deleteMany({ where: { tripId: id } });
       await tx.trip.delete({ where: { id } });
+      // The month closes up behind it, so its numbers stay in date order without a gap.
+      if (!trip.reverseOfTripId && !trip.convoyLeadId) await renumberPeriods(tx, [trip.codePeriod]);
     }, TRIP_TX_OPTIONS);
     return { success: true };
   }

@@ -336,6 +336,14 @@ export class CreateTripDto {
   @IsEnum(TripStatus)
   tripStatus?: TripStatus;
 
+  /**
+   * For a draft: true gives it its number (by departure date within the month) now, false leaves it without one until it is
+   * published. Left out, a new draft is numbered and an existing one keeps what it has. A published trip always has one.
+   */
+  @IsOptional()
+  @IsBoolean()
+  assignCode?: boolean;
+
   @IsOptional()
   @IsEnum(TripScheduleType)
   scheduleType?: TripScheduleType;
