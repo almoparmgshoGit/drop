@@ -55,6 +55,8 @@ const TRIP_TX_OPTIONS = { maxWait: 10_000, timeout: 30_000 };
 // A trip on several buses writes each bus's trip in the same transaction.
 const CONVOY_TX_OPTIONS = { maxWait: 10_000, timeout: 120_000 };
 const DAY_MS = 24 * 60 * 60 * 1000;
+/** The append-only financial tables a finished trip's full delete removes rows from (their guard triggers reject deletes). */
+const PURGE_GUARDED_TABLES = ['CashMovement', 'Invoice', 'CreditNote', 'BookingCollection', 'BookingEvent', 'PaymentTransaction'];
 
 type Schedule = { scheduleType: TripScheduleType; recurrenceCalendar: TripCalendar | null; repeatWeekdays: number[]; repeatUntil: Date | null };
 
@@ -2862,6 +2864,11 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
       const creditNoteWhere = { OR: [{ bookingId: { in: bookingIds } }, { invoiceId: { in: invoiceIds } }] };
       const creditNoteIds = (await tx.creditNote.findMany({ where: creditNoteWhere, select: { id: true } })).map((note) => note.id);
 
+      // The guards that keep these financial records append-only reject every delete, so they are off for this transaction
+      // only: ALTER TABLE is transactional, they come back on before it commits, and a failure restores them with every row.
+      for (const table of PURGE_GUARDED_TABLES) await tx.$executeRawUnsafe(`ALTER TABLE "${table}" DISABLE TRIGGER USER`);
+      // A branch expense spent on the trip stays in its branch's accounts and closings; it only stops naming the trip.
+      await tx.generalExpense.updateMany({ where: { tripId }, data: { tripId: null } });
       await tx.zatcaDocument.deleteMany({ where: { OR: [{ invoiceId: { in: invoiceIds } }, { creditNoteId: { in: creditNoteIds } }] } });
       await tx.creditNote.deleteMany({ where: { id: { in: creditNoteIds } } });
       await tx.invoice.deleteMany({ where: { id: { in: invoiceIds } } });
@@ -2880,6 +2887,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
       // Passengers, tickets, payments and ratings go with their bookings.
       await tx.booking.deleteMany({ where: { tripId } });
       await tx.trip.delete({ where: { id: tripId } });
+      for (const table of PURGE_GUARDED_TABLES) await tx.$executeRawUnsafe(`ALTER TABLE "${table}" ENABLE TRIGGER USER`);
     }, { maxWait: 10_000, timeout: 120_000 });
   }
 

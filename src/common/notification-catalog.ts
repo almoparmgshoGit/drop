@@ -97,6 +97,8 @@ const VARIABLES = {
   remittanceMethod: { label: 'طريقة التوريد', example: 'تسليم نقدي للمالك' },
   rejectReason: { label: 'سبب عدم الاستلام', example: 'لم يصلني أي مبلغ' },
   monthName: { label: 'الشهر', example: 'نوفمبر 2026' },
+  checkInDate: { label: 'تاريخ الدخول إلى الفندق', example: '2026-12-01' },
+  nights: { label: 'عدد الليالي', example: '3' },
 } as const;
 
 export type NotificationVariable = keyof typeof VARIABLES;
@@ -344,6 +346,45 @@ export const NOTIFICATION_CATALOG = {
     translations: {
       en: { title: 'Your refund is complete', body: '{{amount}} for booking {{bookingReference}} has been refunded to {{refundMethod}}.' },
       ur: { title: 'رقم واپس کر دی گئی', body: 'بکنگ {{bookingReference}} کے {{amount}} آپ کو {{refundMethod}} پر واپس کر دیے گئے ہیں۔' },
+    },
+  },
+  STAY_CONFIRMED: {
+    audience: 'PASSENGER',
+    group: 'السكن',
+    label: 'تأكيد حجز السكن',
+    trigger: 'عند إتمام العميل حجز سكن فقط من التطبيق',
+    title: 'تم تأكيد حجز السكن',
+    body: 'حجزك {{bookingReference}} في {{hotelName}} مؤكد: الدخول {{checkInDate}} لمدة {{nights}} ليلة، الإجمالي {{totalPrice}}.',
+    variables: ['userName', 'bookingReference', 'hotelName', 'checkInDate', 'nights', 'totalPrice'],
+    translations: {
+      en: { title: 'Your stay is confirmed', body: 'Your booking {{bookingReference}} at {{hotelName}} is confirmed: check-in {{checkInDate}} for {{nights}} nights, total {{totalPrice}}.' },
+      ur: { title: 'آپ کی رہائش کی بکنگ کنفرم ہو گئی', body: '{{hotelName}} میں آپ کی بکنگ {{bookingReference}} کنفرم ہے: چیک اِن {{checkInDate}}، {{nights}} راتیں، کل {{totalPrice}}۔' },
+    },
+  },
+  STAY_CANCELLED: {
+    audience: 'PASSENGER',
+    group: 'السكن',
+    label: 'إلغاء حجز السكن',
+    trigger: 'عند قبول طلب إلغاء حجز سكن أو إلغائه من لوحة التحكم',
+    title: 'تم إلغاء حجز السكن',
+    body: 'تم إلغاء حجز السكن {{bookingReference}} في {{hotelName}}. المبلغ المسترد إلى محفظتك: {{refundAmount}}. {{reviewNote}}',
+    variables: ['userName', 'bookingReference', 'hotelName', 'checkInDate', 'refundAmount', 'reviewNote'],
+    translations: {
+      en: { title: 'Your stay has been cancelled', body: 'Stay booking {{bookingReference}} at {{hotelName}} has been cancelled. Amount refunded to your wallet: {{refundAmount}}. {{reviewNote}}' },
+      ur: { title: 'رہائش کی بکنگ منسوخ کر دی گئی', body: '{{hotelName}} میں رہائش کی بکنگ {{bookingReference}} منسوخ کر دی گئی ہے۔ آپ کے والٹ میں واپس کی گئی رقم: {{refundAmount}}۔ {{reviewNote}}' },
+    },
+  },
+  STAY_CANCEL_REJECTED: {
+    audience: 'PASSENGER',
+    group: 'السكن',
+    label: 'رفض طلب إلغاء السكن',
+    trigger: 'عند رفض الموظف طلب إلغاء حجز سكن',
+    title: 'تعذر قبول طلب إلغاء السكن',
+    body: 'تعذر قبول طلب إلغاء حجز السكن {{bookingReference}} في {{hotelName}}، وحجزك ما زال مؤكدًا. {{reviewNote}}',
+    variables: ['userName', 'bookingReference', 'hotelName', 'checkInDate', 'reviewNote'],
+    translations: {
+      en: { title: 'Stay cancellation request not accepted', body: 'We could not accept your request to cancel stay booking {{bookingReference}} at {{hotelName}}, and your booking is still confirmed. {{reviewNote}}' },
+      ur: { title: 'رہائش کی منسوخی کی درخواست قبول نہیں ہو سکی', body: '{{hotelName}} میں رہائش کی بکنگ {{bookingReference}} کی منسوخی کی درخواست قبول نہیں ہو سکی، اور آپ کی بکنگ بدستور کنفرم ہے۔ {{reviewNote}}' },
     },
   },
   TRIP_CANCELLED: {
@@ -891,6 +932,19 @@ export const NOTIFICATION_CATALOG = {
     translations: {
       en: { title: 'New booking', body: '{{customerName}} booked {{passengerCount}} seat(s) on trip {{tripCode}}. Booking number {{bookingReference}}.' },
       ur: { title: 'نئی بکنگ', body: '{{customerName}} نے سفر {{tripCode}} پر {{passengerCount}} سیٹیں بک کیں۔ بکنگ نمبر {{bookingReference}}۔' },
+    },
+  },
+  STAFF_STAY_CANCEL_REQUEST: {
+    audience: 'STAFF',
+    group: 'المكتب',
+    label: 'طلب إلغاء حجز سكن',
+    trigger: 'عند طلب عميل إلغاء حجز سكن فقط (لمن يملك حجز الغرف)',
+    title: 'طلب إلغاء سكن بانتظار المراجعة',
+    body: 'طلب {{customerName}} إلغاء حجز السكن {{bookingReference}} في {{hotelName}} (الدخول {{checkInDate}}). السبب: {{cancelReason}}.',
+    variables: ['userName', 'bookingReference', 'hotelName', 'checkInDate', 'customerName', 'customerPhone', 'cancelReason'],
+    translations: {
+      en: { title: 'Stay cancellation request awaiting review', body: '{{customerName}} requested to cancel stay booking {{bookingReference}} at {{hotelName}} (check-in {{checkInDate}}). Reason: {{cancelReason}}.' },
+      ur: { title: 'رہائش کی منسوخی کی درخواست جائزے کی منتظر', body: '{{customerName}} نے {{hotelName}} میں رہائش کی بکنگ {{bookingReference}} (چیک اِن {{checkInDate}}) کی منسوخی کی درخواست کی ہے۔ وجہ: {{cancelReason}}۔' },
     },
   },
   STAFF_CANCELLATION_REQUEST: {

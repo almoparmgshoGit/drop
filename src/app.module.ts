@@ -53,6 +53,7 @@ import { WaitlistModule } from './modules/waitlist/waitlist.module';
 import { TripFollowupModule } from './modules/trip-followup/trip-followup.module';
 import { ClosingsModule } from './modules/closings/closings.module';
 import { BulkModule } from './modules/bulk/bulk.module';
+import { StaysModule } from './modules/stays/stays.module';
 
 @Module({
   imports: [
@@ -108,6 +109,7 @@ import { BulkModule } from './modules/bulk/bulk.module';
     TripFollowupModule,
     ClosingsModule,
     BulkModule,
+    StaysModule,
   ],
   providers: [
     { provide: APP_GUARD, useClass: ThrottlerGuard },

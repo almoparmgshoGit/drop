@@ -11,6 +11,7 @@ import { CREW_WINDOW_SELECT, crewWindow } from '../../common/utils/crew-window.u
 import { hotelBookingCost } from '../../common/utils/payment.util';
 import { SERVICE_SELECT, withHotelServices } from '../../common/utils/services.util';
 import { GALLERY_SELECT, galleryRows } from '../../common/utils/gallery.util';
+import { hotelRatingSummaries, NO_RATINGS, withHotelRatings } from '../../common/utils/hotel-ratings.util';
 import { suggestServiceIcon } from '../../common/service-icons';
 import { NATIONALITIES } from '../../common/profile-options';
 import { riyadhDaysRange } from '../../common/utils/time.util';
@@ -101,7 +102,10 @@ export class HotelsService {
   ) {}
 
   async listHotels(actor: HotelActor) {
-    const hotels = (await this.prisma.hotel.findMany({ orderBy: [{ isActive: 'desc' }, { name: 'asc' }], include: HOTEL_PROFILE })).map(withHotelServices);
+    const hotels = await withHotelRatings(
+      this.prisma,
+      (await this.prisma.hotel.findMany({ orderBy: [{ isActive: 'desc' }, { name: 'asc' }], include: HOTEL_PROFILE })).map(withHotelServices),
+    );
     // The contract rate is a purchase price, so only ranks allowed to see costs get it.
     return actor.permissions.includes('hotels.rates') ? hotels : hotels.map(({ nightlyRate, ...hotel }) => hotel);
   }
@@ -122,7 +126,7 @@ export class HotelsService {
       },
     });
     const canSeeRates = actor.permissions.includes('hotels.rates');
-    return hotels.map(withHotelServices).map(({ bookings, roomBlocks, _count, nightlyRate, ...hotel }) => {
+    return (await withHotelRatings(this.prisma, hotels.map(withHotelServices))).map(({ bookings, roomBlocks, _count, nightlyRate, ...hotel }) => {
       const current = bookings.filter((b) => b.checkIn <= today).flatMap((b) => b.rooms);
       return {
         ...hotel,
@@ -188,7 +192,7 @@ export class HotelsService {
     const canSeeRates = actor.permissions.includes('hotels.rates');
     const { bookings, complaints, roomBlocks, nightlyRate, ...details } = withHotelServices(hotel);
     return {
-      hotel: { ...details, ...(canSeeRates && { nightlyRate }) },
+      hotel: { ...details, ...(canSeeRates && { nightlyRate }), rating: (await hotelRatingSummaries(this.prisma, [hotel.id])).get(hotel.id) ?? NO_RATINGS },
       roomBlocks,
       bookings: bookings.map((b) => {
         const occupied = b.rooms.filter((r) => r.occupants.length > 0).length;
@@ -484,7 +488,7 @@ export class HotelsService {
         },
         include: HOTEL_PROFILE,
       });
-      return withHotelServices(hotel);
+      return (await withHotelRatings(tx, [withHotelServices(hotel)]))[0];
     });
   }
 
@@ -505,7 +509,7 @@ export class HotelsService {
         data: { ...fields, ...(serviceIds?.length && { services: { create: serviceIds.map((serviceId) => ({ serviceId })) } }) },
         include: HOTEL_PROFILE,
       });
-      return withHotelServices(hotel);
+      return (await withHotelRatings(tx, [withHotelServices(hotel)]))[0];
     });
   }
 

@@ -127,9 +127,23 @@ export class CreateHotelDto {
   @IsString()
   @MaxLength(30)
   phone?: string;
+
+  /** The hotel's star class, 1 to 5; null clears it. */
+  @IsOptional()
+  @IsInt({ message: 'تصنيف النجوم رقم صحيح من 1 إلى 5' })
+  @Min(1)
+  @Max(5)
+  stars?: number | null;
 }
 
 export class UpdateHotelDto {
+  /** The hotel's star class, 1 to 5; null clears it. */
+  @IsOptional()
+  @IsInt({ message: 'تصنيف النجوم رقم صحيح من 1 إلى 5' })
+  @Min(1)
+  @Max(5)
+  stars?: number | null;
+
   @IsOptional()
   @trimmed()
   @IsString()

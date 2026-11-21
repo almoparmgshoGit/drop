@@ -22,7 +22,7 @@ import { serviceTypeOf } from '../../common/utils/booking-kinds.util';
 import { nextBookingNumber } from '../../common/utils/booking-number.util';
 import { GALLERY_SELECT } from '../../common/utils/gallery.util';
 import { riyadhDate } from '../../common/utils/time.util';
-import { housingCharge, HousingTerms, isRoomSellable, privateRoomsNeeded } from '../../common/utils/housing-price.util';
+import { hotelHousingTerms, housingCharge, HousingTerms, isRoomSellable, privateRoomsNeeded } from '../../common/utils/housing-price.util';
 import { applicableRule, daysUntil, parseCancellationRules } from '../../common/utils/cancellation-policy.util';
 import { paymentFigures } from '../../common/utils/payment.util';
 import { normalizeSaudiPhone } from '../../common/utils/phone.util';
@@ -624,14 +624,7 @@ export class BookingsService {
       const { housingPrice, privateRoomPrice, privateRoomCapacity, housingPriceMode, privateRoomPriceBasis } = tripTerms;
       return { housingPrice, privateRoomPrice, privateRoomCapacity, housingPriceMode, privateRoomPriceBasis, housingPricePeriod: hotel.housingPricePeriod };
     }
-    return {
-      housingPrice: hotel.bedPrice,
-      privateRoomPrice: hotel.privateRoomPrice,
-      privateRoomCapacity: hotel.privateRoomCapacity,
-      housingPriceMode: 'ADDED_TO_BASE',
-      privateRoomPriceBasis: hotel.privateRoomPriceBasis,
-      housingPricePeriod: hotel.housingPricePeriod,
-    };
+    return hotelHousingTerms(hotel);
   }
 
   /**

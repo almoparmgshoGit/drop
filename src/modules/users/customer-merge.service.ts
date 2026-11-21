@@ -173,6 +173,8 @@ export class CustomerMergeService {
         // A token is its own key, so a phone signed into both accounts has one row and simply moves.
         pushTokens: (await tx.pushToken.updateMany({ where, data: { userId: primaryId } })).count,
         ticketCompensations: (await tx.ticketCompensation.updateMany({ where, data: { userId: primaryId } })).count,
+        stayBookings: (await tx.stayBooking.updateMany({ where, data: { userId: primaryId } })).count,
+        hotelRatings: (await tx.hotelRating.updateMany({ where, data: { userId: primaryId } })).count,
         ownedCoupons: (await tx.coupon.updateMany({ where: { ownerUserId: duplicateId }, data: { ownerUserId: primaryId } })).count,
         seatHolds: (await tx.seat.updateMany({ where: { heldByUserId: duplicateId }, data: { heldByUserId: primaryId } })).count,
         referrals: (await tx.user.updateMany({ where: { referredById: duplicateId, id: { not: primaryId } }, data: { referredById: primaryId } })).count,

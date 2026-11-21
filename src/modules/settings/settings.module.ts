@@ -24,6 +24,10 @@ const PUBLIC_DEFAULTS: Record<string, string> = {
   vatRate: '15',
   cancellationPolicy: '',
   cancellationRules: '[]',
+  // Hotel-only stays: the trip rules above (TRIP) or their own text and rules (CUSTOM), days counted until check-in.
+  stayCancellationMode: 'TRIP',
+  stayCancellationPolicy: '',
+  stayCancellationRules: '[]',
   termsAndConditions: '',
   privacyPolicy: '',
   supportPhone: '',
@@ -113,6 +117,22 @@ class UpdateSettingsDto {
   @ValidateNested({ each: true })
   @Type(() => CancellationRuleDto)
   cancellationRules?: CancellationRuleDto[];
+
+  @IsOptional()
+  @IsIn(['TRIP', 'CUSTOM'], { message: 'اختر سياسة إلغاء السكن: نفس سياسة الرحلات أو سياسة خاصة' })
+  stayCancellationMode?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(5000)
+  stayCancellationPolicy?: string;
+
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(20)
+  @ValidateNested({ each: true })
+  @Type(() => CancellationRuleDto)
+  stayCancellationRules?: CancellationRuleDto[];
 
   @IsOptional()
   @IsString()
@@ -561,7 +581,13 @@ class SettingsService {
 
   async getAll() {
     const [settings, logos] = await Promise.all([this.textValues(PUBLIC_DEFAULTS), this.logoValues()]);
-    return { ...settings, ...logos, vatRate: Number(settings.vatRate), cancellationRules: parseCancellationRules(settings.cancellationRules) };
+    return {
+      ...settings,
+      ...logos,
+      vatRate: Number(settings.vatRate),
+      cancellationRules: parseCancellationRules(settings.cancellationRules),
+      stayCancellationRules: parseCancellationRules(settings.stayCancellationRules),
+    };
   }
 
   /** Public on purpose: the browser tab, the printed invoice and the app show them, some before anyone signs in. */
@@ -655,6 +681,9 @@ class SettingsService {
     }
     if (dto.cancellationRules && new Set(dto.cancellationRules.map((rule) => rule.minDays)).size !== dto.cancellationRules.length) {
       throw new BadRequestException('يوجد أكثر من بند لنفس عدد الأيام في سياسة الإلغاء');
+    }
+    if (dto.stayCancellationRules && new Set(dto.stayCancellationRules.map((rule) => rule.minDays)).size !== dto.stayCancellationRules.length) {
+      throw new BadRequestException('يوجد أكثر من بند لنفس عدد الأيام في سياسة إلغاء السكن');
     }
     if (dto.defaultSinglesFromSeat !== undefined || dto.defaultSinglesToSeat !== undefined) {
       const current = await this.appSettings.singlesRange(null);

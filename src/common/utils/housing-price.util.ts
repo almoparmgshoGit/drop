@@ -14,6 +14,22 @@ export type HousingTerms = {
 
 const toHalalas = (value: Money) => Math.round(Number(value ?? 0) * 100);
 
+/** A hotel sold on its own customer prices, with no trip: housing is charged in full, never folded into a seat price. */
+export const hotelHousingTerms = (hotel: {
+  bedPrice: Money;
+  privateRoomPrice: Money;
+  privateRoomCapacity: number | null;
+  privateRoomPriceBasis: PrivateRoomPriceBasis;
+  housingPricePeriod: HousingPricePeriod;
+}): HousingTerms => ({
+  housingPrice: hotel.bedPrice,
+  privateRoomPrice: hotel.privateRoomPrice,
+  privateRoomCapacity: hotel.privateRoomCapacity,
+  housingPriceMode: 'ADDED_TO_BASE',
+  privateRoomPriceBasis: hotel.privateRoomPriceBasis,
+  housingPricePeriod: hotel.housingPricePeriod,
+});
+
 const stayUnits = (terms: HousingTerms, nights: number) => (terms.housingPricePeriod === 'PER_NIGHT' ? Math.max(1, nights) : 1);
 
 /** When housing is added to the base price, a room type without a price cannot be sold, or it would be free. */
