@@ -6,6 +6,7 @@ import { bookingTypeLabel } from '../../common/utils/booking-kinds.util';
 import { bookingHasStay, includesHousing } from '../../common/utils/booking-types.util';
 import { tripSeatLayout } from '../../common/utils/bus-layout.util';
 import { goOnlyBookings, returningBookingIds, reverseSeatsSummary } from '../../common/utils/linked-seats.util';
+import { tripRatingSummaries } from '../../common/utils/trip-ratings.util';
 import { hotelBookingCost, paymentFigures } from '../../common/utils/payment.util';
 import { passengerWeights } from '../../common/utils/housing-price.util';
 import { tripInCity } from '../../common/utils/branch-city.util';
@@ -128,7 +129,11 @@ export class ManifestsService {
     });
     if (!trip) throw new NotFoundException('Trip not found');
 
-    const [{ bookingIds: goOnly }, reverse] = await Promise.all([goOnlyBookings(this.prisma, [tripId]), reverseSeatsSummary(this.prisma, tripId)]);
+    const [{ bookingIds: goOnly }, reverse, ratingSummaries] = await Promise.all([
+      goOnlyBookings(this.prisma, [tripId]),
+      reverseSeatsSummary(this.prisma, tripId),
+      tripRatingSummaries(this.prisma, [tripId]),
+    ]);
 
     // A round trip's passengers ride back on the reverse under their outbound booking, so its sheet must list them too.
     const isReverseOpen = trip.reverseOfTripId && ['PUBLISHED', 'COMPLETED'].includes(trip.tripStatus);
@@ -236,6 +241,8 @@ export class ManifestsService {
         supervisors: trip.supervisors.map((s) => s.user.name).filter(Boolean),
         manifestSentAt: trip.manifestSentAt,
         manifestSentByName: trip.manifestSentByName,
+        /** The customers' ratings of this trip: how many rated it and their average stars. */
+        ratings: ratingSummaries.get(trip.id) ?? { count: 0, average: null },
         crew: [
           ...trip.drivers.map((d, idx) => ({ name: d.user.name, phone: d.user.phone, label: idx === 0 ? 'السائق الأول' : 'السائق الثاني' })),
           ...trip.supervisors.map((s) => ({ name: s.user.name, phone: s.user.phone, label: 'مشرف' })),

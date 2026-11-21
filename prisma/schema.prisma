@@ -1184,7 +1184,8 @@ model Booking {
   seatBasePrice         Decimal?             @db.Decimal(10, 2)
   /// The secret in the public tracking link the customer shares with family. Made on first share, and only opens the trip's live position until it ends.
   trackingToken         String?              @unique
-  rating                TripRating?
+  /// One per leg it rode: the outbound, and on a round trip the way back on its reverse.
+  ratings               TripRating[]
 
   @@index([userId])
   @@index([tripId])
@@ -3169,10 +3170,11 @@ model UserTablePreference {
   @@unique([userId, tableKey])
 }
 
-/// A customer's rating of a trip they rode, one per booking. Asked for once after the trip, and from the app's past trips.
+/// A customer's rating of a trip they rode, one per booking and leg: a round-trip booking rates its outbound and the
+/// reverse it came back on apart. Asked for once after each, and from the app's past trips.
 model TripRating {
   id               String   @id @default(uuid())
-  bookingId        String   @unique
+  bookingId        String
   booking          Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
   tripId           String
   trip             Trip     @relation(fields: [tripId], references: [id], onDelete: Cascade)
@@ -3185,6 +3187,7 @@ model TripRating {
   comment          String?
   createdAt        DateTime @default(now())
 
+  @@unique([bookingId, tripId])
   @@index([tripId, createdAt])
 }
 

@@ -1,5 +1,6 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { Prisma } from '@prisma/client';
 import { NotificationEvent, NotificationValues } from '../../common/notification-catalog';
 import { AppSettingsService } from '../../common/services/app-settings.service';
 import { NotificationsService, tripValues } from '../../common/services/notifications.service';
@@ -31,8 +32,12 @@ const REMINDERS: { key: 'REMINDER_24H' | 'REMINDER_2H'; event: NotificationEvent
 const RATING_AFTER_ARRIVAL_MS = HOUR_MS;
 /** Trips older than this are not asked about, so turning the feature on does not reach every customer of last year. */
 const RATING_LOOKBACK_MS = 5 * 24 * HOUR_MS;
+/** A trip the crew never marked arrived counts as over this long after its arrival time. */
+const UNDERWAY_GRACE_MS = 6 * HOUR_MS;
 
 export const ratingRequestKey = (bookingId: string) => `${bookingId}:RATING_REQUEST`;
+/** The way back of a round trip, rated apart from its outbound. */
+export const returnRatingRequestKey = (bookingId: string, tripId: string) => `${bookingId}:${tripId}:RATING_REQUEST`;
 
 const BOOKING_SELECT = {
   id: true,
@@ -197,42 +202,64 @@ export class TripRemindersService implements OnModuleInit, OnModuleDestroy {
     return sent;
   }
 
-  /** Asks each customer who rode a finished trip to rate it, once. Returns how many were asked. */
+  /**
+   * Asks each customer who rode a finished trip to rate it, once per leg: the outbound, and on a round trip the way back
+   * on its reverse. Only those who boarded that leg. Returns how many were asked.
+   */
   async sweepRatingRequests(now = new Date()) {
     const at = now.getTime();
+    const endedBy = (cutoff: Date): Prisma.TripWhereInput[] => [
+      { estimatedArrivalAt: { lte: cutoff } },
+      { estimatedArrivalAt: null, arrivalTime: { lte: cutoff } },
+    ];
     const settled = new Date(at - RATING_AFTER_ARRIVAL_MS);
+    const settledUnderway = new Date(at - RATING_AFTER_ARRIVAL_MS - UNDERWAY_GRACE_MS);
     const trips = await this.prisma.trip.findMany({
       where: {
-        executedAt: { not: null },
         tripStatus: { in: ['PUBLISHED', 'COMPLETED'] },
         departureTime: { gte: new Date(at - RATING_LOOKBACK_MS) },
         OR: [
           { liveStatus: 'ARRIVED' },
           { tripStatus: 'COMPLETED' },
-          { estimatedArrivalAt: { lte: settled } },
-          { estimatedArrivalAt: null, arrivalTime: { lte: settled } },
+          // Boarding is the proof the trip ran, so the crew not closing it does not keep the request back.
+          { liveStatus: 'NOT_STARTED', OR: endedBy(settled) },
+          // A trip left on the road is asked about some hours later, in case it is only late.
+          { liveStatus: { in: ['ON_ROAD', 'AT_POINT', 'STOPPED'] }, OR: endedBy(settledUnderway) },
         ],
       },
-      select: { id: true },
+      select: { id: true, tripCode: true, origin: true, destination: true, departureTime: true, hijriDate: true, reverseOfTripId: true },
     });
     let asked = 0;
     for (const trip of trips) {
       try {
-        // Only those who boarded: a no-show has nothing to rate.
-        const bookings = await this.prisma.booking.findMany({
-          where: { tripId: trip.id, status: { in: [...GOING_STATUSES] }, rating: { is: null }, tickets: { some: { isBoarded: true } } },
+        const own = await this.prisma.booking.findMany({
+          where: { tripId: trip.id, status: { in: [...GOING_STATUSES] }, ratings: { none: { tripId: trip.id } }, tickets: { some: { isBoarded: true } } },
           select: { id: true },
         });
-        if (bookings.length === 0) continue;
+        // A round trip's passengers come back on its reverse under their outbound booking.
+        const returningIds = trip.reverseOfTripId ? await returningBookingIds(this.prisma, trip.reverseOfTripId) : [];
+        const returning = returningIds.length
+          ? await this.prisma.booking.findMany({
+              where: { id: { in: returningIds }, status: { in: [...GOING_STATUSES] }, ratings: { none: { tripId: trip.id } }, tickets: { some: { returnBoardedAt: { not: null } } } },
+              select: { id: true },
+            })
+          : [];
+        const candidates = [
+          ...own.map((booking) => ({ bookingId: booking.id, key: ratingRequestKey(booking.id), isReturning: false })),
+          ...returning.map((booking) => ({ bookingId: booking.id, key: returnRatingRequestKey(booking.id, trip.id), isReturning: true })),
+        ];
+        if (candidates.length === 0) continue;
         const done = new Set(
-          (await this.prisma.tripReminderLog.findMany({ where: { key: { in: bookings.map((booking) => ratingRequestKey(booking.id)) } }, select: { key: true } })).map((row) => row.key),
+          (await this.prisma.tripReminderLog.findMany({ where: { key: { in: candidates.map((row) => row.key) } }, select: { key: true } })).map((row) => row.key),
         );
-        for (const booking of bookings) {
-          if (done.has(ratingRequestKey(booking.id))) continue;
+        for (const { bookingId, key, isReturning } of candidates) {
+          if (done.has(key)) continue;
           const claimed = await this.prisma.$transaction(async (tx) => {
-            const claim = await tx.tripReminderLog.createMany({ data: [{ key: ratingRequestKey(booking.id) }], skipDuplicates: true });
+            const claim = await tx.tripReminderLog.createMany({ data: [{ key }], skipDuplicates: true });
             if (claim.count === 0) return false;
-            await this.notifications.toBookingOwners(tx, 'TRIP_RATING_REQUEST', [booking.id]);
+            // Returning passengers are asked about the trip back, not the outbound their booking belongs to.
+            if (isReturning) await this.notifications.toBookingOwnersEach(tx, 'TRIP_RATING_REQUEST', new Map([[bookingId, tripValues(trip)]]));
+            else await this.notifications.toBookingOwners(tx, 'TRIP_RATING_REQUEST', [bookingId]);
             return true;
           }, TX_OPTIONS);
           if (claimed) asked++;

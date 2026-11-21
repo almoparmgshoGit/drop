@@ -1485,7 +1485,7 @@ export const NOTIFICATION_CATALOG = {
     audience: 'PASSENGER',
     group: 'الحجوزات',
     label: 'طلب تقييم الرحلة',
-    trigger: 'بعد وصول الرحلة وتنفيذها، مرة واحدة لكل حجز صعد ركابه',
+    trigger: 'بعد وصول الرحلة، مرة واحدة لكل حجز صعد ركابه، ولرحلة العودة طلب مستقل',
     title: 'كيف كانت رحلتك؟',
     body: 'حمدًا لله على السلامة. نسعد بتقييمك لرحلة {{origin}} ← {{destination}} يوم {{departureDate}} من التطبيق، فرأيك يساعدنا على خدمتك بشكل أفضل.',
     variables: BOOKING,

@@ -26,6 +26,7 @@ import { seatLayoutFor, seatNumbersOf, storedSeatLayout, tripSeatLayout } from '
 import { assertSinglesFitRange } from '../../common/utils/singles-seats.util';
 import { applySeatLayout } from '../../common/utils/trip-seats.util';
 import { bookedOnTrips, goOnlyBookings, lockTripsWithLinked, returningBookingIds } from '../../common/utils/linked-seats.util';
+import { tripRatingSummaries } from '../../common/utils/trip-ratings.util';
 import { RIYADH_OFFSET_MS, addDays, formatRiyadhDate, formatRiyadhTime, riyadhDate, riyadhDayRange, riyadhMonth, riyadhMonthRange, startOfRiyadhMonth, toHijriLabel } from '../../common/utils/time.util';
 import { bookingOpenedWhere, bookingOpensAtFor, startOfNextRiyadhMonth } from '../../common/utils/booking-opens.util';
 import { applyBusServices, busServiceRows } from '../../common/utils/bus-services.util';
@@ -1166,7 +1167,12 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
       }),
       this.metrics.revenueByTrip(where),
     ]);
-    return trips.map((trip) => ({ ...withoutRentFor(actor, withSeatPrice(trip)), expectedRevenue: (revenue.get(trip.id) ?? 0) / 100 }));
+    const ratings = await tripRatingSummaries(this.prisma, trips.map((trip) => trip.id));
+    return trips.map((trip) => ({
+      ...withoutRentFor(actor, withSeatPrice(trip)),
+      expectedRevenue: (revenue.get(trip.id) ?? 0) / 100,
+      ratings: ratings.get(trip.id) ?? { count: 0, average: null },
+    }));
   }
 
   /** The departure window of the trips list; null for every trip. */

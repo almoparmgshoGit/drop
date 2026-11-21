@@ -28,6 +28,14 @@ class TripFollowupController {
     return this.followup.publicTracking(token);
   }
 
+  @Get('trip-ratings/pending')
+  @ApiBearerAuth()
+  @SkipAudit()
+  @ApiOperation({ summary: 'The customer\'s finished trips still waiting for a rating, latest first' })
+  pendingRatings(@Req() req) {
+    return this.followup.pendingRatings(req.user.userId);
+  }
+
   @Get('trip-ratings/bookings/:bookingId')
   @ApiBearerAuth()
   @ApiOperation({ summary: 'Whether the customer can rate the trip of this booking, and their rating if given' })
@@ -38,7 +46,7 @@ class TripFollowupController {
   @Post('trip-ratings/bookings/:bookingId')
   @ApiBearerAuth()
   @Throttle({ default: { limit: 10, ttl: 60_000 } })
-  @ApiOperation({ summary: 'The customer rates a trip they rode, once per booking' })
+  @ApiOperation({ summary: 'The customer rates a trip they rode, once per booking and leg (outbound or the way back)' })
   rate(@Req() req, @Param('bookingId') bookingId: string, @Body() dto: RateTripDto) {
     return this.followup.rate(req.user.userId, bookingId, dto);
   }

@@ -15,7 +15,10 @@ import { parseCancellationRules } from '../../common/utils/cancellation-policy.u
 import { INVOICE_SETTING_DEFAULTS } from '../../common/utils/invoice.util';
 import { Public, RequirePermission, SkipAudit } from '../../common/decorators/auth.decorators';
 
-/** Anyone can read these through GET /settings, so nothing internal belongs here. */
+/**
+ * Anyone can read these through GET /settings, so nothing internal belongs here. The invoice's seller details are not among
+ * them: each invoice carries its own copy, and only staff need the settings themselves (GET /settings/panel and /admin).
+ */
 const PUBLIC_DEFAULTS: Record<string, string> = {
   systemName: 'دروب الهجرة — Durob Al Hijra',
   vatRate: '15',
@@ -25,8 +28,10 @@ const PUBLIC_DEFAULTS: Record<string, string> = {
   privacyPolicy: '',
   supportPhone: '',
   supportWhatsapp: '',
-  ...INVOICE_SETTING_DEFAULTS,
 };
+
+/** Flags the app has no use for, kept out of the public app config. */
+const INTERNAL_FLAGS = ['ticketCompensationAutomatic'] as const;
 
 const APP_TEXT_DEFAULTS: Record<string, string> = {
   maintenanceMessage: 'نعمل على تحسين الخدمة، وسنعود قريبًا بإذن الله.',
@@ -66,7 +71,8 @@ const LOGO_DEFAULTS: Record<string, string> = {
   appLogoUrl: '',
   appLogoSize: '40',
 };
-const LOGO_URL = /^(\/trips\/images\/[0-9a-f-]{36})?$/;
+// Ids are the database's own and not always UUIDs (the live server's are 25 mixed-case characters), as in GALLERY_URL.
+const LOGO_URL = /^(\/trips\/images\/[A-Za-z0-9_-]{8,64})?$/;
 const LOGO_URL_MESSAGE = 'ارفع الشعار من صفحة الإعدادات';
 
 const STORE_URL = /^(https:\/\/\S+)?$/;
@@ -573,8 +579,9 @@ class SettingsService {
 
   /** Everything the settings page edits, except integration keys, which have their own permission. */
   async getAdmin() {
-    const [general, appText, google, panel, numbers, flags, schedule] = await Promise.all([
+    const [general, invoice, appText, google, panel, numbers, flags, schedule] = await Promise.all([
       this.getAll(),
+      this.textValues(INVOICE_SETTING_DEFAULTS),
       this.textValues(APP_TEXT_DEFAULTS),
       this.textValues(GOOGLE_SIGN_IN_DEFAULTS),
       this.textValues(PANEL_DEFAULTS),
@@ -582,7 +589,7 @@ class SettingsService {
       this.flagValues(),
       this.textValues(SCHEDULE_TEXT_DEFAULTS),
     ]);
-    return { ...general, ...appText, ...google, ...panel, ...numbers, ...flags, ...schedule };
+    return { ...general, ...invoice, ...appText, ...google, ...panel, ...numbers, ...flags, ...schedule };
   }
 
   /** What each copy of the app asks for on opening, before anyone signs in. */
@@ -596,6 +603,7 @@ class SettingsService {
       this.logoValues(),
       this.numberValues(),
     ]);
+    for (const key of INTERNAL_FLAGS) delete (flags as Partial<typeof flags>)[key];
     return {
       ...appText,
       ...contact,
@@ -611,9 +619,17 @@ class SettingsService {
   }
 
   async getPanelConfig() {
-    const [panel, numbers, map, logos] = await Promise.all([this.textValues(PANEL_DEFAULTS), this.numberValues(), this.integrations.mapConfig(), this.logoValues()]);
+    const [panel, numbers, map, logos, invoice] = await Promise.all([
+      this.textValues(PANEL_DEFAULTS),
+      this.numberValues(),
+      this.integrations.mapConfig(),
+      this.logoValues(),
+      this.textValues({ vatNumber: INVOICE_SETTING_DEFAULTS.vatNumber }),
+    ]);
     return {
       ...panel,
+      // The invoices page shows it, and warns while it is empty.
+      vatNumber: invoice.vatNumber,
       logoSidebarCollapsed: logos.logoSidebarCollapsed,
       logoSidebarExpanded: logos.logoSidebarExpanded,
       map,

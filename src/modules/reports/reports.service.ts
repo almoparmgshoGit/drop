@@ -7,6 +7,7 @@ import { bookingHasStay, includesHousing } from '../../common/utils/booking-type
 import { includedBedValue } from '../../common/utils/housing-price.util';
 import { halalas, netBookingFigures, paymentFigures } from '../../common/utils/payment.util';
 import { addDays, riyadhDate, riyadhDayRange } from '../../common/utils/time.util';
+import { tripRatingSummaries } from '../../common/utils/trip-ratings.util';
 import { AppEventDto, DateBasis, ReportRangeQuery, ReportRecordsQuery } from './reports.dto';
 
 const MAX_RANGE_DAYS = 366;
@@ -928,6 +929,7 @@ export class ReportsService {
         },
       }),
     ]);
+    const ratings = await tripRatingSummaries(this.prisma, rows.map((trip) => trip.id));
     return {
       total,
       rows: rows.map((trip) => {
@@ -947,6 +949,7 @@ export class ReportsService {
           taken,
           offered: trip.totalSeats,
           occupancy: percent(taken, trip.totalSeats),
+          ratings: ratings.get(trip.id) ?? { count: 0, average: null },
         };
       }),
     };

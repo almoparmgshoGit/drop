@@ -154,8 +154,14 @@ describe('Settings control panel (e2e)', () => {
     it('keeps internal limits out of the public endpoints', async () => {
       const [general, appConfig] = await Promise.all([request(http()).get(`${API}/settings`).expect(200), request(http()).get(`${API}/settings/app-config`).expect(200)]);
       for (const body of [general.body, appConfig.body]) {
-        for (const key of ['otpMaxAttempts', 'loginMaxFailures', 'panelNotice']) expect(body).not.toHaveProperty(key);
+        for (const key of ['otpMaxAttempts', 'loginMaxFailures', 'panelNotice', 'vatNumber', 'crNumber', 'invoiceContacts', 'ticketCompensationAutomatic']) {
+          expect(body).not.toHaveProperty(key);
+        }
       }
+      const panel = await request(http()).get(`${API}/settings/panel`).set(admin.auth).expect(200);
+      expect(panel.body).toHaveProperty('vatNumber');
+      const settings = await request(http()).get(`${API}/settings/admin`).set(admin.auth).expect(200);
+      for (const key of ['vatNumber', 'crNumber', 'sellerTagline', 'ticketCompensationAutomatic']) expect(settings.body).toHaveProperty(key);
       await request(http()).get(`${API}/settings/admin`).set(passenger.auth).expect(403);
       await request(http()).get(`${API}/settings/panel`).set(passenger.auth).expect(403);
     });
