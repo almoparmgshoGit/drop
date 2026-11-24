@@ -27,6 +27,7 @@ import { SystemResetModule } from './modules/system-reset/system-reset.module';
 import { DashboardModule } from './modules/dashboard/dashboard.module';
 import { ManifestsModule } from './modules/manifests/manifests.module';
 import { HotelsModule } from './modules/hotels/hotels.module';
+import { RoomCardsModule } from './modules/room-cards/room-cards.module';
 import { TrackingModule } from './modules/tracking/tracking.module';
 import { LoyaltyModule } from './modules/loyalty/loyalty.module';
 import { VouchersModule } from './modules/vouchers/vouchers.module';
@@ -84,6 +85,7 @@ import { StaysModule } from './modules/stays/stays.module';
     DashboardModule,
     ManifestsModule,
     HotelsModule,
+    RoomCardsModule,
     TrackingModule,
     LoyaltyModule,
     VouchersModule,

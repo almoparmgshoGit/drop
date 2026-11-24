@@ -1537,6 +1537,8 @@ model Hotel {
   /// Hotel-only stays customers booked from the app, and what they rated them.
   stayBookings          StayBooking[]
   ratings               HotelRating[]
+  /// Room card designs made for this hotel only; without an active one the general design is used.
+  roomCardTemplates     RoomCardTemplate[]
 }
 
 model HotelBooking {
@@ -3649,4 +3651,25 @@ model FixedExpenseAttachment {
 
   @@index([expenseId])
   @@index([paymentId])
+}
+
+/// The card a housed traveler sees in the app with their room: a background and layers (text with variables, QR, images, shapes) placed by staff.
+/// hotelId null is the general design, used for every hotel without an active design of its own. One active design per hotel and one general.
+model RoomCardTemplate {
+  id              String   @id @default(uuid())
+  name            String
+  hotelId         String?
+  hotel           Hotel?   @relation(fields: [hotelId], references: [id], onDelete: Cascade)
+  isActive        Boolean  @default(false)
+  /// Width over height of the card.
+  ratio           Float    @default(0.8)
+  background      String   @default("#0F2A5C")
+  backgroundImage String?
+  /// The layers, bottom first; positions and sizes are fractions of the card so it scales to any screen.
+  elements        Json     @default("[]")
+  updatedByName   String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([hotelId, isActive])
 }

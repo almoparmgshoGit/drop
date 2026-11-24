@@ -40,6 +40,7 @@ import { customPackageStay, loadCustomPackage } from '../../common/utils/custom-
 import { assertBookingOpened } from '../../common/utils/booking-opens.util';
 import { seatPricing } from '../../common/utils/dynamic-pricing.util';
 import { WaitlistService } from '../../common/services/waitlist.service';
+import { RoomCardsService } from '../room-cards/room-cards.module';
 import { APP_SALES_INCLUDE, AppSalesTrip, appOpenPoints, appStillSells, hasSetOff } from '../../common/utils/app-boarding.util';
 
 const DEFAULT_VAT_RATE = 15;
@@ -89,7 +90,7 @@ const BOOKING_INCLUDE = {
               checkIn: true,
               checkOut: true,
               mealPlan: true,
-              hotel: { select: { name: true, city: true, address: true, phone: true, description: true, images: GALLERY_SELECT } },
+              hotel: { select: { id: true, name: true, city: true, address: true, phone: true, description: true, images: GALLERY_SELECT } },
             },
           },
         },
@@ -216,6 +217,7 @@ export class BookingsService {
     private ledger: PaymentLedgerService,
     private appSettings: AppSettingsService,
     private waitlist: WaitlistService,
+    private roomCards: RoomCardsService,
   ) {}
 
   private assertBookable(
@@ -1164,7 +1166,9 @@ export class BookingsService {
         })
       : [];
     if (booking.userId === userId) {
-      return { ...toCustomerBooking(booking), passengers: withBoarding, updates, cancellationEstimate, tripDayOpen, returnRide, boarding, boardingPlace, linkedLegs };
+      // Each housed passenger's room card, drawn by the app from the design staff made for the hotel.
+      const roomCards = await this.roomCards.forBooking({ ...booking, passengers: withBoarding });
+      return { ...toCustomerBooking(booking), passengers: withBoarding, updates, cancellationEstimate, tripDayOpen, returnRide, boarding, boardingPlace, linkedLegs, roomCards };
     }
     // Staff read bookings but do not need the token a passenger scans to board.
     return {
