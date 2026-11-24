@@ -623,6 +623,9 @@ model Trip {
   package                    Package?              @relation(fields: [packageId], references: [id], onDelete: SetNull)
   reverseEnabled             Boolean               @default(false)
   reverseOpenPercent         Int                   @default(0)
+  /// How full the whole bus must be (%) before a singles booking, finding the singles section full, may take family seats.
+  /// Empty follows the settings' singlesOverflowPercent.
+  singlesOverflowPercent     Int?
   reverseDepartureAt         DateTime?
   reversePrice               Decimal?              @db.Decimal(10, 2)
   /// When staff were told the trip reached its opening percent, so they are told once.

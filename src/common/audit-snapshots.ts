@@ -441,6 +441,7 @@ const TYPE_LABELS: Partial<Record<AuditRecordType, Record<string, string>>> = {
     busPlate: 'الباص',
     reverseEnabled: 'الرحلة العكسية',
     reverseOpenPercent: 'فتح العكسية عند امتلاء (%)',
+    singlesOverflowPercent: 'فتح مقاعد العائلات للأفراد عند امتلاء (%)',
     reverseDepartureAt: 'موعد العودة',
     reversePrice: 'سعر العودة',
     channelApp: 'الحجز من التطبيق',

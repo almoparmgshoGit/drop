@@ -21,6 +21,7 @@ import { cityTripWhere, tripInCity } from '../../common/utils/branch-city.util';
 import { riyadhDayRange, startOfRiyadhMonth } from '../../common/utils/time.util';
 import { compareSeats, NO_SEAT_LABEL, seatLabel } from '../../common/utils/seat-label.util';
 import { assertIdsFreeOnTrips } from '../../common/utils/passenger-ids.util';
+import { singlesOverflow } from '../../common/utils/singles-seats.util';
 import { allocate, BookingsService, holdAvailableTo, randomCode, toHalalas, toSar } from './bookings.service';
 
 const EDIT_TX_OPTIONS = { maxWait: 10_000, timeout: 30_000 };
@@ -398,16 +399,18 @@ export class BookingsAdminService {
   async seatMap(id: string) {
     const booking = await this.prisma.booking.findUnique({
       where: { id },
-      select: { category: true, trip: { select: { busType: true, busId: true, seatLayout: true, seats: true } } },
+      select: { category: true, trip: { select: { busType: true, busId: true, seatLayout: true, totalSeats: true, singlesOverflowPercent: true, seats: true } } },
     });
     if (!booking) throw new NotFoundException('Booking not found');
     const now = new Date();
+    const range = booking.category === 'SINGLES' ? await this.appSettings.singlesRange(booking.trip.busId) : null;
     return {
       category: booking.category,
       busType: booking.trip.busType,
       layout: tripSeatLayout(booking.trip),
-      // A singles booking may only move within this range.
-      singlesRange: booking.category === 'SINGLES' ? await this.appSettings.singlesRange(booking.trip.busId) : null,
+      // A singles booking moves within this range, and to any seat once it is full and the bus is booked to the trip's percent.
+      singlesRange: range,
+      singlesOverflowOpen: range ? singlesOverflow(booking.trip.seats, range, booking.trip.totalSeats, await this.appSettings.singlesOverflowPercent(booking.trip), [], now).open : false,
       seats: booking.trip.seats
         .map((seat) => ({
           seatNumber: seat.seatNumber,

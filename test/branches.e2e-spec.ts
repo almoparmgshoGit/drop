@@ -308,7 +308,7 @@ describe('Branches, their staff and counter bookings', () => {
       expect(found.body.items.map((trip: any) => trip.id)).not.toContain(closed.id);
     });
 
-    it('keeps families out of the singles seats and singles inside them, and shows each seat’s section and hold', async () => {
+    it('seats families anywhere, keeps singles in their section until it is full and the bus reaches its percent, and shows each seat’s section and hold', async () => {
       const trip = (await request(http()).post(`${API}/trips`).set(admin.auth).send(tripPayload()).expect(201)).body;
       const seatMap = async () => (await request(http()).get(`${API}/branch-bookings/trips/${trip.id}/seats`).set(clerk.auth).expect(200)).body;
       const book = (seats: string[], category?: 'FAMILY' | 'SINGLES', gender?: 'MALE' | 'FEMALE') =>
@@ -328,13 +328,12 @@ describe('Branches, their staff and counter bookings', () => {
         expect(map.seats.find((seat: any) => seat.seatNumber === '46')).toMatchObject({ status: 'available', singles: true, heldUntil: null });
         expect(map.seats.find((seat: any) => seat.seatNumber === '1')).toMatchObject({ status: 'available', singles: false });
 
-        // A family, which is what a booking is when no category is sent, may not take a singles seat.
-        const family = await book(['46']).expect(400);
-        expect(family.body.message).toContain('مقاعد الأفراد');
-        await book(['46'], 'FAMILY').expect(400);
-        // Singles may not take a family seat.
+        expect(map).toMatchObject({ singlesOverflowPercent: 70, singlesOverflowReached: false });
+        // A family, which is what a booking is when no category is sent, sits anywhere, the singles section included.
+        await book(['48']).expect(201);
+        // Singles may not take a family seat while their section still has room.
         const singles = await book(['2'], 'SINGLES').expect(400);
-        expect(singles.body.message).toContain('خارج مقاعد الأفراد');
+        expect(singles.body.message).toContain('من مقاعد العائلات');
 
         // Men alone are an individuals booking and a woman makes it a family one, whatever section was picked.
         const men = await book(['3'], 'FAMILY', 'MALE').expect(400);
@@ -347,6 +346,14 @@ describe('Branches, their staff and counter bookings', () => {
         const saved = await prisma.booking.findMany({ where: { id: { in: [singlesOk.body.legs[0].id, familyOk.body.legs[0].id] } }, select: { id: true, category: true } });
         expect(saved.find((row) => row.id === singlesOk.body.legs[0].id)?.category).toBe('SINGLES');
         expect(saved.find((row) => row.id === familyOk.body.legs[0].id)?.category).toBe('FAMILY');
+
+        // With the singles section full, a family seat opens to singles only once the bus is booked to the trip's percent.
+        await book(['45', '47', '49'], 'SINGLES').expect(201);
+        const notYet = await book(['5'], 'SINGLES').expect(400);
+        expect(notYet.body.message).toContain('بعد امتلاء الباص بنسبة 70%');
+        await prisma.trip.update({ where: { id: trip.id }, data: { singlesOverflowPercent: 10 } });
+        expect(await seatMap()).toMatchObject({ singlesOverflowPercent: 10, singlesOverflowReached: true });
+        await book(['5'], 'SINGLES').expect(201);
 
         // Passengers left without a seat are saved without one: the server never picks a seat itself, and the trip's count
         // still drops so the bus cannot be sold past its capacity.

@@ -24,6 +24,8 @@ export const NUMBER_SETTINGS = {
   maxPassengersPerBooking: 5,
   defaultSinglesFromSeat: 26,
   defaultSinglesToSeat: 49,
+  /** How full the whole bus must be (%) before a singles booking, finding its section full, may take family seats; a trip may set its own. */
+  singlesOverflowPercent: 70,
   otpTtlMinutes: 5,
   otpMaxAttempts: 5,
   otpResendCooldownSeconds: 30,
@@ -124,6 +126,11 @@ export class AppSettingsService {
   async seatRules(busId: string | null | undefined): Promise<{ range: SinglesRange; soloPolicy: SoloTravelerPolicy }> {
     const bus = busId ? await this.prisma.bus.findUnique({ where: { id: busId }, select: { soloTravelerPolicy: true } }) : null;
     return { range: await this.singlesRange(busId), soloPolicy: bus?.soloTravelerPolicy ?? 'SINGLES_ONLY' };
+  }
+
+  /** How full the bus must be before singles, their section full, may take family seats: the trip's own percent, or the settings'. */
+  async singlesOverflowPercent(trip: { singlesOverflowPercent?: number | null }) {
+    return trip.singlesOverflowPercent ?? (await this.number('singlesOverflowPercent'));
   }
 
   async singlesRange(busId: string | null | undefined): Promise<SinglesRange> {

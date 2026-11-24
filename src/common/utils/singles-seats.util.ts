@@ -11,6 +11,21 @@ export const isSinglesSeat = (seat: string | number, range: SinglesRange) => Num
 
 export const describeSinglesRange = (range: SinglesRange) => `من ${range.from} إلى ${range.to}`;
 
+type SeatState = { seatNumber: string; isBooked: boolean; heldUntil: Date | null };
+
+/**
+ * Families sit anywhere on the bus. Singles sit in their section, and may take family seats only once that section has no free
+ * seat left besides the ones they are taking, and the whole bus is booked to the trip's percent (e.g. 70%).
+ */
+export function singlesOverflow(seats: SeatState[], range: SinglesRange, totalSeats: number, percent: number, taking: string[] = [], now = new Date()) {
+  const takingNow = new Set(taking.map((seat) => String(seat)));
+  const isFree = (seat: SeatState) => !seat.isBooked && !(seat.heldUntil && seat.heldUntil > now);
+  const freeSingles = seats.filter((seat) => isSinglesSeat(seat.seatNumber, range) && isFree(seat) && !takingNow.has(seat.seatNumber)).length;
+  const bookedPercent = totalSeats > 0 ? (seats.filter((seat) => seat.isBooked).length / totalSeats) * 100 : 0;
+  const reached = bookedPercent >= percent;
+  return { percent, reached, freeSingles, open: reached && freeSingles === 0 };
+}
+
 /**
  * Who the booking is decides its section: a booking with a woman in it is a family booking, wherever she sits and however
  * few travel, and one of men only sits with the individuals. Null while a traveller's gender is still unknown, as on a seat
@@ -55,7 +70,8 @@ export function singlesRangeFor(settings: SinglesRange, seatCount: number): Sing
 
 /**
  * A bus can reach a trip after it went on sale, and a range can change while bookings exist. Nobody already seated is
- * moved silently: the change is refused and names who is in the way, so staff can move that passenger first.
+ * moved silently: the change is refused and names the single who would end up outside the section, so staff can move that
+ * passenger first. Families sit anywhere, so a family inside the new section is no obstacle.
  */
 export async function assertSinglesFitRange(db: Pick<Prisma.TransactionClient, 'bookingPassenger'>, trips: Prisma.TripWhereInput, range: SinglesRange) {
   const passengers = await db.bookingPassenger.findMany({
@@ -63,17 +79,6 @@ export async function assertSinglesFitRange(db: Pick<Prisma.TransactionClient, '
     select: { seatNumber: true, booking: { select: { trip: { select: { tripCode: true } } } } },
   });
   const outside = passengers.find((passenger) => !isSinglesSeat(passenger.seatNumber!, range));
-  // A family already seated where the new singles section would start is refused the same way.
-  const families = await db.bookingPassenger.findMany({
-    where: { seatNumber: { not: null }, booking: { category: 'FAMILY', status: { not: 'CANCELLED' }, trip: trips } },
-    select: { seatNumber: true, booking: { select: { trip: { select: { tripCode: true } } } } },
-  });
-  const inside = families.find((passenger) => isSinglesSeat(passenger.seatNumber!, range));
-  if (inside) {
-    throw new ConflictException(
-      `المقعد ${inside.seatNumber} في الرحلة ${inside.booking.trip.tripCode} محجوز لعائلة وسيصبح من مقاعد الأفراد (${describeSinglesRange(range)}). انقل الراكب أولًا`,
-    );
-  }
   if (outside) {
     throw new ConflictException(
       `المقعد ${outside.seatNumber} في الرحلة ${outside.booking.trip.tripCode} محجوز للأفراد وهو خارج النطاق ${describeSinglesRange(range)}. انقل الراكب أولًا`,

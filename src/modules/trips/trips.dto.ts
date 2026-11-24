@@ -518,6 +518,13 @@ export class CreateTripDto {
   @Max(100)
   reverseOpenPercent?: number;
 
+  /** How full the bus must be (%) before singles, their section full, may take family seats. Empty follows the settings. */
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  singlesOverflowPercent?: number | null;
+
   @IsOptional()
   @IsDateString()
   reverseDepartureAt?: string;

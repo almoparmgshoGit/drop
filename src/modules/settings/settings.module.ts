@@ -366,6 +366,13 @@ class UpdateSettingsDto {
   @Max(BUS_SEAT_COUNT)
   defaultSinglesToSeat?: number;
 
+  /** How full the bus must be before singles, their section full, may take family seats; a trip may set its own. */
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  singlesOverflowPercent?: number;
+
   @IsOptional()
   @IsInt()
   @Min(0)
@@ -664,6 +671,8 @@ class SettingsService {
         boardingOpensBeforeMinutes: numbers.defaultBoardingOpensBeforeMinutes,
         boardingClosesAfterMinutes: numbers.defaultBoardingClosesAfterMinutes,
         maxSeatsPerBooking: numbers.maxPassengersPerBooking,
+        // A new trip's form shows it as the value an empty field follows.
+        singlesOverflowPercent: numbers.singlesOverflowPercent,
       },
     };
   }

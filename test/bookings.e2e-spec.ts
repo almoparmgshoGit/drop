@@ -115,9 +115,9 @@ describe('Trips, bookings & tickets (e2e)', () => {
       const user = await loginPassenger(app);
       await book(user, { legs: legsFor(trip, ['3']), passengers: people(1), category: 'SINGLES' }).expect(400);
       await book(user, { legs: legsFor(trip, ['26']), passengers: people(1), category: 'SINGLES' }).expect(201);
-      // A traveller alone is not a family, and a family never sits in the singles seats.
+      // A traveller alone is not a family; a family sits anywhere, the singles seats included.
       await book(user, { legs: legsFor(trip, ['3']), passengers: people(1), category: 'FAMILY' }).expect(400);
-      await book(user, { legs: legsFor(trip, ['27', '28']), passengers: people(2), category: 'FAMILY' }).expect(400);
+      await book(user, { legs: legsFor(trip, ['27', '28']), passengers: people(2), category: 'FAMILY' }).expect(201);
       await book(user, { legs: legsFor(trip, ['3', '4']), passengers: people(2), category: 'FAMILY' }).expect(201);
     });
 

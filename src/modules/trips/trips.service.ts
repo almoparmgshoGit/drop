@@ -45,6 +45,7 @@ import { PublicService, SERVICE_SELECT, withHotelServices } from '../../common/u
 import { assignTripCode, codePeriodOf, draftPlaceholderCode, lockPeriods, journeyCodeOf, renumberPeriods, reverseCodeOf, syncTripCode } from '../../common/utils/trip-code.util';
 import { approvedLeaveWhere, crewClashResources, scheduleOverlapWhere } from '../../common/utils/schedule-conflict.util';
 import { oneBusPerConvoy } from '../../common/utils/convoy.util';
+import { linkedReturnWhere } from '../../common/utils/linked-return.util';
 import { APP_SALES_STATUS_UPDATES, AppSalesTrip, appOpenPoints, appSellingWindowWhere, appStillSells, hasSetOff } from '../../common/utils/app-boarding.util';
 
 const DEFAULT_TRIP_DURATION_MS = 8 * 60 * 60 * 1000;
@@ -265,6 +266,8 @@ interface TripSearchFilters {
   busType?: string;
   bookingType?: string;
   packageId?: string;
+  /** A round trip on transport: each outbound comes with the trip back linked to it, and one without it is left out. */
+  pairedReturn?: boolean;
 }
 
 type OutboundTimes = { direction: string; departureTime: Date; arrivalTime: Date; estimatedArrivalAt: Date | null };
@@ -1051,6 +1054,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
         housingPricePeriod: source.housingPricePeriod,
         reverseEnabled: source.reverseEnabled,
         reverseOpenPercent: source.reverseOpenPercent,
+        singlesOverflowPercent: source.singlesOverflowPercent,
         reverseDepartureAt: shift(source.reverseDepartureAt),
         reversePrice: source.reversePrice,
         channelApp: source.channelApp,
@@ -1171,7 +1175,36 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
     // With transport + stay, a seat sold alone is priced alone and the customer adds a hotel; a trip including its stay keeps its offer.
     const seatAlone = (trip: { housingPriceMode: string }) =>
       filters.bookingType === 'TRANSPORT_ONLY' || (filters.bookingType === 'WITH_STAY' && trip.housingPriceMode !== 'INCLUDED_IN_BASE');
-    return oneBusPerConvoy(trips).map((trip) => toPublicTrip(withSeatPrice(withAppOpenPoints(trip, now), seatAlone(trip))));
+    const shown = oneBusPerConvoy(trips);
+    if (!filters.pairedReturn) return shown.map((trip) => toPublicTrip(withSeatPrice(withAppOpenPoints(trip, now), seatAlone(trip))));
+
+    // A round trip on transport comes back on the trip linked to its outbound (D001 → R001), never on a day the customer picks:
+    // each outbound carries that trip back, and one without a trip back on sale is left to the one-way search.
+    const paired = await Promise.all(
+      shown.map(async (trip) => {
+        const backs = await this.prisma.trip.findMany({
+          where: {
+            AND: [
+              appTripWhere({ origin: trip.destination, destination: trip.origin }),
+              { packageId: null, departureTime: { gt: trip.departureTime } },
+              ...(filters.bookingType ? [bookingTypeWhere(filters.bookingType)] : []),
+              linkedReturnWhere(trip),
+            ],
+          },
+          orderBy: [{ departureTime: 'asc' }, { convoyOrder: 'asc' }],
+          include: { ...PUBLIC_TRIP_INCLUDE, statusUpdates: APP_SALES_STATUS_UPDATES },
+        });
+        // The buses of one convoy are sold in order, as in any search; the first convoy found is the trip back.
+        const back = oneBusPerConvoy(backs).find((row) => (row.convoyLeadId ?? row.id) === (backs[0]?.convoyLeadId ?? backs[0]?.id));
+        return back ? { trip, back } : null;
+      }),
+    );
+    return paired
+      .filter((row) => row !== null)
+      .map(({ trip, back }) => ({
+        ...toPublicTrip(withSeatPrice(withAppOpenPoints(trip, now), seatAlone(trip))),
+        pairedReturn: toPublicTrip(withSeatPrice(withAppOpenPoints(back, now), seatAlone(back))),
+      }));
   }
 
   /**
@@ -1662,6 +1695,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
           housingPricePeriod: dto.housingPricePeriod,
           reverseEnabled: !!dto.reverseEnabled,
           reverseOpenPercent: dto.reverseOpenPercent ?? 0,
+          singlesOverflowPercent: dto.singlesOverflowPercent ?? null,
           reverseDepartureAt,
           // Coming back only costs the ticket's base price unless the office sets another.
           reversePrice: dto.reverseEnabled ? dto.reversePrice ?? dto.price : dto.reversePrice ?? null,
@@ -2203,6 +2237,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
           housingPricePeriod: dto.housingPricePeriod,
           reverseEnabled: dto.reverseEnabled,
           reverseOpenPercent: dto.reverseOpenPercent,
+          singlesOverflowPercent: dto.singlesOverflowPercent,
           reverseDepartureAt: reverseDepartureAt ?? undefined,
           reversePrice: dto.reversePrice,
           channelApp: dto.channelApp,

@@ -26,10 +26,11 @@ import { hotelHousingTerms, housingCharge, HousingTerms, isRoomSellable, private
 import { applicableRule, daysUntil, parseCancellationRules } from '../../common/utils/cancellation-policy.util';
 import { paymentFigures } from '../../common/utils/payment.util';
 import { normalizeSaudiPhone } from '../../common/utils/phone.util';
+import { isLinkedReturn } from '../../common/utils/linked-return.util';
 import { signTicketToken } from '../../common/utils/ticket-token.util';
 import { AppSettingsService } from '../../common/services/app-settings.service';
 import { tripSeatLayout } from '../../common/utils/bus-layout.util';
-import { assertCategoryMatchesGenders, categoryForGenders, describeSinglesRange, isSinglesSeat } from '../../common/utils/singles-seats.util';
+import { assertCategoryMatchesGenders, categoryForGenders, describeSinglesRange, isSinglesSeat, singlesOverflow } from '../../common/utils/singles-seats.util';
 import { holdLinkedSeats, lockTripsWithLinked, releaseLinkedHolds, returnRideOf, takeLinkedSeats, takeTripCapacity } from '../../common/utils/linked-seats.util';
 import { boardingOfBookings } from '../../common/utils/ticket-boarding.util';
 import { tripDayWindow } from '../../common/utils/trip-day.util';
@@ -246,13 +247,14 @@ export class BookingsService {
   }
 
   /**
-   * The same seat rules everywhere; the branch screen and the customer's app differ only in who may buy. Individuals sit in the
-   * singles range and families everywhere else. With `genders`, the whole booking is being checked, so a booking with a woman
-   * in it must be a family one and one of men only an individuals one; leaving it out checks the seats alone, as when one seat
-   * is changed or held before the passenger details.
+   * The same seat rules everywhere; the branch screen and the customer's app differ only in who may buy. Families sit anywhere;
+   * individuals sit in the singles range, and take family seats only once it is full and the bus is booked to the trip's
+   * percent (singlesOverflow). With `genders`, the whole booking is being checked, so a booking with a woman in it must be a
+   * family one and one of men only an individuals one; leaving it out checks the seats alone, as when one seat is changed or
+   * held before the passenger details.
    */
   async assertSeatRules(
-    trip: { maxSeatsPerBooking: number; busId: string | null; packageId?: string | null; package?: unknown },
+    trip: { id: string; tripCode?: string; totalSeats: number; singlesOverflowPercent?: number | null; maxSeatsPerBooking: number; busId: string | null; packageId?: string | null; package?: unknown },
     seats: string[],
     category: BookingCategory = 'FAMILY',
     genders?: (Gender | null)[],
@@ -265,17 +267,23 @@ export class BookingsService {
     if (seats.length > trip.maxSeatsPerBooking) {
       throw new BadRequestException(`الحد الأقصى ${trip.maxSeatsPerBooking} مقاعد في الحجز الواحد`);
     }
+    if (category !== 'SINGLES') return;
     const range = await this.appSettings.singlesRange(trip.busId);
-    if (category === 'SINGLES') {
-      if (seats.some((seat) => !isSinglesSeat(seat, range))) {
-        throw new BadRequestException(`مقاعد الأفراد ${describeSinglesRange(range)}`);
-      }
-      return;
-    }
-    const inSingles = seats.filter((seat) => isSinglesSeat(seat, range));
-    if (inSingles.length > 0) {
-      throw new BadRequestException(`المقعد ${inSingles.join('، ')} من مقاعد الأفراد (${describeSinglesRange(range)}) ولا يُحجز لعائلة`);
-    }
+    const outside = seats.filter((seat) => seat && !isSinglesSeat(seat, range));
+    if (outside.length === 0) return;
+    const [percent, tripSeats] = await Promise.all([
+      this.appSettings.singlesOverflowPercent(trip),
+      this.prisma.seat.findMany({ where: { tripId: trip.id }, select: { seatNumber: true, isBooked: true, heldUntil: true } }),
+    ]);
+    const overflow = singlesOverflow(tripSeats, range, trip.totalSeats, percent, seats);
+    if (overflow.open) return;
+    const which = outside.length === 1 ? `المقعد ${outside[0]}` : `المقاعد ${outside.join('، ')}`;
+    const onTrip = trip.tripCode ? ` في الرحلة ${trip.tripCode}` : '';
+    throw new BadRequestException(
+      overflow.freeSingles > 0
+        ? `${which}${onTrip} من مقاعد العائلات، ومقاعد الأفراد (${describeSinglesRange(range)}) فيها ${overflow.freeSingles} متاح. اختر منها أولًا`
+        : `${which}${onTrip} من مقاعد العائلات، وتُفتح للأفراد بعد امتلاء الباص بنسبة ${percent}%`,
+    );
   }
 
   async getSeatMap(userId: string, tripId: string) {
@@ -287,6 +295,8 @@ export class BookingsService {
     // Under way, the seats show while a point ahead of the bus can still be booked; a package's trips only before it sets off.
     if (!trip || (trip.liveStatus !== 'NOT_STARTED' && (trip.packageId || !appStillSells(trip)))) throw new NotFoundException('الرحلة غير موجودة');
     const { range: singles, soloPolicy } = await this.appSettings.seatRules(trip.busId);
+    // Singles take family seats once their section is full and the bus is booked to this percent; the app checks the section.
+    const overflow = singlesOverflow(trip.seats, singles, trip.totalSeats, await this.appSettings.singlesOverflowPercent(trip), [], now);
 
     const seats = trip.seats
       .map((seat) => {
@@ -311,6 +321,9 @@ export class BookingsService {
       singlesToSeat: singles.to,
       /** Where a booking of one traveller may sit: SINGLES_ONLY, or WOMEN_ALLOWED in the family section too. */
       soloTravelerPolicy: soloPolicy,
+      /** Families sit anywhere; singles may take family seats once their section is full and the bus is booked to this percent. */
+      singlesOverflowPercent: overflow.percent,
+      singlesOverflowReached: overflow.reached,
       // The same seat price the quote charges: flexible pricing when the trip has it on, the listed price otherwise.
       pricePerSeat: trip.package ? Number(trip.package.price) : seatPricing(trip).price / 100,
       basePricePerSeat: Number(trip.package?.price ?? trip.price),
@@ -445,6 +458,13 @@ export class BookingsService {
       listedLegs[0].trip.origin === listedLegs[1].trip.destination &&
       listedLegs[0].trip.destination === listedLegs[1].trip.origin;
     const outboundIndex = roundJourney && listedLegs[1].trip.departureTime < listedLegs[0].trip.departureTime ? 1 : 0;
+    // A round trip on ordinary trips, with or without a stay, comes back on the trip linked to its outbound (D001 → R001).
+    if (roundJourney) {
+      const outboundTrip = listedLegs[outboundIndex].trip;
+      if (!(await isLinkedReturn(db, outboundTrip, listedLegs[1 - outboundIndex].trip))) {
+        throw new BadRequestException(`رحلة العودة في الذهاب والعودة هي الرحلة المرتبطة برحلة ${outboundTrip.tripCode} فقط`);
+      }
+    }
     const roundShares = roundJourney ? allocate(listedLegs[outboundIndex].seatsSubtotal, listedLegs.map((leg) => leg.seatsSubtotal)) : null;
     const legs = roundShares
       ? listedLegs.map((leg, idx) => {

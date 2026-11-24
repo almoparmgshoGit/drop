@@ -11,7 +11,7 @@ import { includesVisits } from '../../common/utils/booking-types.util';
 import { housingCharge, HousingTerms, isRoomSellable } from '../../common/utils/housing-price.util';
 import { vatInside } from '../../common/utils/invoice.util';
 import { tripSeatLayout } from '../../common/utils/bus-layout.util';
-import { assertCategoryMatchesGenders, categoryForGenders, describeSinglesRange, isSinglesSeat } from '../../common/utils/singles-seats.util';
+import { assertCategoryMatchesGenders, categoryForGenders, isSinglesSeat, singlesOverflow } from '../../common/utils/singles-seats.util';
 import { AppSettingsService } from '../../common/services/app-settings.service';
 import { lockTripsWithLinked, takeLinkedPlaces, takeLinkedSeats, takeTripCapacity } from '../../common/utils/linked-seats.util';
 import { halalas, netBookingFigures, paymentFigures } from '../../common/utils/payment.util';
@@ -58,6 +58,7 @@ const JOURNEY_TRIP = {
   price: true,
   pricingRules: true,
   totalSeats: true,
+  singlesOverflowPercent: true,
   availableSeats: true,
   maxSeatsPerBooking: true,
   busId: true,
@@ -216,19 +217,23 @@ export class BranchBookingsService {
   async seatMap(tripId: string) {
     const trip = await this.prisma.trip.findFirst({
       where: { id: tripId, tripStatus: 'PUBLISHED', channelBranch: true, salesClosedAt: null, OR: [{ packageId: null }, { package: { status: 'PUBLISHED' } }] },
-      select: { totalSeats: true, availableSeats: true, seatLayout: true, busId: true, seats: { select: { seatNumber: true, isBooked: true, heldUntil: true } } },
+      select: { totalSeats: true, availableSeats: true, seatLayout: true, busId: true, singlesOverflowPercent: true, seats: { select: { seatNumber: true, isBooked: true, heldUntil: true } } },
     });
     if (!trip) throw new NotFoundException('الرحلة غير موجودة');
     const now = new Date();
     const { range: singles, soloPolicy } = await this.appSettings.seatRules(trip.busId);
+    const overflow = singlesOverflow(trip.seats, singles, trip.totalSeats, await this.appSettings.singlesOverflowPercent(trip), [], now);
     return {
       totalSeats: trip.totalSeats,
       soloTravelerPolicy: soloPolicy,
       layout: tripSeatLayout(trip),
       availableSeats: trip.availableSeats,
-      // Where singles sit on this trip; every other seat is for families. The form greys out the other section.
+      // Where singles sit on this trip. Families sit anywhere; singles take family seats once their section is full and the
+      // bus is booked to the percent.
       singlesFromSeat: singles.from,
       singlesToSeat: singles.to,
+      singlesOverflowPercent: overflow.percent,
+      singlesOverflowReached: overflow.reached,
       seats: trip.seats
         .map((seat) => {
           // A seat held in the app for its payment window is not sold yet: the counter sees until when it is held.
@@ -657,7 +662,6 @@ export class BranchBookingsService {
           const seats: (string | null)[] = leg.seats.map((seat) => seat || null);
           const picked = seats.filter((seat): seat is string => !!seat);
           if (passengers.length > leg.trip.maxSeatsPerBooking) throw new BadRequestException(`الحد الأقصى ${leg.trip.maxSeatsPerBooking} مقاعد في الحجز الواحد`);
-          await this.assertSeatSection(leg.trip, picked, category);
           await this.bookings.assertSeatRules(leg.trip, picked, category, passengers.map((passenger) => passenger.gender ?? null));
           if (picked.length > 0) {
             const claimed = await tx.seat.updateMany({
@@ -772,21 +776,6 @@ export class BranchBookingsService {
     }
   }
 
-  /**
-   * Company policy at the counter: a family booking may not take a seat in the singles section, and a singles booking may
-   * only take seats inside it. The section is the bus's own range, or the settings' while the trip has no bus.
-   */
-  private async assertSeatSection(trip: Pick<JourneyTrip, 'busId' | 'tripCode'>, seats: string[], category: BookingCategory) {
-    if (seats.length === 0) return;
-    const range = await this.appSettings.singlesRange(trip.busId);
-    const wrong = seats.filter((seat) => isSinglesSeat(seat, range) !== (category === 'SINGLES'));
-    if (wrong.length === 0) return;
-    const which = wrong.length === 1 ? `المقعد ${wrong[0]}` : `المقاعد ${wrong.join('، ')}`;
-    if (category === 'SINGLES') {
-      throw new BadRequestException(`${which} في الرحلة ${trip.tripCode} خارج مقاعد الأفراد (${describeSinglesRange(range)}). حجز الأفراد داخل هذا النطاق فقط`);
-    }
-    throw new BadRequestException(`${which} في الرحلة ${trip.tripCode} من مقاعد الأفراد (${describeSinglesRange(range)}) ولا تُحجز لعائلة. اختر من مقاعد العائلات أو غيّر فئة الحجز إلى أفراد`);
-  }
 
   /** Fills each trip's booking in turn from the payments, so a split payment still adds up on every invoice. */
   private async takePayments(tx: Db, actor: CashActor, branchId: string, bookings: { id: string; total: number }[], payments: { method: 'CASH' | 'NETWORK' | 'TRANSFER'; amount: number; reference?: string }[]) {

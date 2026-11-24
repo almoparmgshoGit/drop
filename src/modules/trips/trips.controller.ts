@@ -1,7 +1,7 @@
 import { Controller, ForbiddenException, Get, Header, Post, Put, Delete, Param, Query, Body, Req, StreamableFile, UploadedFiles, UseInterceptors } from '@nestjs/common';
 import { FilesInterceptor } from '@nestjs/platform-express';
 import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
-import { ArrayMaxSize, IsArray, IsBoolean, IsOptional, IsString, MaxLength } from 'class-validator';
+import { ArrayMaxSize, IsArray, IsBoolean, IsIn, IsOptional, IsString, MaxLength } from 'class-validator';
 import { MAX_PUBLIC_IMAGE_BYTES, MAX_PUBLIC_IMAGES_PER_UPLOAD, TripsService, UploadedImage } from './trips.service';
 import { AdminOccupancyQuery, AdminTripsQuery, CreateTripDto, DuplicateTripDto, OpenReverseTripDto, ReverseTripsQuery, SeriesMonthDto, StopSeriesDto, UpdateTripDto } from './trips.dto';
 import { Public, RequirePermission } from '../../common/decorators/auth.decorators';
@@ -15,6 +15,11 @@ class TripSearchQuery {
   @IsOptional() @IsString() @MaxLength(40) busType?: string;
   @IsOptional() @IsString() @MaxLength(40) bookingType?: string;
   @IsOptional() @IsString() @MaxLength(60) packageId?: string;
+}
+
+class AppTripSearchQuery extends TripSearchQuery {
+  /** "true" for a round trip on transport: each outbound comes with its linked trip back. */
+  @IsOptional() @IsIn(['true', 'false']) pairedReturn?: string;
 }
 
 class NextAvailableQuery extends TripSearchQuery {
@@ -65,8 +70,8 @@ export class TripsController {
   @Public()
   @Get('search')
   @ApiOperation({ summary: 'Search upcoming published trips' })
-  async searchTrips(@Query() query: TripSearchQuery) {
-    return this.tripsService.searchTrips(query);
+  async searchTrips(@Query() query: AppTripSearchQuery) {
+    return this.tripsService.searchTrips({ ...query, pairedReturn: query.pairedReturn === 'true' });
   }
 
   @Public()
