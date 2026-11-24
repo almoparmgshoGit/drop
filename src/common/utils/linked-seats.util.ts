@@ -1,5 +1,5 @@
 import { ConflictException } from '@nestjs/common';
-import { BookingStatus, Prisma } from '@prisma/client';
+import { BookingKind, BookingStatus, Prisma } from '@prisma/client';
 
 const HOLDS_A_SEAT: BookingStatus[] = ['CONFIRMED', 'BOARDED', 'PENDING_CANCELLATION_REVIEW'];
 
@@ -29,10 +29,21 @@ async function withoutOtherLeg<T extends { tripId: string; groupReference: strin
   return bookings.filter((booking) => !legs.some((leg) => leg.groupReference === booking.groupReference && leg.tripId !== booking.tripId));
 }
 
-/** Bookings on one-way trips with a reverse enabled that have no return leg, and how many seats they free coming back. */
+/**
+ * Bookings bought as the way there alone ("ذهاب فقط"). The counter sells that on a round trip too, and then only the booking's
+ * own kind says so. It is the same word the manifest and the bookings list show beside the passenger, so they cannot disagree.
+ */
+const OUTBOUND_ONLY_KINDS: BookingKind[] = ['TRANSPORT_OUTBOUND', 'PACKAGE_OUTBOUND_STAY'];
+
+/** Bookings with no ride back on trips with a reverse enabled (every one of a one-way trip's, or bought as ذهاب فقط), and their seats. */
 export async function goOnlyBookings(db: Pick<Prisma.TransactionClient, 'booking'>, tripIds: string[]) {
   const bookings = await db.booking.findMany({
-    where: { tripId: { in: tripIds }, status: { in: HOLDS_A_SEAT }, trip: { direction: 'ONE_WAY', reverseEnabled: true } },
+    where: {
+      tripId: { in: tripIds },
+      status: { in: HOLDS_A_SEAT },
+      trip: { reverseEnabled: true },
+      OR: [{ trip: { direction: 'ONE_WAY' } }, { kind: { in: OUTBOUND_ONLY_KINDS } }],
+    },
     select: { id: true, tripId: true, groupReference: true, _count: { select: { passengers: true } } },
   });
 
@@ -51,7 +62,13 @@ export async function goOnlyBookings(db: Pick<Prisma.TransactionClient, 'booking
  */
 export async function returningBookingIds(db: Pick<Prisma.TransactionClient, 'booking'>, outboundId: string) {
   const bookings = await db.booking.findMany({
-    where: { tripId: outboundId, status: { in: HOLDS_A_SEAT }, trip: { direction: 'ROUND_TRIP' } },
+    where: {
+      tripId: outboundId,
+      status: { in: HOLDS_A_SEAT },
+      trip: { direction: 'ROUND_TRIP' },
+      // Bought as ذهاب فقط, it stays at the destination and is not on the way-back sheet. A booking from before kinds has none.
+      OR: [{ kind: null }, { kind: { notIn: OUTBOUND_ONLY_KINDS } }],
+    },
     select: { id: true, tripId: true, groupReference: true },
   });
   return (await withoutOtherLeg(db, bookings)).map((booking) => booking.id);

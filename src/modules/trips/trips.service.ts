@@ -1542,7 +1542,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
           privateRoomPriceBasis: dto.privateRoomPriceBasis,
           housingPricePeriod: dto.housingPricePeriod,
           reverseEnabled: !!dto.reverseEnabled,
-          reverseOpenPercent: dto.reverseOpenPercent ?? 80,
+          reverseOpenPercent: dto.reverseOpenPercent ?? 0,
           reverseDepartureAt,
           // Coming back only costs the ticket's base price unless the office sets another.
           reversePrice: dto.reverseEnabled ? dto.reversePrice ?? dto.price : dto.reversePrice ?? null,

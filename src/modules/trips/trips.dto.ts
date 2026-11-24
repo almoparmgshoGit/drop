@@ -514,7 +514,7 @@ export class CreateTripDto {
 
   @IsOptional()
   @IsInt()
-  @Min(1)
+  @Min(0)
   @Max(100)
   reverseOpenPercent?: number;
 

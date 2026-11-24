@@ -480,9 +480,11 @@ export class BranchBookingsService {
     });
     // Round-trip transport costs the outbound's seat price once, which already covers coming back, the same rule as the
     // app: the two tickets share it instead of adding the return's price. Packages keep a price for each of their trips.
+    // Transport with a stay sold from the single booking form on the linked return follows the same rule, as the app does.
     const outboundListed = listed.find((row) => row.leg.leg === 'OUTBOUND');
+    const roundJourney = dto.kind === 'TRANSPORT_ROUND' || (dto.kind === 'PACKAGE_ROUND_STAY' && !!dto.pairedReturn);
     const roundShares =
-      dto.kind === 'TRANSPORT_ROUND' && outboundListed && listed.every((row) => !row.trip.package)
+      roundJourney && outboundListed && listed.every((row) => !row.trip.package)
         ? allocate(outboundListed.transport, listed.map((row) => row.transport))
         : null;
     const priced = roundShares

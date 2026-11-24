@@ -622,7 +622,7 @@ model Trip {
   packageId                  String?
   package                    Package?              @relation(fields: [packageId], references: [id], onDelete: SetNull)
   reverseEnabled             Boolean               @default(false)
-  reverseOpenPercent         Int                   @default(80)
+  reverseOpenPercent         Int                   @default(0)
   reverseDepartureAt         DateTime?
   reversePrice               Decimal?              @db.Decimal(10, 2)
   /// When staff were told the trip reached its opening percent, so they are told once.
