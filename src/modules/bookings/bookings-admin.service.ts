@@ -20,6 +20,7 @@ import { AdminBookingsQuery, BoardingOverrideDto, ChangeBoardingPointDto, Change
 import { cityTripWhere, tripInCity } from '../../common/utils/branch-city.util';
 import { riyadhDayRange, startOfRiyadhMonth } from '../../common/utils/time.util';
 import { compareSeats, NO_SEAT_LABEL, seatLabel } from '../../common/utils/seat-label.util';
+import { assertIdsFreeOnTrips } from '../../common/utils/passenger-ids.util';
 import { allocate, BookingsService, holdAvailableTo, randomCode, toHalalas, toSar } from './bookings.service';
 
 const EDIT_TX_OPTIONS = { maxWait: 10_000, timeout: 30_000 };
@@ -466,6 +467,11 @@ export class BookingsAdminService {
         throw new BadRequestException('لا يوجد تغيير للحفظ');
       }
 
+      // Only a changed number is checked, so a booking saved before the rule can still have its other details corrected.
+      if (nationalId && nationalId !== passenger.nationalId) {
+        await lockTripsWithLinked(tx, [booking.tripId]);
+        await assertIdsFreeOnTrips(tx, [booking.tripId], [nationalId], passengerId);
+      }
       await tx.bookingPassenger.update({ where: { id: passengerId }, data: { fullName, phone, nationalId, notes, gender, nationality } });
       await tx.booking.update({ where: { id: bookingId }, data: { updatedAt: new Date() } });
       await this.events.record(tx, {

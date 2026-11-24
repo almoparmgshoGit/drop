@@ -28,6 +28,7 @@ import { seatPricing } from '../../common/utils/dynamic-pricing.util';
 import { assertBookingOpened, bookingOpenedWhere } from '../../common/utils/booking-opens.util';
 import { compareSeats, seatLabel } from '../../common/utils/seat-label.util';
 import { oneBusPerConvoy } from '../../common/utils/convoy.util';
+import { assertIdsFreeOnTrips } from '../../common/utils/passenger-ids.util';
 
 type Db = Prisma.TransactionClient;
 
@@ -634,6 +635,8 @@ export class BranchBookingsService {
         await lockTripsWithLinked(tx, dto.legs.map((leg) => leg.tripId));
 
         const quote = await this.computeQuote(tx, dto);
+        // After the trips are locked, so two counters typing the same ID at once cannot both get through.
+        await assertIdsFreeOnTrips(tx, dto.legs.map((leg) => leg.tripId), passengers.map((passenger) => passenger.nationalId));
         const changed = quote.total !== quote.listTotal;
         if (changed && !actor.permissions.includes('bookings.price_override')) throw new ForbiddenException('ليست لديك صلاحية تعديل سعر الحجز');
         // A price that is not the listed one must say why, so whoever reads the booking later can see the reason.
