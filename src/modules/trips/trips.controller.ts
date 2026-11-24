@@ -1,7 +1,8 @@
 import { Controller, ForbiddenException, Get, Header, Post, Put, Delete, Param, Query, Body, Req, StreamableFile, UploadedFiles, UseInterceptors } from '@nestjs/common';
 import { FilesInterceptor } from '@nestjs/platform-express';
 import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
-import { ArrayMaxSize, IsArray, IsBoolean, IsIn, IsOptional, IsString, MaxLength } from 'class-validator';
+import { ArrayMaxSize, IsArray, IsBoolean, IsIn, IsInt, IsOptional, IsString, Max, MaxLength, Min } from 'class-validator';
+import { Type } from 'class-transformer';
 import { MAX_PUBLIC_IMAGE_BYTES, MAX_PUBLIC_IMAGES_PER_UPLOAD, TripsService, UploadedImage } from './trips.service';
 import { AdminOccupancyQuery, AdminTripsQuery, CreateTripDto, DuplicateTripDto, OpenReverseTripDto, ReverseTripsQuery, SeriesMonthDto, StopSeriesDto, UpdateTripDto } from './trips.dto';
 import { Public, RequirePermission } from '../../common/decorators/auth.decorators';
@@ -22,8 +23,10 @@ class AppTripSearchQuery extends TripSearchQuery {
   @IsOptional() @IsIn(['true', 'false']) pairedReturn?: string;
 }
 
-class NextAvailableQuery extends TripSearchQuery {
+class NextAvailableQuery extends AppTripSearchQuery {
   @IsOptional() @IsString() @MaxLength(20) after?: string;
+  /** How many travel together, so the day offered has seats for all of them. */
+  @IsOptional() @Type(() => Number) @IsInt() @Min(1) @Max(50) passengers?: number;
 }
 
 class AssignCrewDto {
@@ -85,7 +88,7 @@ export class TripsController {
   @Get('next-available')
   @ApiOperation({ summary: 'Next departure that still has seats for a route' })
   async getNextAvailable(@Query() query: NextAvailableQuery) {
-    return this.tripsService.getNextAvailableDate(query);
+    return this.tripsService.getNextAvailableDate({ ...query, pairedReturn: query.pairedReturn === 'true' });
   }
 
   @Get('admin/all')

@@ -1542,6 +1542,8 @@ model Hotel {
   ratings               HotelRating[]
   /// Room card designs made for this hotel only; without an active one the general design is used.
   roomCardTemplates     RoomCardTemplate[]
+  /// The automatic rooming's options last used for this hotel, so every employee opens with them.
+  roomingOptions        Json?
 }
 
 model HotelBooking {
@@ -1581,6 +1583,8 @@ model HotelRoom {
   number         String
   type           RoomType           @default(SHARED)
   capacity       Int                @default(4)
+  /// The hotel floor, so the automatic rooming can give the lowest ones to families and elderly travellers.
+  floor          Int?
   occupants      BookingPassenger[]
 
   @@unique([hotelBookingId, number])

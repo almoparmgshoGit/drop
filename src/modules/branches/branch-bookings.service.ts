@@ -9,11 +9,12 @@ import { BOOKING_KIND_PARTS, bookingTypeLabel, serviceTypeOf } from '../../commo
 import { nextBookingNumber } from '../../common/utils/booking-number.util';
 import { includesVisits } from '../../common/utils/booking-types.util';
 import { housingCharge, HousingTerms, isRoomSellable } from '../../common/utils/housing-price.util';
+import { familyRooms } from '../../common/utils/family-room.util';
 import { vatInside } from '../../common/utils/invoice.util';
 import { tripSeatLayout } from '../../common/utils/bus-layout.util';
 import { assertCategoryMatchesGenders, categoryForGenders, isSinglesSeat, singlesOverflow } from '../../common/utils/singles-seats.util';
 import { AppSettingsService } from '../../common/services/app-settings.service';
-import { lockTripsWithLinked, takeLinkedPlaces, takeLinkedSeats, takeTripCapacity } from '../../common/utils/linked-seats.util';
+import { lockTripsWithLinked, ridesBack, takeLinkedPlaces, takeLinkedSeats, takeTripCapacity } from '../../common/utils/linked-seats.util';
 import { halalas, netBookingFigures, paymentFigures } from '../../common/utils/payment.util';
 import { normalizeSaudiPhone } from '../../common/utils/phone.util';
 import { signTicketToken } from '../../common/utils/ticket-token.util';
@@ -562,7 +563,6 @@ export class BranchBookingsService {
     const hotel = await db.hotel.findUnique({ where: { id: stay.hotelId } });
     if (!hotel?.isActive) throw new BadRequestException('الفندق غير موجود أو موقوف');
     const offers: RoomType[] = [...(hotel.offersSharedRoom ? (['SHARED'] as const) : []), ...(hotel.offersPrivateRoom ? (['PRIVATE'] as const) : [])];
-    if (!offers.includes(stay.roomType)) throw new BadRequestException('نوع السكن المختار غير متاح في هذا الفندق');
 
     // The trip's own housing price decides the charge: first a trip already sold with this hotel, then any trip of the journey
     // whose housing price was set when it was created. Only a trip with no housing price at all falls back on the hotel's rate,
@@ -584,17 +584,21 @@ export class BranchBookingsService {
         };
     // A package's price is all-inclusive, the same rule as the app.
     const charges = !trips.some((trip) => trip.package);
-    if (charges && !isRoomSellable(terms, stay.roomType)) throw new BadRequestException(`لا يوجد سعر لهذا النوع من السكن في ${hotel.name}، أضفه من صفحة الفنادق`);
+    // A family (the counter's default) is given the private room wherever the hotel sells one, as in the app.
+    const sold = offers.filter((room) => !charges || isRoomSellable(terms, room));
+    const roomType = familyRooms(sold, stay.roomType, (dto.category ?? 'FAMILY') === 'FAMILY').choice ?? stay.roomType;
+    if (!offers.includes(roomType)) throw new BadRequestException('نوع السكن المختار غير متاح في هذا الفندق');
+    if (charges && !isRoomSellable(terms, roomType)) throw new BadRequestException(`لا يوجد سعر لهذا النوع من السكن في ${hotel.name}، أضفه من صفحة الفنادق`);
     return {
       hotelId: hotel.id,
       hotelName: hotel.name,
-      roomType: stay.roomType,
+      roomType,
       checkIn,
       checkOut,
       nights,
       // A private room is always priced by the night, whatever the bed's period.
-      period: stay.roomType === 'PRIVATE' ? ('PER_NIGHT' as const) : terms.housingPricePeriod,
-      amount: charges ? housingCharge(terms, stay.roomType, persons, nights) : 0,
+      period: roomType === 'PRIVATE' ? ('PER_NIGHT' as const) : terms.housingPricePeriod,
+      amount: charges ? housingCharge(terms, roomType, persons, nights) : 0,
     };
   }
 
@@ -672,9 +676,11 @@ export class BranchBookingsService {
           }
           // Every traveller takes a place on the bus, seated or not, so the trip cannot be sold past its capacity.
           await takeTripCapacity(tx, leg.trip.id, leg.trip.tripCode, passengers.length);
-          if (picked.length > 0) await takeLinkedSeats(tx, leg.trip.id, picked, available, { returnsOnOtherLeg: quote.legs.length > 1 });
+          // A ذهاب فقط gets off at the destination, so it takes nothing on a round trip's reverse.
+          const comesBack = ridesBack(dto.kind);
+          if (picked.length > 0) await takeLinkedSeats(tx, leg.trip.id, picked, available, { returnsOnOtherLeg: quote.legs.length > 1, ridesBack: comesBack });
           // Those saved without a seat still ride the linked trip of a round trip, so they take a place there by count.
-          await takeLinkedPlaces(tx, leg.trip.id, passengers.length - picked.length, { hasOtherLeg: quote.legs.length > 1 });
+          await takeLinkedPlaces(tx, leg.trip.id, passengers.length - picked.length, { hasOtherLeg: quote.legs.length > 1, ridesBack: comesBack });
 
           const point = leg.leg.boardingPointId ? await tx.boardingPoint.findFirst({ where: { id: leg.leg.boardingPointId, tripId: leg.trip.id } }) : null;
           if (leg.leg.boardingPointId && !point) throw new BadRequestException('نقطة التجمع لا تخص هذه الرحلة');

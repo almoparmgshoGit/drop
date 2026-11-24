@@ -4,6 +4,7 @@ import { riyadhDate } from './time.util';
 import { SERVICE_SELECT, withHotelServices } from './services.util';
 import { GALLERY_SELECT } from './gallery.util';
 import { privateRoomsNeeded } from './housing-price.util';
+import { familyRooms } from './family-room.util';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const RIYADH_OFFSET_MS = 3 * 60 * 60 * 1000;
@@ -92,8 +93,9 @@ export function customPackageStay(
   pkg: CustomPackage,
   outbound: { trip: JourneyTrip; seats: number },
   inbound: { trip: JourneyTrip; seats: number },
-  roomChoice: RoomType | undefined,
+  pickedRoom: RoomType | undefined,
   privateRooms = 1,
+  family = false,
 ) {
   const same = (a: string, b: string | null) => a.trim() === (b ?? '').trim();
   if (outbound.trip.package || inbound.trip.package) throw new BadRequestException('رحلات الباقة المصممة تكون من رحلات النقل، لا من باقة أخرى');
@@ -117,8 +119,9 @@ export function customPackageStay(
   if (pkg.startDate && checkIn < day(pkg.startDate)!) throw new BadRequestException(`الباقة متاحة من ${day(pkg.startDate)}`);
   if (pkg.endDate && checkOut > day(pkg.endDate)!) throw new BadRequestException(`الباقة متاحة حتى ${day(pkg.endDate)}`);
 
-  const options = customRoomOptions(pkg);
-  if (options.length === 0) throw new BadRequestException('لا يوجد سعر سكن لهذه الباقة بعد');
+  const sold = customRoomOptions(pkg);
+  if (sold.length === 0) throw new BadRequestException('لا يوجد سعر سكن لهذه الباقة بعد');
+  const { options, choice: roomChoice } = familyRooms(sold, pickedRoom, family);
   if (roomChoice && !options.includes(roomChoice)) throw new BadRequestException('نوع الغرفة المختار غير متاح في هذه الباقة');
   const choice = roomChoice ?? (options.length === 1 ? options[0] : null);
   const persons = outbound.seats;

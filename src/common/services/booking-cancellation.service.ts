@@ -8,7 +8,7 @@ import { WalletService } from './wallet.service';
 import { InvoiceLedgerService } from './invoice-ledger.service';
 import { PaymentLedgerService, refundMethodLabel } from './payment-ledger.service';
 import { WaitlistService } from './waitlist.service';
-import { hasOtherLeg, lockTripsWithLinked, releaseLinkedPlaces, releaseLinkedSeats, retakeReturnSeats, takeLinkedPlaces } from '../utils/linked-seats.util';
+import { hasOtherLeg, lockTripsWithLinked, releaseLinkedPlaces, releaseLinkedSeats, retakeReturnSeats, ridesBack, takeLinkedPlaces } from '../utils/linked-seats.util';
 import { halalas, paymentFigures, splitOriginalRefund } from '../utils/payment.util';
 
 /**
@@ -102,7 +102,8 @@ export class BookingCancellationService {
     });
     await releaseLinkedSeats(tx, booking.tripId, seatNumbers);
     // The places its seatless passengers held on the linked trip, unless it rode another leg and so held none there.
-    if (!(await hasOtherLeg(tx, booking))) await releaseLinkedPlaces(tx, booking.tripId, booking.passengers.length - seatNumbers.length);
+    // A ذهاب فقط held none there either.
+    if (ridesBack(booking.kind) && !(await hasOtherLeg(tx, booking))) await releaseLinkedPlaces(tx, booking.tripId, booking.passengers.length - seatNumbers.length);
     await this.returnHomeOnOwnTrip(tx, booking);
     // The freed seats go first to whoever is waiting for this trip; a whole trip being cancelled has nothing to offer.
     if (options.notifyAs !== 'TRIP_CANCELLED') await this.waitlist.offerFreedSeats(tx, booking.tripId);
@@ -192,12 +193,12 @@ export class BookingCancellationService {
     if (!booking.groupReference) return;
     const legs = await tx.booking.findMany({
       where: { groupReference: booking.groupReference, id: { not: booking.id }, status: { in: ['CONFIRMED', 'PENDING_CANCELLATION_REVIEW'] } },
-      select: { id: true, tripId: true, passengers: { select: { seatNumber: true } }, trip: { select: { direction: true, reverseOfTripId: true } } },
+      select: { id: true, tripId: true, kind: true, passengers: { select: { seatNumber: true } }, trip: { select: { direction: true, reverseOfTripId: true } } },
     });
     // Only a lone remaining leg rides back on its own trip; with two legs left, the journey still returns elsewhere.
     if (legs.length !== 1) return;
     const [outbound] = legs;
-    if (outbound.trip.direction !== 'ROUND_TRIP' || outbound.trip.reverseOfTripId) return;
+    if (outbound.trip.direction !== 'ROUND_TRIP' || outbound.trip.reverseOfTripId || !ridesBack(outbound.kind)) return;
     await lockTripsWithLinked(tx, [outbound.tripId]);
     await retakeReturnSeats(tx, outbound.tripId, outbound.passengers.map((passenger) => passenger.seatNumber).filter((seat): seat is string => !!seat));
     // Its passengers without a seat number come back too, on whatever places are left there.

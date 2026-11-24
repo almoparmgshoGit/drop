@@ -19,6 +19,7 @@ import {
   ResolveHotelComplaintDto,
   UpdateHotelDto,
   UpdateRoomingProfileDto,
+  RoomingOptionsDto,
 } from './hotels.dto';
 import { HotelsService } from './hotels.service';
 
@@ -89,6 +90,13 @@ class HotelsController {
   @ApiOperation({ summary: 'Save a whole room plan at once; one refused room keeps every passenger where they were' })
   assignRooms(@Req() req, @Param('id') id: string, @Body() dto: BulkAssignRoomsDto) {
     return this.hotels.assignRooms(req.user, id, dto, req.ip);
+  }
+
+  @Post(':id/rooming-options')
+  @RequirePermission('hotels.book')
+  @ApiOperation({ summary: "Keep the automatic rooming's options for this hotel, shared by every employee" })
+  saveRoomingOptions(@Param('id') id: string, @Body() dto: RoomingOptionsDto) {
+    return this.hotels.saveRoomingOptions(id, dto);
   }
 
   @Post('bookings/:id/cancel')

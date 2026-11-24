@@ -352,6 +352,7 @@ export const SETTING_LABELS: Record<string, string> = {
   panelTitle: 'اسم اللوحة',
   panelSubtitle: 'العبارة أسفل اسم اللوحة',
   panelNotice: 'تنبيه الموظفين',
+  nationalityGroups: 'مجموعات الجنسيات في التسكين',
   holdMinutes: 'مدة حجز المقعد المؤقت',
   waitlistOfferMinutes: 'مهلة المقاعد المعروضة من قائمة الانتظار',
   waitlistEnabled: 'قائمة الانتظار في التطبيق',

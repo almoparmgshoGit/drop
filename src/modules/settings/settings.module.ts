@@ -61,6 +61,16 @@ const PANEL_DEFAULTS: Record<string, string> = {
   panelTitle: 'دروب الهجرة',
   panelSubtitle: 'لوحة الإدارة',
   panelNotice: '',
+  /**
+   * The automatic rooming's nearby nationalities, one group a line as "name: nationality، nationality". A room short of
+   * one nationality is filled from its group before any other. Kept as text so the settings page edits it in a plain box.
+   */
+  nationalityGroups: [
+    'عرب: سعودي، مصري، سوداني، يمني، سوري، أردني، فلسطيني، لبناني، عراقي، إماراتي، كويتي، قطري، بحريني، عماني، مغربي، جزائري، تونسي، ليبي، موريتاني، صومالي',
+    'آسيا: باكستاني، هندي، بنغلاديشي، أفغاني، نيبالي، سريلانكي، إندونيسي، ماليزي، فلبيني',
+    'أفريقيا: إثيوبي، إريتري، تشادي، نيجيري، سنغالي',
+    'تركيا وإيران: تركي، إيراني',
+  ].join('\n'),
 };
 
 /**
@@ -267,6 +277,11 @@ class UpdateSettingsDto {
   @IsString()
   @MaxLength(300)
   panelNotice?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(3000)
+  nationalityGroups?: string;
 
   @IsOptional() @Matches(LOGO_URL, { message: LOGO_URL_MESSAGE }) logoSidebarCollapsed?: string;
   @IsOptional() @Matches(LOGO_URL, { message: LOGO_URL_MESSAGE }) logoSidebarExpanded?: string;

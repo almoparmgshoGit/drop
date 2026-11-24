@@ -31,7 +31,8 @@ import { signTicketToken } from '../../common/utils/ticket-token.util';
 import { AppSettingsService } from '../../common/services/app-settings.service';
 import { tripSeatLayout } from '../../common/utils/bus-layout.util';
 import { assertCategoryMatchesGenders, categoryForGenders, describeSinglesRange, isSinglesSeat, singlesOverflow } from '../../common/utils/singles-seats.util';
-import { holdLinkedSeats, lockTripsWithLinked, releaseLinkedHolds, returnRideOf, takeLinkedSeats, takeTripCapacity } from '../../common/utils/linked-seats.util';
+import { holdLinkedSeats, lockTripsWithLinked, releaseLinkedHolds, returnRideOf, ridesBack, takeLinkedSeats, takeTripCapacity } from '../../common/utils/linked-seats.util';
+import { familyRooms } from '../../common/utils/family-room.util';
 import { boardingOfBookings } from '../../common/utils/ticket-boarding.util';
 import { tripDayWindow } from '../../common/utils/trip-day.util';
 import { PACKAGE_MAX_PERSONS, PACKAGE_PRICE_SELECT, packageGroupTotal, packagePriceTiers } from '../../common/utils/package-price.util';
@@ -404,6 +405,8 @@ export class BookingsService {
         },
       },
     });
+    // A family with a stay is given a private room, without being offered a shared one.
+    const family = dto.category === 'FAMILY';
     // A package the customer builds: its two trips are sold as transport, and its stay is priced by the night on the outbound.
     const customPackage = dto.customPackageId ? await loadCustomPackage(db, dto.customPackageId) : null;
     if (customPackage && dto.legs.length !== 2) throw new BadRequestException('اختر رحلة الذهاب ورحلة العودة للباقة');
@@ -420,7 +423,7 @@ export class BookingsService {
     const skipsCustomStay = !!customPackage && !!dto.legs[0].withoutHousing;
     if (skipsCustomStay && dto.legs[0].roomChoice) throw new BadRequestException('اختر نوع الغرفة أو بدون سكن، لا الاثنين');
     const builtStay = customPackage
-      ? customPackageStay(customPackage, { trip: seated[0].trip, seats: seated[0].seats.length }, { trip: seated[1].trip, seats: seated[1].seats.length }, skipsCustomStay ? undefined : dto.legs[0].roomChoice, dto.legs[0].privateRooms)
+      ? customPackageStay(customPackage, { trip: seated[0].trip, seats: seated[0].seats.length }, { trip: seated[1].trip, seats: seated[1].seats.length }, skipsCustomStay ? undefined : dto.legs[0].roomChoice, dto.legs[0].privateRooms, family)
       : null;
     // What the customer can still pick from is shown either way; only a stay they keep is charged and saved.
     const customStayLeg = builtStay && {
@@ -431,7 +434,7 @@ export class BookingsService {
     // A hotel the customer added to transport, like the counter's "transport with stay"; it rides on the outbound.
     if (dto.stay && customPackage) throw new BadRequestException('الباقة المصممة لها سكنها، فلا يُضاف لها فندق آخر');
     if (dto.stay && !dto.transportOnly) throw new BadRequestException('الفندق المختار يُضاف إلى حجز نقل');
-    const chosenStay = dto.stay ? await this.priceChosenStay(db, dto.stay, seated, { returnOnly: !!dto.returnOnly }) : null;
+    const chosenStay = dto.stay ? await this.priceChosenStay(db, dto.stay, seated, { returnOnly: !!dto.returnOnly, family }) : null;
 
     const listedLegs = seated.map(({ leg, trip, seats }, index) => {
       // A package charges its total for the group's size; an ordinary trip charges each seat.
@@ -445,7 +448,7 @@ export class BookingsService {
       if (dto.transportOnly && includesHousing(trip.bookingType) && trip.housingPriceMode === 'INCLUDED_IN_BASE') {
         throw new BadRequestException('السكن مشمول في سعر هذه الرحلة، ولا يمكن حجزها بدون سكن');
       }
-      const stay = customStayLeg ? (index === 0 ? customStayLeg : null) : chosenStay ? (index === 0 ? chosenStay : null) : dto.transportOnly ? null : this.priceStay(trip, leg, seats.length);
+      const stay = customStayLeg ? (index === 0 ? customStayLeg : null) : chosenStay ? (index === 0 ? chosenStay : null) : dto.transportOnly ? null : this.priceStay(trip, leg, seats.length, family);
       const housingAmount = stay?.amount ?? 0;
       return { leg, trip, seats, unitPrice, pricing, stay, seatsSubtotal, housingAmount, subtotal: seatsSubtotal + housingAmount, roundShare: false };
     });
@@ -696,7 +699,7 @@ export class BookingsService {
     db: Prisma.TransactionClient,
     stay: { hotelId: string; roomType: RoomType; nights: number; privateRooms?: number },
     seated: { trip: HousingTerms & { package: unknown; departureTime: Date; hotelBookings: { hotelId: string }[] }; seats: string[] }[],
-    { returnOnly = false } = {},
+    { returnOnly = false, family = false } = {},
   ) {
     if (seated.some((row) => row.trip.package)) throw new BadRequestException('الباقة تشمل سكنها، فلا يُضاف لها فندق آخر');
     // The stay starts with the outbound, which the app sends first; a return leaving before it would put the stay in the wrong place.
@@ -712,8 +715,12 @@ export class BookingsService {
     }
     const hotel = await db.hotel.findUnique({ where: { id: stay.hotelId }, select: { ...CHOSEN_STAY_HOTEL_SELECT, isActive: true } });
     if (!hotel?.isActive) throw new BadRequestException('الفندق غير موجود أو موقوف');
-    if (!roomOptionsOf(hotel).includes(stay.roomType)) throw new BadRequestException('نوع السكن المختار غير متاح في هذا الفندق');
     const terms = this.stayTerms(hotel, seated.map((row) => row.trip));
+    // A family takes the hotel's private room, as many as it needs unless it said otherwise.
+    const sold = roomOptionsOf(hotel).filter((room) => isRoomSellable(terms, room));
+    const asFamily = familyRooms(sold, stay.roomType, family).choice === 'PRIVATE' && stay.roomType !== 'PRIVATE';
+    if (asFamily) stay = { ...stay, roomType: 'PRIVATE', privateRooms: privateRoomsNeeded(terms.privateRoomCapacity, persons) };
+    if (!roomOptionsOf(hotel).includes(stay.roomType)) throw new BadRequestException('نوع السكن المختار غير متاح في هذا الفندق');
     if (!isRoomSellable(terms, stay.roomType)) throw new BadRequestException(`لا يوجد سعر لهذا النوع من السكن في ${hotel.name}`);
     const rooms = stay.roomType === 'PRIVATE' ? stay.privateRooms ?? 1 : 1;
     if (rooms > persons) throw new BadRequestException('عدد الغرف أكثر من عدد المسافرين');
@@ -754,6 +761,7 @@ export class BookingsService {
     },
     leg: { roomChoice?: RoomType; withoutHousing?: boolean; privateRooms?: number },
     seats: number,
+    family = false,
   ) {
     if (!includesHousing(trip.bookingType)) return null;
     const hotel = trip.hotelBookings[0]?.hotel;
@@ -772,10 +780,11 @@ export class BookingsService {
       return null;
     }
     const nights = trip.accommodations[0]?.nights ?? 1;
-    const options = roomOptionsOf(hotel).filter((room) => !charges || isRoomSellable(trip, room));
-    if (leg.roomChoice && !options.includes(leg.roomChoice)) throw new BadRequestException('نوع الغرفة المختار غير متاح في هذا الفندق');
+    // A family is offered only the private room, and a shared pick becomes private.
+    const { options, choice: roomChoice } = familyRooms(roomOptionsOf(hotel).filter((room) => !charges || isRoomSellable(trip, room)), leg.roomChoice, family);
+    if (roomChoice && !options.includes(roomChoice)) throw new BadRequestException('نوع الغرفة المختار غير متاح في هذا الفندق');
     // With no housing left out, a hotel with one room type picks it; leaving the stay out picks none.
-    const choice = skips ? null : leg.roomChoice ?? (options.length === 1 ? options[0] : null);
+    const choice = skips ? null : roomChoice ?? (options.length === 1 ? options[0] : null);
     // A group larger than a private room may take more rooms; each costs the hotel's price for one room.
     if ((leg.privateRooms ?? 1) > seats) throw new BadRequestException('عدد الغرف أكثر من عدد المسافرين');
     const rooms = choice === 'PRIVATE' ? leg.privateRooms ?? 1 : 1;
@@ -881,24 +890,25 @@ export class BookingsService {
           await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`booking:${userId}`}))`;
           // Taken before the quote checks the trip, so a booking waiting on a trip being cancelled sees the cancellation instead of confirming onto it.
           await lockTripsWithLinked(tx, dto.legs.map((leg) => leg.tripId));
-          const quote = await this.computeQuote(tx, userId, dto);
+          // Priced for the travellers' own section, so a family is charged the private room it is given.
+          const quote = await this.computeQuote(tx, userId, { ...dto, category });
           if (quote.housing.some((stay) => stay && !stay.choice && !stay.withoutHousing)) throw new BadRequestException('اختر نوع الغرفة أو بدون سكن');
           // Which rows are sold as transport alone: all of them when the customer asked for transport or left a built package's stay
           // out, otherwise each trip whose hotel they left out. The kind tells the rooming sheet and the crew there is no stay.
           const asTransport = quote.pricedLegs.map(
             (leg) => quote.skipsCustomStay || (!quote.customStay && !quote.chosenStay && (!!dto.transportOnly || !!leg.leg.withoutHousing)),
           );
-          const allTransport = asTransport.every(Boolean);
-          const transportKind = (legIndex: number) =>
-            allTransport
-              ? quote.pricedLegs.length > 1
-                ? ('TRANSPORT_ROUND' as const)
-                : dto.returnOnly
-                  ? ('TRANSPORT_RETURN' as const)
-                  : ('TRANSPORT_OUTBOUND' as const)
-              : legIndex === 0
-                ? ('TRANSPORT_OUTBOUND' as const)
-                : ('TRANSPORT_RETURN' as const);
+          // The direction the customer bought, the same on every row of the journey, as the counter records it: it also decides
+          // whether a passenger of a round trip rides back on its reverse (ذهاب فقط does not).
+          const journeyKind = (stay: boolean) =>
+            quote.pricedLegs.length > 1
+              ? stay ? ('PACKAGE_ROUND_STAY' as const) : ('TRANSPORT_ROUND' as const)
+              : dto.returnOnly
+                ? stay ? ('PACKAGE_STAY_RETURN' as const) : ('TRANSPORT_RETURN' as const)
+                : stay ? ('PACKAGE_OUTBOUND_STAY' as const) : ('TRANSPORT_OUTBOUND' as const);
+          // A package trip bought from its own listing is the whole package, so its rows keep no kind.
+          const rowKind = (legIndex: number, hasStay: boolean, isPackage: boolean) =>
+            quote.customStay ? ('PACKAGE_ROUND_STAY' as const) : asTransport[legIndex] ? journeyKind(false) : quote.chosenStay ? journeyKind(true) : isPackage ? null : journeyKind(hasStay);
 
           // Until the gateway ships, anything left to pay can only go through in explicit simulated mode.
           const simulated = this.config.get('PAYMENT_MODE') === 'simulated';
@@ -922,15 +932,16 @@ export class BookingsService {
             }
             // Passengers a counter booked without a seat hold places too, so the count is checked and not only the plan.
             await takeTripCapacity(tx, leg.trip.id, leg.trip.tripCode, leg.seats.length);
-            await takeLinkedSeats(tx, leg.trip.id, leg.seats, holdAvailableTo(userId, now), { returnsOnOtherLeg: quote.pricedLegs.length > 1 });
+            // Stored on the booking, so every screen reads what was bought here rather than what the trip offers.
+            const hasStay = !asTransport[legIndex] && (!!quote.customStay || !!quote.housing[legIndex]?.choice);
+            const kind = rowKind(legIndex, hasStay, !!leg.trip.package);
+            await takeLinkedSeats(tx, leg.trip.id, leg.seats, holdAvailableTo(userId, now), { returnsOnOtherLeg: quote.pricedLegs.length > 1, ridesBack: ridesBack(kind) });
 
             const boardingPoint = await this.resolveBoardingPoint(tx, leg.leg, leg.trip.id);
             // Under way, the bus picks the customer up only at a point ahead of it, so one must be chosen (the quote checked it is ahead).
             if (!boardingPoint && hasSetOff(leg.trip, now.getTime())) throw new BadRequestException('اختر نقطة تجمع أمام الحافلة');
             // The same numbering as a branch's bookings; the plain client, so the counter is not held while this one saves.
             const bookingReference = await nextBookingNumber(this.prisma);
-            // Stored on the booking, so every screen reads what was bought here rather than what the trip offers.
-            const hasStay = !asTransport[legIndex] && (!!quote.customStay || !!quote.housing[legIndex]?.choice);
             const paidOnline = leg.payable > 0;
 
             const booking = await tx.booking.create({
@@ -944,6 +955,8 @@ export class BookingsService {
                 roomChoice: quote.housing[legIndex]?.choice ?? null,
                 privateRooms: quote.housing[legIndex]?.choice === 'PRIVATE' ? quote.housing[legIndex]?.privateRooms ?? 1 : 1,
                 serviceType: serviceTypeOf(hasStay, includesVisits(leg.trip.bookingType)),
+                // An ordinary trip bought with its own stay or none: the direction bought, so a ذهاب فقط does not ride back.
+                ...(kind && { kind, leg: legIndex === 0 && !dto.returnOnly ? ('OUTBOUND' as const) : ('RETURN' as const) }),
                 // The customer's own package: both legs carry it, and the stay sits on the outbound like a branch's journey.
                 ...(quote.customStay && {
                   kind: 'PACKAGE_ROUND_STAY' as const,
@@ -969,7 +982,7 @@ export class BookingsService {
                 }),
                 // Named as transport, so the rooming sheet and the crew know this booking has no stay even on a trip with a hotel.
                 ...(asTransport[legIndex] && {
-                  kind: transportKind(legIndex),
+                  kind: journeyKind(false),
                   leg: legIndex === 0 ? ('OUTBOUND' as const) : ('RETURN' as const),
                 }),
                 housingAmount: toSar(leg.housingAmount),

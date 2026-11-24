@@ -6,6 +6,7 @@ import {
   IsArray,
   IsBoolean,
   IsEnum,
+  IsIn,
   IsInt,
   IsNumber,
   IsOptional,
@@ -364,11 +365,35 @@ export class PlannedRoomDto {
   @Max(50)
   capacity?: number;
 
+  /** The room's floor; left out keeps what the room has. */
+  @IsOptional()
+  @IsInt({ message: 'الدور رقم صحيح' })
+  @Min(-5)
+  @Max(200)
+  floor?: number;
+
   @IsArray()
   @ArrayMinSize(1)
   @ArrayMaxSize(50)
   @IsString({ each: true })
   passengerIds: string[];
+}
+
+/** The automatic rooming's options for one hotel, kept so the next trip there opens with them. */
+export class RoomingOptionsDto {
+  @IsIn(['prefer', 'strict', 'ignore'])
+  nationalityMode: string;
+
+  @IsIn(['largest', 'booking', 'boardingPoint'])
+  fillOrder: string;
+
+  @IsBoolean() completeSameGender: boolean;
+  @IsBoolean() keepTogether: boolean;
+  @IsBoolean() fillExisting: boolean;
+  @IsBoolean() mergeNearest: boolean;
+  @IsBoolean() seniorsLow: boolean;
+  @IsBoolean() minimizeRooms: boolean;
+  @IsBoolean() warnDuplicates: boolean;
 }
 
 /** A whole plan from the automatic distribution, saved together or not at all. */

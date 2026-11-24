@@ -25,7 +25,7 @@ import { CREW_WINDOW_SELECT, MAX_CREW_OPENS_BEFORE_MINUTES, crewWindow } from '.
 import { seatLayoutFor, seatNumbersOf, storedSeatLayout, tripSeatLayout } from '../../common/utils/bus-layout.util';
 import { assertSinglesFitRange } from '../../common/utils/singles-seats.util';
 import { applySeatLayout } from '../../common/utils/trip-seats.util';
-import { bookedOnTrips, goOnlyBookings, lockTripsWithLinked, manifestSeatsByTrip, returningBookingIds, seatlessRiders } from '../../common/utils/linked-seats.util';
+import { bookedOnTrips, goOnlyBookings, lockTripsWithLinked, manifestSeatsByTrip, returningBookingIds, ridingBackSeats, seatlessRiders } from '../../common/utils/linked-seats.util';
 import { tripRatingSummaries } from '../../common/utils/trip-ratings.util';
 import { RIYADH_OFFSET_MS, addDays, formatRiyadhDate, formatRiyadhTime, riyadhDate, riyadhDayRange, riyadhMonth, riyadhMonthRange, startOfRiyadhMonth, toHijriLabel } from '../../common/utils/time.util';
 import { bookingOpenedWhere, bookingOpensAtFor, startOfNextRiyadhMonth } from '../../common/utils/booking-opens.util';
@@ -56,6 +56,8 @@ const TRIP_TX_OPTIONS = { maxWait: 10_000, timeout: 30_000 };
 // A trip on several buses writes each bus's trip in the same transaction.
 const CONVOY_TX_OPTIONS = { maxWait: 10_000, timeout: 120_000 };
 const DAY_MS = 24 * 60 * 60 * 1000;
+/** How many later days with trips the "nearest available date" checks against the search before giving up. */
+const MAX_NEXT_AVAILABLE_DAYS = 20;
 /** The append-only financial tables a finished trip's full delete removes rows from (their guard triggers reject deletes). */
 const PURGE_GUARDED_TABLES = ['CashMovement', 'Invoice', 'CreditNote', 'BookingCollection', 'BookingEvent', 'PaymentTransaction'];
 
@@ -1280,24 +1282,39 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
     };
   }
 
-  async getNextAvailableDate(filters: TripSearchFilters & { after?: string }) {
+  /**
+   * The nearest later day the search itself lists a bookable trip on, so the day the app offers always shows trips: the
+   * same sale rules, and on a round trip the same linked trip back with seats for everyone. Its Riyadh date comes with it,
+   * so the app opens that day whatever the phone's time zone.
+   */
+  async getNextAvailableDate(filters: TripSearchFilters & { after?: string; passengers?: number }) {
     const after = filters.after ? riyadhDayRange(filters.after)?.end : undefined;
     const now = new Date();
-    const trip = await this.prisma.trip.findFirst({
+    const persons = Math.max(1, filters.passengers ?? 1);
+    const candidates = await this.prisma.trip.findMany({
       where: {
-        tripStatus: 'PUBLISHED',
-        channelApp: true,
-        ...ON_SALE_PACKAGE,
-        departureTime: { gt: after && after > now ? after : now },
-        availableSeats: { gt: 0 },
-        ...(filters.origin && { origin: { contains: filters.origin, mode: 'insensitive' as const } }),
-        ...(filters.destination && { destination: { contains: filters.destination, mode: 'insensitive' as const } }),
-        AND: [bookingOpenedWhere(now), ...(filters.bookingType ? [bookingTypeWhere(filters.bookingType)] : [])],
+        AND: [
+          appTripWhere({ origin: filters.origin, destination: filters.destination }),
+          { departureTime: { gt: after && after > now ? after : now }, availableSeats: { gte: persons } },
+          ...(filters.bookingType ? [bookingTypeWhere(filters.bookingType)] : []),
+          ...(filters.packageId ? [{ packageId: filters.packageId }] : []),
+        ],
       },
       orderBy: { departureTime: 'asc' },
       select: { departureTime: true },
+      take: 300,
     });
-    return { departureTime: trip?.departureTime ?? null };
+    const days = [...new Set(candidates.map((trip) => riyadhDate(trip.departureTime)))].slice(0, MAX_NEXT_AVAILABLE_DAYS);
+    for (const date of days) {
+      const listed = await this.searchTrips({ ...filters, date });
+      const bookable = listed.filter((trip) => {
+        const row = trip as { availableSeats?: number; isBookingClosed?: boolean; pairedReturn?: { availableSeats?: number; isBookingClosed?: boolean } };
+        const sells = (leg?: { availableSeats?: number; isBookingClosed?: boolean }) => !!leg && !leg.isBookingClosed && (leg.availableSeats ?? 0) >= persons;
+        return sells(row) && (!filters.pairedReturn || sells(row.pairedReturn));
+      });
+      if (bookable.length > 0) return { departureTime: (bookable[0] as { departureTime: Date }).departureTime, date };
+    }
+    return { departureTime: null, date: null };
   }
 
   /**
@@ -2666,8 +2683,10 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
 
       // The reverse can go on sale as soon as the outbound is published; its percent only decides when staff are reminded.
       // Seats the outbound sells afterwards are closed on the reverse by the seat link.
-      // Only a round trip's passengers are still aboard coming back, so only their seats stay closed.
-      const seatNumbers = trip.seats.filter((seat) => trip.direction === 'ONE_WAY' || !seat.isBooked).map((seat) => seat.seatNumber);
+      // Only a round trip's passengers who ride back are still aboard coming back, so only their seats stay closed; a ذهاب فقط
+      // passenger's seat goes on sale there.
+      const ridingBack = trip.direction === 'ROUND_TRIP' ? await ridingBackSeats(tx, trip.id) : new Set<string>();
+      const seatNumbers = trip.seats.filter((seat) => trip.direction === 'ONE_WAY' || !seat.isBooked || !ridingBack.has(seat.seatNumber)).map((seat) => seat.seatNumber);
       if (seatNumbers.length === 0) throw new ConflictException('لا توجد مقاعد متبقية');
       // A round trip's riders saved without a seat number come back too, though no seat shows it: their places are not for sale.
       const available = Math.max(0, seatNumbers.length - (trip.direction === 'ROUND_TRIP' ? await seatlessRiders(tx, trip.id) : 0));

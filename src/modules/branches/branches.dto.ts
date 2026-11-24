@@ -243,6 +243,15 @@ export class JourneyQuoteDto {
   @IsOptional()
   @IsBoolean()
   pairedReturn?: boolean;
+
+  /**
+   * Who the seats are for: a family (the default) never sits in the singles section and singles sit only inside it, the
+   * same company rule the app keeps. Seats left for the server are chosen inside the right section. A family with a stay
+   * is given a private room, so the quote takes it too.
+   */
+  @IsOptional()
+  @IsEnum(BookingCategory, { message: 'فئة الحجز عائلات أو أفراد' })
+  category?: BookingCategory;
 }
 
 export class CustomerDto {
@@ -328,14 +337,6 @@ export class JourneyPaymentDto {
 }
 
 export class CreateJourneyDto extends JourneyQuoteDto {
-  /**
-   * Who the seats are for: a family (the default) never sits in the singles section and singles sit only inside it, the
-   * same company rule the app keeps. Seats left for the server are chosen inside the right section.
-   */
-  @IsOptional()
-  @IsEnum(BookingCategory, { message: 'فئة الحجز عائلات أو أفراد' })
-  category?: BookingCategory;
-
   @IsOptional()
   @IsString()
   @MaxLength(60)

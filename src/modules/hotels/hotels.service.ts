@@ -1,3 +1,4 @@
+import * as crypto from 'crypto';
 import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
 import { BookingStatus, HotelRateUnit, Prisma, RoomType } from '@prisma/client';
 import { BookingEventsService } from '../../common/services/booking-events.service';
@@ -30,6 +31,7 @@ import {
   CreateTravelerComplaintDto,
   UpdateHotelDto,
   UpdateRoomingProfileDto,
+  RoomingOptionsDto,
 } from './hotels.dto';
 
 /** What the hotel shows customers, its services and photos, which every staff view of a hotel carries for its edit form. */
@@ -39,6 +41,14 @@ const TX_OPTIONS = { maxWait: 10_000, timeout: 30_000 };
 // A whole trip's plan places each room in turn, with its checks and notifications, inside one transaction.
 const BULK_TX_OPTIONS = { maxWait: 10_000, timeout: 120_000 };
 const MAX_PLANNED_PASSENGERS = 300;
+
+/** Whole years on the given day, or null without a birth date. */
+const ageOn = (birthDate: Date | null, on: Date) => {
+  if (!birthDate) return null;
+  const years = on.getUTCFullYear() - birthDate.getUTCFullYear();
+  const beforeBirthday = on.getUTCMonth() < birthDate.getUTCMonth() || (on.getUTCMonth() === birthDate.getUTCMonth() && on.getUTCDate() < birthDate.getUTCDate());
+  return beforeBirthday ? years - 1 : years;
+};
 const DAY_MS = 24 * 60 * 60 * 1000;
 const RIYADH_OFFSET_MS = 3 * 60 * 60 * 1000;
 const DEFAULT_ROOM_CAPACITY = 4;
@@ -641,8 +651,8 @@ export class HotelsService {
         hotelBookings: {
           orderBy: { number: 'asc' },
           include: {
-            hotel: { select: { id: true, name: true, city: true } },
-            rooms: { orderBy: { number: 'asc' }, select: { id: true, number: true, type: true, capacity: true, _count: { select: { occupants: true } } } },
+            hotel: { select: { id: true, name: true, city: true, roomingOptions: true } },
+            rooms: { orderBy: { number: 'asc' }, select: { id: true, number: true, type: true, capacity: true, floor: true, _count: { select: { occupants: true } } } },
           },
         },
         bookings: {
@@ -658,7 +668,9 @@ export class HotelsService {
             stayCheckIn: true,
             stayCheckOut: true,
             stayHotel: { select: { id: true, name: true } },
-            user: { select: { name: true, phone: true, ...PROFILE_ACCOUNT_SELECT } },
+            boardingPointName: true,
+            createdAt: true,
+            user: { select: { name: true, phone: true, birthDate: true, ...PROFILE_ACCOUNT_SELECT } },
             passengers: {
               // The booking's owner first, so the account phone below lands on them.
               orderBy: { position: 'asc' },
@@ -667,6 +679,9 @@ export class HotelsService {
                 fullName: true,
                 phone: true,
                 roomNote: true,
+                // For the automatic rooming's checks: the same identity twice, and an elderly traveller written in a note.
+                nationalId: true,
+                notes: true,
                 hotelRoom: { select: { id: true, number: true, type: true, hotelBookingId: true } },
               },
             },
@@ -696,7 +711,16 @@ export class HotelsService {
           seatNumber: p.seatNumber,
           ...profiles.get(p.id)!,
           roomNote: p.roomNote,
+          // A fingerprint, not the number: enough to tell the same identity twice without showing it on the page.
+          idKey: p.nationalId?.trim() ? crypto.createHash('sha256').update(p.nationalId.replace(/\s+/g, '').toUpperCase()).digest('hex').slice(0, 16) : null,
+          notes: p.notes,
+          // Known only for the booking's owner, the first traveller, from the account's birth date.
+          age: idx === 0 ? ageOn(booking.user.birthDate, trip.departureTime) : null,
           room: p.hotelRoom,
+          // Bought no hotel (transport, or transport and visits): the automatic rooming never places them.
+          transportOnly: !booking.stayHotel && (booking.serviceType === 'TRANSPORT_ONLY' || booking.serviceType === 'WITH_VISITS'),
+          boardingPointName: booking.boardingPointName,
+          bookedAt: booking.createdAt,
         }));
       })
       .sort((a, b) => compareSeats(a.seatNumber, b.seatNumber));
@@ -729,7 +753,7 @@ export class HotelsService {
           mealPlan: b.mealPlan,
           notes: b.notes,
           rooms: b.rooms
-            .map((r) => ({ id: r.id, number: r.number, type: r.type, capacity: r.capacity, occupants: r._count.occupants }))
+            .map((r) => ({ id: r.id, number: r.number, type: r.type, capacity: r.capacity, floor: r.floor, occupants: r._count.occupants }))
             .sort((x, y) => (parseInt(x.number, 10) || 0) - (parseInt(y.number, 10) || 0)),
           ...(canSeeRates && { nightlyRate: money(b.nightlyRate), rateUnit: b.rateUnit, extraCost: money(b.extraCost), cost: bookingCost(b) }),
         };
@@ -852,6 +876,7 @@ export class HotelsService {
       roomNumber: string;
       roomType: RoomType;
       capacity?: number;
+      floor?: number;
       newRoomCapacity?: number;
       keepRoomType?: boolean;
       roomNote?: string;
@@ -919,8 +944,8 @@ export class HotelsService {
       throw new ConflictException(`الغرفة ${number} مسجلة ${existing.type === 'PRIVATE' ? 'غرفة خاصة' : 'غرفة مشتركة'}، اختر غرفة أخرى`);
     }
     const room = existing
-      ? await tx.hotelRoom.update({ where: { id: existing.id }, data: { type: dto.roomType, capacity: dto.capacity ?? existing.capacity } })
-      : await tx.hotelRoom.create({ data: { hotelBookingId, number, type: dto.roomType, capacity: dto.capacity ?? dto.newRoomCapacity ?? DEFAULT_ROOM_CAPACITY } });
+      ? await tx.hotelRoom.update({ where: { id: existing.id }, data: { type: dto.roomType, capacity: dto.capacity ?? existing.capacity, ...(dto.floor !== undefined && { floor: dto.floor }) } })
+      : await tx.hotelRoom.create({ data: { hotelBookingId, number, type: dto.roomType, capacity: dto.capacity ?? dto.newRoomCapacity ?? DEFAULT_ROOM_CAPACITY, floor: dto.floor ?? null } });
 
     const stayingOccupants = (existing?.occupants ?? []).filter((o) => !passengerIds.includes(o.id));
     // A private room is the booking's own, so nobody from another booking may share it.
@@ -1032,6 +1057,16 @@ export class HotelsService {
       }
     }, BULK_TX_OPTIONS);
     return { rooms: dto.rooms.length, passengers: everyone.length };
+  }
+
+  /** Only the known options are stored, so the page always reads back what it sent. */
+  async saveRoomingOptions(hotelId: string, dto: RoomingOptionsDto) {
+    const { nationalityMode, fillOrder, completeSameGender, keepTogether, fillExisting, mergeNearest, seniorsLow, minimizeRooms, warnDuplicates } = dto;
+    const roomingOptions = { nationalityMode, fillOrder, completeSameGender, keepTogether, fillExisting, mergeNearest, seniorsLow, minimizeRooms, warnDuplicates };
+    const found = await this.prisma.hotel.findUnique({ where: { id: hotelId }, select: { id: true } });
+    if (!found) throw new NotFoundException('الفندق غير موجود');
+    await this.prisma.hotel.update({ where: { id: hotelId }, data: { roomingOptions } });
+    return roomingOptions;
   }
 
   /** Housing staff fill in what the booking left blank, so the passenger can be filtered and placed with the right people. */

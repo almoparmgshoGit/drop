@@ -18,7 +18,7 @@ import {
   Min,
   ValidateNested,
 } from 'class-validator';
-import { BookingCategory, BookingStatus, Gender, RefundDestination, RoomType } from '@prisma/client';
+import { BookingCategory, BookingKind, BookingServiceType, BookingStatus, Gender, RefundDestination, RoomType } from '@prisma/client';
 import { NATIONALITIES } from '../../common/profile-options';
 
 const SEAT_NUMBER = /^\d{1,3}$/;
@@ -362,6 +362,16 @@ export class AdminBookingsQuery {
   @IsOptional()
   @IsIn(['WAITING', 'PARTIAL', 'BOARDED', 'NO_SHOW'])
   boarding?: 'WAITING' | 'PARTIAL' | 'BOARDED' | 'NO_SHOW';
+
+  /** The booking's main type (نقل فقط، نقل مع سكن…), the same as the list's «نوع الحجز» column. */
+  @IsOptional()
+  @IsEnum(BookingServiceType)
+  serviceType?: BookingServiceType;
+
+  /** What the customer bought (حجز رحلة - ذهاب فقط، حجز باقة - ذهاب وعودة مع السكن…), the list's «نوع الحجز» column. */
+  @IsOptional()
+  @IsEnum(BookingKind)
+  kind?: BookingKind;
 
   @IsOptional()
   @Matches(/^\d{4}-(0[1-9]|1[0-2])$/)

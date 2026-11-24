@@ -9,7 +9,7 @@ import { AppSettingsService, withinHours } from '../../common/services/app-setti
 import { csvCell } from '../../common/utils/csv.util';
 import { invoiceNumber } from '../../common/utils/invoice.util';
 import { tripSeatLayout } from '../../common/utils/bus-layout.util';
-import { goOnlyBookings, hasOtherLeg, lockTripsWithLinked, releaseLinkedPlaces, releaseLinkedSeats, returnRideOf, reverseSeatsSummary, takeLinkedSeats } from '../../common/utils/linked-seats.util';
+import { goOnlyBookings, hasOtherLeg, lockTripsWithLinked, releaseLinkedPlaces, releaseLinkedSeats, returnRideOf, reverseSeatsSummary, ridesBack, takeLinkedSeats } from '../../common/utils/linked-seats.util';
 import { passengerWeights } from '../../common/utils/housing-price.util';
 import { paymentFigures } from '../../common/utils/payment.util';
 import { normalizeSaudiPhone } from '../../common/utils/phone.util';
@@ -127,6 +127,8 @@ export class BookingsAdminService {
     const where: Prisma.BookingWhereInput = {};
     if (query.status) where.status = query.status;
     if (query.tripId) where.tripId = query.tripId;
+    if (query.serviceType) where.serviceType = query.serviceType;
+    if (query.kind) where.kind = query.kind;
     if (query.search) {
       where.OR = [
         { bookingReference: { contains: query.search, mode: 'insensitive' } },
@@ -202,12 +204,26 @@ export class BookingsAdminService {
       this.prisma.booking.count({ where: { ...scope, payment: { status: 'PENDING' }, collections: { none: {} }, status: { not: 'CANCELLED' } } }),
       this.prisma.booking.count({ where: { ...scope, status: 'PENDING_CANCELLATION_REVIEW' } }),
     ]);
-    const [{ bookingIds: goOnly }, reverse] = await Promise.all([
+    // A booking saved before its kind was stored says nothing of its direction; a leg on another trip in its group makes it a round journey.
+    const unnamedGroups = [...new Set(items.filter((item) => !item.kind && item.groupReference).map((item) => item.groupReference as string))];
+    const [{ bookingIds: goOnly }, reverse, groupLegs] = await Promise.all([
       goOnlyBookings(this.prisma, [...new Set(items.map((item) => item.tripId))]),
       query.tripId ? reverseSeatsSummary(this.prisma, query.tripId) : null,
+      unnamedGroups.length
+        ? this.prisma.booking.findMany({ where: { groupReference: { in: unnamedGroups } }, select: { groupReference: true, tripId: true } })
+        : [],
     ]);
+    const tripsOfGroup = new Map<string, Set<string>>();
+    for (const row of groupLegs) {
+      if (!row.groupReference) continue;
+      tripsOfGroup.set(row.groupReference, (tripsOfGroup.get(row.groupReference) ?? new Set()).add(row.tripId));
+    }
     return {
-      items: items.map((item) => ({ ...item, goOnly: goOnly.has(item.id) })),
+      items: items.map((item) => ({
+        ...item,
+        goOnly: goOnly.has(item.id),
+        roundJourney: !!item.groupReference && (tripsOfGroup.get(item.groupReference)?.size ?? 0) > 1,
+      })),
       total,
       page,
       limit,
@@ -518,7 +534,8 @@ export class BookingsAdminService {
           data: { isBooked: false, heldByUserId: null, heldUntil: null },
         });
       }
-      const tookSeat = await takeLinkedSeats(tx, booking.tripId, [seatNumber], holdAvailableTo(actorId, new Date()));
+      // A ذهاب فقط holds nothing on a round trip's reverse, so its new seat takes nothing there either.
+      const tookSeat = await takeLinkedSeats(tx, booking.tripId, [seatNumber], holdAvailableTo(actorId, new Date()), { ridesBack: ridesBack(booking.kind) });
       if (passenger.seatNumber) await releaseLinkedSeats(tx, booking.tripId, [passenger.seatNumber]);
       // A seatless rider held a place there by count; the seat now holds it, so the count goes back.
       else if (tookSeat > 0 && !(await hasOtherLeg(tx, booking))) await releaseLinkedPlaces(tx, booking.tripId, tookSeat);
