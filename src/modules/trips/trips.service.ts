@@ -25,7 +25,7 @@ import { CREW_WINDOW_SELECT, MAX_CREW_OPENS_BEFORE_MINUTES, crewWindow } from '.
 import { seatLayoutFor, seatNumbersOf, storedSeatLayout, tripSeatLayout } from '../../common/utils/bus-layout.util';
 import { assertSinglesFitRange } from '../../common/utils/singles-seats.util';
 import { applySeatLayout } from '../../common/utils/trip-seats.util';
-import { bookedOnTrips, goOnlyBookings, lockTripsWithLinked, returningBookingIds } from '../../common/utils/linked-seats.util';
+import { bookedOnTrips, goOnlyBookings, lockTripsWithLinked, manifestSeatsByTrip, returningBookingIds } from '../../common/utils/linked-seats.util';
 import { tripRatingSummaries } from '../../common/utils/trip-ratings.util';
 import { RIYADH_OFFSET_MS, addDays, formatRiyadhDate, formatRiyadhTime, riyadhDate, riyadhDayRange, riyadhMonth, riyadhMonthRange, startOfRiyadhMonth, toHijriLabel } from '../../common/utils/time.util';
 import { bookingOpenedWhere, bookingOpensAtFor, startOfNextRiyadhMonth } from '../../common/utils/booking-opens.util';
@@ -101,7 +101,7 @@ const ADMIN_TRIP_INCLUDE = {
   accommodations: true,
   hotelBookings: { where: { status: 'CONFIRMED' }, orderBy: { number: 'asc' }, select: { hotelId: true } },
   reverseTrip: { select: { id: true, tripCode: true, tripStatus: true } },
-  reverseOf: { select: { id: true, tripCode: true, departureTime: true } },
+  reverseOf: { select: { id: true, tripCode: true, departureTime: true, direction: true } },
   drivers: { include: { user: STAFF_USER_SELECT } },
   supervisors: { include: { user: STAFF_USER_SELECT } },
   _count: { select: { bookings: true } },
@@ -1185,10 +1185,15 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
       }),
       this.metrics.revenueByTrip(where),
     ]);
-    const ratings = await tripRatingSummaries(this.prisma, trips.map((trip) => trip.id));
+    const [ratings, passengers] = await Promise.all([
+      tripRatingSummaries(this.prisma, trips.map((trip) => trip.id)),
+      manifestSeatsByTrip(this.prisma, trips),
+    ]);
     return trips.map((trip) => ({
       ...withoutRentFor(actor, withSeatPrice(trip)),
       expectedRevenue: (revenue.get(trip.id) ?? 0) / 100,
+      // The passengers its manifest lists; seats taken (totalSeats - availableSeats) also counts seats closed by the linked trip.
+      passengerSeats: passengers.get(trip.id) ?? 0,
       ratings: ratings.get(trip.id) ?? { count: 0, average: null },
     }));
   }

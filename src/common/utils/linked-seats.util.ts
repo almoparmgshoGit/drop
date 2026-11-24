@@ -114,6 +114,45 @@ export async function bookedOnTrips(db: Pick<Prisma.TransactionClient, 'booking'
   return totals;
 }
 
+/**
+ * How many passengers each trip's manifest lists, counted the manifest's way: its own bookings holding a seat, and on an
+ * opened reverse of a round trip also the outbound's passengers riding back on it. totalSeats - availableSeats can be more,
+ * because a seat sold on the linked trip is closed here too without anyone of this trip sitting in it.
+ */
+export async function manifestSeatsByTrip(
+  db: Pick<Prisma.TransactionClient, 'booking'>,
+  trips: { id: string; tripStatus: string; reverseOfTripId: string | null; reverseOf?: { direction: string } | null }[],
+) {
+  const seats = new Map<string, number>(trips.map((trip) => [trip.id, 0]));
+  const own = await db.booking.findMany({
+    where: { tripId: { in: trips.map((trip) => trip.id) }, status: { in: HOLDS_A_SEAT } },
+    select: { tripId: true, _count: { select: { passengers: true } } },
+  });
+  for (const booking of own) seats.set(booking.tripId, (seats.get(booking.tripId) ?? 0) + booking._count.passengers);
+
+  // The same rule as returningBookingIds, for every opened reverse in one go.
+  const reverseOf = new Map(
+    trips
+      .filter((trip) => trip.reverseOfTripId && trip.reverseOf?.direction === 'ROUND_TRIP' && ['PUBLISHED', 'COMPLETED'].includes(trip.tripStatus))
+      .map((trip) => [trip.reverseOfTripId!, trip.id]),
+  );
+  if (reverseOf.size > 0) {
+    const outbound = await db.booking.findMany({
+      where: {
+        tripId: { in: [...reverseOf.keys()] },
+        status: { in: HOLDS_A_SEAT },
+        OR: [{ kind: null }, { kind: { notIn: OUTBOUND_ONLY_KINDS } }],
+      },
+      select: { tripId: true, groupReference: true, _count: { select: { passengers: true } } },
+    });
+    for (const booking of await withoutOtherLeg(db, outbound)) {
+      const reverseId = reverseOf.get(booking.tripId)!;
+      seats.set(reverseId, (seats.get(reverseId) ?? 0) + booking._count.passengers);
+    }
+  }
+  return seats;
+}
+
 /** What the trip's passenger and booking sheets show about its reverse. Null when the trip has none. */
 export async function reverseSeatsSummary(db: Pick<Prisma.TransactionClient, 'booking' | 'trip'>, tripId: string) {
   const trip = await db.trip.findUnique({
