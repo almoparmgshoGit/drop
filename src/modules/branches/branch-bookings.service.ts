@@ -13,7 +13,7 @@ import { vatInside } from '../../common/utils/invoice.util';
 import { tripSeatLayout } from '../../common/utils/bus-layout.util';
 import { assertCategoryMatchesGenders, categoryForGenders, describeSinglesRange, isSinglesSeat } from '../../common/utils/singles-seats.util';
 import { AppSettingsService } from '../../common/services/app-settings.service';
-import { lockTripsWithLinked, takeLinkedSeats, takeTripCapacity } from '../../common/utils/linked-seats.util';
+import { lockTripsWithLinked, takeLinkedPlaces, takeLinkedSeats, takeTripCapacity } from '../../common/utils/linked-seats.util';
 import { halalas, netBookingFigures, paymentFigures } from '../../common/utils/payment.util';
 import { normalizeSaudiPhone } from '../../common/utils/phone.util';
 import { signTicketToken } from '../../common/utils/ticket-token.util';
@@ -289,7 +289,7 @@ export class BranchBookingsService {
           stayNights: true,
           stayHotel: { select: { name: true } },
           branch: { select: { name: true } },
-          trip: { select: { tripCode: true, origin: true, destination: true, departureTime: true } },
+          trip: { select: { tripCode: true, origin: true, destination: true, departureTime: true, direction: true } },
           passengers: { select: { fullName: true, nationalId: true, phone: true, seatNumber: true, ticket: { select: { boardedAt: true, isBoarded: true } } } },
           user: { select: { phone: true } },
           payment: { select: { amount: true, walletAmount: true, status: true } },
@@ -669,6 +669,8 @@ export class BranchBookingsService {
           // Every traveller takes a place on the bus, seated or not, so the trip cannot be sold past its capacity.
           await takeTripCapacity(tx, leg.trip.id, leg.trip.tripCode, passengers.length);
           if (picked.length > 0) await takeLinkedSeats(tx, leg.trip.id, picked, available, { returnsOnOtherLeg: quote.legs.length > 1 });
+          // Those saved without a seat still ride the linked trip of a round trip, so they take a place there by count.
+          await takeLinkedPlaces(tx, leg.trip.id, passengers.length - picked.length, { hasOtherLeg: quote.legs.length > 1 });
 
           const point = leg.leg.boardingPointId ? await tx.boardingPoint.findFirst({ where: { id: leg.leg.boardingPointId, tripId: leg.trip.id } }) : null;
           if (leg.leg.boardingPointId && !point) throw new BadRequestException('نقطة التجمع لا تخص هذه الرحلة');

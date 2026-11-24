@@ -107,6 +107,14 @@ export class TripsController {
     return this.tripsService.getReverseTrips(query.range, req.user);
   }
 
+  @Get('admin/reverse/alerts')
+  @RequirePermission('trips.view', 'trips.manage')
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Ways there without a way back, and open ways back the app does not show' })
+  async getReverseAlerts(@Req() req) {
+    return this.tripsService.getReverseAlerts(req.user);
+  }
+
   @Get('admin/availability')
   @RequirePermission('trips.view', 'trips.manage')
   @ApiBearerAuth()

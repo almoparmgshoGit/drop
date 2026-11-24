@@ -25,7 +25,7 @@ import { CREW_WINDOW_SELECT, MAX_CREW_OPENS_BEFORE_MINUTES, crewWindow } from '.
 import { seatLayoutFor, seatNumbersOf, storedSeatLayout, tripSeatLayout } from '../../common/utils/bus-layout.util';
 import { assertSinglesFitRange } from '../../common/utils/singles-seats.util';
 import { applySeatLayout } from '../../common/utils/trip-seats.util';
-import { bookedOnTrips, goOnlyBookings, lockTripsWithLinked, manifestSeatsByTrip, returningBookingIds } from '../../common/utils/linked-seats.util';
+import { bookedOnTrips, goOnlyBookings, lockTripsWithLinked, manifestSeatsByTrip, returningBookingIds, seatlessRiders } from '../../common/utils/linked-seats.util';
 import { tripRatingSummaries } from '../../common/utils/trip-ratings.util';
 import { RIYADH_OFFSET_MS, addDays, formatRiyadhDate, formatRiyadhTime, riyadhDate, riyadhDayRange, riyadhMonth, riyadhMonthRange, startOfRiyadhMonth, toHijriLabel } from '../../common/utils/time.util';
 import { bookingOpenedWhere, bookingOpensAtFor, startOfNextRiyadhMonth } from '../../common/utils/booking-opens.util';
@@ -442,8 +442,26 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
    * or crew was busy at the return time, and tries again once that is sorted out. A return staff cancelled stays cancelled.
    */
   async openPendingReverses() {
+    const now = new Date();
+    // A published way there whose return has no time yet gets the default one (defaultReverseDeparture), and opens below.
+    const untimed = await this.prisma.trip.findMany({
+      where: { reverseEnabled: true, tripStatus: 'PUBLISHED', reverseOfTripId: null, convoyLeadId: null, departureTime: { gt: now }, reverseDepartureAt: null, OR: [{ reverseTrip: null }, { reverseTrip: { tripStatus: 'DRAFT' } }] },
+      include: { package: { select: { nights: true } }, accommodations: { select: { nights: true } } },
+    });
+    for (const trip of untimed) {
+      await this.prisma.$transaction(async (tx) => tx.trip.update({ where: { id: trip.id }, data: { reverseDepartureAt: await this.defaultReverseDeparture(tx, trip) } }));
+    }
+    // A draft way there gets its draft return, as when it is saved (syncDraftReverse): drafts made before that rule, or
+    // switched on by the one-off repair (prisma/fix-returns.ts).
+    const drafts = await this.prisma.trip.findMany({
+      where: { reverseEnabled: true, tripStatus: 'DRAFT', reverseOfTripId: null, convoyLeadId: null, departureTime: { gt: now }, reverseTrip: null },
+      select: { id: true },
+    });
+    for (const trip of drafts) {
+      await this.prisma.$transaction((tx) => this.syncDraftReverse(tx, trip.id), TRIP_TX_OPTIONS).catch((err) => console.error(`Could not make the return of draft ${trip.id}:`, err.message));
+    }
     const trips = await this.prisma.trip.findMany({
-      where: { reverseEnabled: true, tripStatus: 'PUBLISHED', reverseTrip: null, reverseDepartureAt: { gt: new Date() } },
+      where: { reverseEnabled: true, tripStatus: 'PUBLISHED', OR: [{ reverseTrip: null }, { reverseTrip: { tripStatus: 'DRAFT' } }], reverseDepartureAt: { gt: new Date() } },
       select: { id: true },
     });
     for (const trip of trips) await this.autoOpenReverse(trip.id);
@@ -462,7 +480,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
       if (!(err instanceof HttpException)) console.error(`Could not open the return of trip ${id}:`, err.message);
       await this.prisma.$transaction(async (tx) => {
         // Opened by someone else meanwhile: nothing to tell.
-        if ((await tx.trip.count({ where: { id, reverseTrip: null } })) === 0) return;
+        if ((await tx.trip.count({ where: { id, OR: [{ reverseTrip: null }, { reverseTrip: { tripStatus: 'DRAFT' } }] } })) === 0) return;
         const claimed = await tx.trip.updateMany({ where: { id, reverseReadyAnnouncedAt: null }, data: { reverseReadyAnnouncedAt: new Date() } });
         if (claimed.count === 1) await this.notifications.toStaff(tx, 'REVERSE_TRIP_READY', ['trips.manage'], {}, { tripId: id });
       }, TRIP_TX_OPTIONS);
@@ -470,13 +488,108 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  private async defaultReverseOpening(id: string): Promise<OpenReverseTripDto> {
-    const trip = await this.prisma.trip.findUniqueOrThrow({
+  /**
+   * When the way back leaves unless staff chose: with a stay, the departure day plus the stay's nights (the package's, or the
+   * trip's hotel's); without one, the first chance after the bus reaches the destination. Either way at the clock time of the
+   * latest return on the same road, or the way there's own clock on a road with none, and never before the bus has arrived.
+   */
+  private async defaultReverseDeparture(
+    db: Prisma.TransactionClient,
+    trip: OutboundTimes & { origin: string; destination: string; package: { nights: number } | null; accommodations: { nights: number }[] },
+  ) {
+    const template = await db.trip.findFirst({
+      where: { reverseOfTripId: { not: null }, origin: trip.destination, destination: trip.origin, tripStatus: { not: 'CANCELLED' } },
+      orderBy: { departureTime: 'desc' },
+      select: { departureTime: true },
+    });
+    const clock = formatRiyadhTime(template?.departureTime ?? trip.departureTime);
+    const nights = trip.package?.nights ?? trip.accommodations[0]?.nights ?? 0;
+    const reaches = reachesDestinationAt(trip);
+    const from = nights > 0 ? new Date(trip.departureTime.getTime() + nights * DAY_MS) : reaches;
+    let departure = new Date(`${riyadhDate(from)}T${clock}:00+03:00`);
+    while (departure <= reaches) departure = new Date(departure.getTime() + DAY_MS);
+    return departure;
+  }
+
+  /**
+   * Every way there has its way back from the start: a draft's return is made with it as a draft, R under the same number,
+   * so the trips list and the month show the whole journey. It follows the draft's edits, goes when the return is switched
+   * off or the draft is deleted, and opens for sale when the way there is published (openReverseTrip takes a draft return
+   * like a cancelled one and puts it on sale). A published way there gets its return opened straight away instead.
+   * Another bus of a trip gets its return with its first bus, when that is published.
+   */
+  private async syncDraftReverse(tx: Prisma.TransactionClient, id: string) {
+    const trip = await tx.trip.findUnique({
+      where: { id },
+      include: {
+        package: { select: { nights: true } },
+        accommodations: { select: { nights: true } },
+        drivers: true,
+        supervisors: true,
+        seats: { select: { seatNumber: true } },
+        reverseTrip: { select: { id: true, tripStatus: true, _count: { select: { bookings: true } } } },
+      },
+    });
+    if (!trip || trip.reverseOfTripId || trip.convoyLeadId || trip.tripStatus !== 'DRAFT') return;
+    const draft = trip.reverseTrip?.tripStatus === 'DRAFT' ? trip.reverseTrip : null;
+    if (!trip.reverseEnabled) {
+      if (draft && draft._count.bookings === 0) await tx.trip.delete({ where: { id: draft.id } });
+      return;
+    }
+    // A return staff cancelled stays cancelled, as when opening.
+    if (trip.reverseTrip && !draft) return;
+
+    const departure = trip.reverseDepartureAt ?? (await this.defaultReverseDeparture(tx, trip));
+    if (!trip.reverseDepartureAt) await tx.trip.update({ where: { id }, data: { reverseDepartureAt: departure } });
+    const reached = reachesDestinationAt(trip);
+    const arrival = new Date(departure.getTime() + (reached > trip.departureTime ? reached.getTime() - trip.departureTime.getTime() : DEFAULT_TRIP_DURATION_MS));
+    const details = {
+      origin: trip.destination,
+      destination: trip.origin,
+      departureTime: departure,
+      arrivalTime: arrival,
+      hijriDate: toHijriLabel(departure),
+      price: trip.reversePrice ?? trip.price,
+      busId: trip.busId,
+      busType: trip.busType,
+      channelApp: trip.channelApp,
+      channelBranch: trip.channelBranch,
+    };
+    if (draft) {
+      await tx.trip.update({ where: { id: draft.id }, data: details });
+      return;
+    }
+    const route = this.reverseRoute(await this.defaultReverseOpening(id, tx), departure);
+    await tx.trip.create({
+      data: {
+        ...reverseCodeOf(trip),
+        ...details,
+        title: 'رحلة عكسية',
+        tripStatus: 'DRAFT',
+        direction: 'ONE_WAY',
+        reverseOfTripId: trip.id,
+        // The whole bus for now; opening puts on sale only what the way there left free.
+        totalSeats: trip.seats.length,
+        availableSeats: trip.seats.length,
+        seatLayout: storedSeatLayout(tripSeatLayout(trip)),
+        maxSeatsPerBooking: trip.maxSeatsPerBooking,
+        miqat: trip.miqat,
+        seats: { createMany: { data: trip.seats.map(({ seatNumber }) => ({ seatNumber })) } },
+        boardingPoints: { create: route.boardingPoints },
+        ...(route.itineraryStops.length && { itineraryStops: { create: route.itineraryStops } }),
+        drivers: { create: trip.drivers.map(({ userId, isPrimary }) => ({ userId, isPrimary })) },
+        supervisors: { create: trip.supervisors.map(({ userId, isPrimary }) => ({ userId, isPrimary })) },
+      },
+    });
+  }
+
+  private async defaultReverseOpening(id: string, db: Prisma.TransactionClient | PrismaService = this.prisma): Promise<OpenReverseTripDto> {
+    const trip = await db.trip.findUniqueOrThrow({
       where: { id },
       select: { origin: true, destination: true, reverseDepartureAt: true, channelApp: true, channelBranch: true },
     });
     const departure = trip.reverseDepartureAt ?? new Date();
-    const template = await this.prisma.trip.findFirst({
+    const template = await db.trip.findFirst({
       where: { reverseOfTripId: { not: null }, origin: trip.destination, destination: trip.origin, tripStatus: { not: 'CANCELLED' }, boardingPoints: { some: {} } },
       orderBy: { createdAt: 'desc' },
       select: {
@@ -1003,6 +1116,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
           convoy: { leadId: draft.id, order, code: convoyCodeOf(draft.tripCode, order) },
         });
       }
+      await this.syncDraftReverse(tx, draft.id);
       // The copy takes its place among the month's numbers by its departure date.
       await renumberPeriods(tx, [draft.codePeriod]);
       return tx.trip.findUniqueOrThrow({ where: { id: draft.id } });
@@ -1583,6 +1697,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
       // Crew only see published trips, so a draft is announced when it is published.
       if (trip.tripStatus === 'PUBLISHED') await this.notifications.toTripCrew(tx, 'CREW_TRIP_ASSIGNED', trip.id);
       for (const [idx, entry] of (dto.extraBuses ?? []).entries()) await this.addConvoyBus(tx, trip, entry, idx + 2, actor);
+      await this.syncDraftReverse(tx, trip.id);
       // The month's numbers follow the departure dates, so a trip made later for an earlier day takes the earlier number.
       await renumberPeriods(tx, [trip.codePeriod]);
       return withSeatPrice(await tx.trip.findUniqueOrThrow({ where: { id: trip.id }, include: ADMIN_TRIP_INCLUDE }));
@@ -1649,7 +1764,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
   private async openFollowerReverses(ids: string[]) {
     if (ids.length === 0) return;
     const due = await this.prisma.trip.findMany({
-      where: { id: { in: ids }, tripStatus: 'PUBLISHED', reverseEnabled: true, reverseTrip: null, reverseDepartureAt: { gt: new Date() } },
+      where: { id: { in: ids }, tripStatus: 'PUBLISHED', reverseEnabled: true, OR: [{ reverseTrip: null }, { reverseTrip: { tripStatus: 'DRAFT' } }], reverseDepartureAt: { gt: new Date() } },
       select: { id: true },
     });
     for (const trip of due) await this.autoOpenReverse(trip.id);
@@ -1879,6 +1994,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
       const followerIds = multiBus || dto.extraBuses ? await this.syncConvoy(tx, id, dto, actor, reason) : [];
       // A new date, a publish or the draft's code choice can change the trip's number and its month's order.
       const codeBefore = saved.tripCode;
+      await this.syncDraftReverse(tx, id);
       await syncTripCode(tx, id, dto.assignCode);
       const recoded = (await tx.trip.findUniqueOrThrow({ where: { id }, select: { tripCode: true } })).tripCode !== codeBefore;
       // The list of buses or the codes changed after the first was read, so it is read again.
@@ -1890,7 +2006,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
     if (startsSeries) this.extendSeriesLater(id);
     // Publishing the way there opens the way back with it; see openPendingReverses.
     const opensReverse =
-      result.tripStatus === 'PUBLISHED' && result.reverseEnabled && !result.reverseOfTripId && !result.reverseTrip && !!result.reverseDepartureAt && result.reverseDepartureAt > new Date();
+      result.tripStatus === 'PUBLISHED' && result.reverseEnabled && !result.reverseOfTripId && (!result.reverseTrip || result.reverseTrip.tripStatus === 'DRAFT') && !!result.reverseDepartureAt && result.reverseDepartureAt > new Date();
     const reverseTrip = opensReverse ? await this.autoOpenReverse(id) : null;
     await this.openFollowerReverses(followerIds);
     return { ...result, ...(reverseTrip && { reverseTrip }), seriesDrafting: startsSeries };
@@ -1920,7 +2036,12 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
         throw new ConflictException('لا يمكن تعديل رحلة ملغاة');
       }
       // A cancelled reverse sells nothing, so the outbound is free again: its direction can be corrected and the reverse opened anew.
-      const openReverse = existing.reverseTrip && existing.reverseTrip.tripStatus !== 'CANCELLED' ? existing.reverseTrip : null;
+      const openReverse = existing.reverseTrip && !['CANCELLED', 'DRAFT'].includes(existing.reverseTrip.tripStatus) ? existing.reverseTrip : null;
+      // A draft return is put on sale with its way there, never on its own: it would sell seats the way there has not settled.
+      if (existing.reverseOfTripId && existing.tripStatus === 'DRAFT' && dto.tripStatus === 'PUBLISHED') {
+        const outbound = await tx.trip.findUnique({ where: { id: existing.reverseOfTripId }, select: { tripStatus: true, tripCode: true } });
+        if (outbound?.tripStatus !== 'PUBLISHED') throw new BadRequestException(`تُنشر رحلة العودة تلقائيًا مع نشر رحلة الذهاب ${outbound?.tripCode ?? ''}`.trim());
+      }
       const now = new Date();
       let soldCount: number | undefined;
       const hasSales = async () => (soldCount ??= await tx.booking.count({ where: { tripId: id, status: { not: 'CANCELLED' } } })) > 0;
@@ -2359,7 +2480,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
 
     return trips.map((trip) => {
       // A cancelled reverse is out of the picture: this trip can open one again.
-      const reverse = trip.reverseTrip?.tripStatus === 'CANCELLED' ? null : trip.reverseTrip;
+      const reverse = trip.reverseTrip && ['CANCELLED', 'DRAFT'].includes(trip.reverseTrip.tripStatus) ? null : trip.reverseTrip;
       // With an open reverse the seat count includes seats closed by the link, so only real passengers count. Before that the two agree.
       const seatsTaken = trip.totalSeats - trip.availableSeats;
       const bookedSeats = reverse ? booked.get(trip.id)?.seats ?? 0 : seatsTaken;
@@ -2416,6 +2537,71 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
     });
   }
 
+  /**
+   * What the return trips screen warns about, so no way there goes without its way back:
+   * - a way there still ahead whose return is off or has no time, or is published with its return not opened (the sweep
+   *   could not open it, usually a busy bus or crew). A draft with its return set is fine: it opens on publishing.
+   * - an open return the app leaves out, with why, by the same rules as the app's search (appTripWhere).
+   */
+  async getReverseAlerts(actor?: RentActor) {
+    const now = new Date();
+    const city = actor?.userId ? await servedCity(this.prisma, { userId: actor.userId, permissions: actor.permissions }) : null;
+    const inCity = city ? [cityTripWhere(city)] : [];
+    const outbounds = await this.prisma.trip.findMany({
+      where: {
+        AND: inCity,
+        reverseOfTripId: null,
+        // Another bus of a trip gets its return with its first bus.
+        convoyLeadId: null,
+        tripStatus: { in: ['DRAFT', 'PUBLISHED'] },
+        departureTime: { gt: now },
+        OR: [
+          { reverseEnabled: false },
+          { reverseDepartureAt: null },
+          // Published with no return on sale; or a draft with no draft return (made before every draft got one).
+          { tripStatus: 'PUBLISHED', OR: [{ reverseTrip: null }, { reverseTrip: { tripStatus: { in: ['CANCELLED', 'DRAFT'] } } }] },
+          { tripStatus: 'DRAFT', reverseTrip: null },
+        ],
+      },
+      orderBy: { departureTime: 'asc' },
+      select: { id: true, tripCode: true, tripStatus: true, departureTime: true, reverseEnabled: true, reverseDepartureAt: true },
+    });
+    const returns = await this.prisma.trip.findMany({
+      where: { AND: inCity, reverseOfTripId: { not: null }, tripStatus: 'PUBLISHED', departureTime: { gt: now } },
+      orderBy: { departureTime: 'asc' },
+      select: { id: true, tripCode: true, departureTime: true, channelApp: true, salesClosedAt: true, bookingOpensAt: true, availableSeats: true, liveStatus: true },
+    });
+    return {
+      missingReturn: outbounds.map((trip) => ({
+        id: trip.id,
+        tripCode: trip.tripCode,
+        departureTime: trip.departureTime,
+        isDraft: trip.tripStatus === 'DRAFT',
+        reason: !trip.reverseEnabled
+          ? 'العودة غير مفعلة'
+          : !trip.reverseDepartureAt
+            ? 'بلا موعد عودة'
+            : trip.tripStatus === 'DRAFT'
+              ? 'لم تُنشأ رحلة عودتها بعد: احفظ الرحلة مرة أخرى أو شغّل سكربت الإصلاح'
+              : 'لم تُفتح بعد: غالبًا الباص أو الطاقم مشغول وقت العودة',
+      })),
+      hiddenFromApp: returns
+        .map((trip) => ({
+          id: trip.id,
+          tripCode: trip.tripCode,
+          departureTime: trip.departureTime,
+          reasons: [
+            !trip.channelApp && 'قناة التطبيق مغلقة',
+            trip.salesClosedAt && 'أُغلق الحجز',
+            trip.bookingOpensAt && trip.bookingOpensAt > now && 'لم يبدأ موعد فتح الحجز',
+            trip.availableSeats <= 0 && 'لا مقاعد متاحة',
+            trip.liveStatus !== 'NOT_STARTED' && 'انطلقت الحافلة',
+          ].filter((reason): reason is string => !!reason),
+        }))
+        .filter((trip) => trip.reasons.length > 0),
+    };
+  }
+
   async openReverseTrip(id: string, dto: OpenReverseTripDto, actor?: CrewActor) {
     return this.prisma.$transaction(async (tx) => {
       // A seat sold while this copies them would be on sale on both trips.
@@ -2432,7 +2618,8 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
       });
       if (!trip) throw new NotFoundException('Trip not found');
       if (!trip.reverseEnabled) throw new ConflictException('الرحلة العكسية غير مفعلة لهذه الرحلة');
-      if (trip.reverseTrip && trip.reverseTrip.tripStatus !== 'CANCELLED') throw new ConflictException('فُتحت الرحلة العكسية مسبقًا');
+      // A draft return, made with a draft way there (syncDraftReverse), is opened like a cancelled one: everything is set afresh.
+      if (trip.reverseTrip && !['CANCELLED', 'DRAFT'].includes(trip.reverseTrip.tripStatus)) throw new ConflictException('فُتحت الرحلة العكسية مسبقًا');
       // A completed outbound still counts: the bus has arrived and the way back is ahead of it.
       if (!['PUBLISHED', 'COMPLETED'].includes(trip.tripStatus)) throw new ConflictException('يجب أن تكون رحلة الذهاب منشورة');
       if (dto.channelApp === false && dto.channelBranch === false) throw new BadRequestException('اختر قناة حجز واحدة على الأقل');
@@ -2447,6 +2634,8 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
       // Only a round trip's passengers are still aboard coming back, so only their seats stay closed.
       const seatNumbers = trip.seats.filter((seat) => trip.direction === 'ONE_WAY' || !seat.isBooked).map((seat) => seat.seatNumber);
       if (seatNumbers.length === 0) throw new ConflictException('لا توجد مقاعد متبقية');
+      // A round trip's riders saved without a seat number come back too, though no seat shows it: their places are not for sale.
+      const available = Math.max(0, seatNumbers.length - (trip.direction === 'ROUND_TRIP' ? await seatlessRiders(tx, trip.id) : 0));
 
       const departure = trip.reverseDepartureAt;
       const route = this.reverseRoute(dto, departure);
@@ -2461,11 +2650,12 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
         supervisorIds,
         start: departure,
         end: arrival,
-        excludeTripIds: [trip.id],
+        // The draft return being opened holds this very window; it is not another trip.
+        excludeTripIds: [trip.id, ...(trip.reverseTrip ? [trip.reverseTrip.id] : [])],
       });
 
       if (trip.reverseTrip) {
-        const reopened = await this.reopenReverse(tx, trip.reverseTrip, trip, { departure, arrival, seatNumbers, dto, route }, actor);
+        const reopened = await this.reopenReverse(tx, trip.reverseTrip, trip, { departure, arrival, seatNumbers, available, dto, route }, actor);
         await this.linkConvoyReverses(tx, trip.convoyLeadId ?? trip.id);
         return reopened;
       }
@@ -2482,7 +2672,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
           busType: trip.busType,
           price: trip.reversePrice ?? trip.price,
           totalSeats: seatNumbers.length,
-          availableSeats: seatNumbers.length,
+          availableSeats: available,
           // Same vehicle, so the same plan; the seats on sale are the ones the outbound left free.
           seatLayout: storedSeatLayout(tripSeatLayout(trip)),
           maxSeatsPerBooking: trip.maxSeatsPerBooking,
@@ -2572,10 +2762,10 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
     tx: Prisma.TransactionClient,
     cancelled: { id: string; busId: string | null },
     outbound: { busId: string | null; seatLayout: Prisma.JsonValue; price: Prisma.Decimal; reversePrice: Prisma.Decimal | null; destination: string; origin: string; drivers: { userId: string; isPrimary: boolean }[]; supervisors: { userId: string; isPrimary: boolean }[] },
-    opening: { departure: Date; arrival: Date; seatNumbers: string[]; dto: OpenReverseTripDto; route: ReturnType<TripsService['reverseRoute']> },
+    opening: { departure: Date; arrival: Date; seatNumbers: string[]; available: number; dto: OpenReverseTripDto; route: ReturnType<TripsService['reverseRoute']> },
     actor?: CrewActor,
   ) {
-    const { departure, arrival, seatNumbers, dto, route } = opening;
+    const { departure, arrival, seatNumbers, available, dto, route } = opening;
     const previous = await tx.trip.findUniqueOrThrow({ where: { id: cancelled.id }, select: { drivers: { select: { userId: true } }, supervisors: { select: { userId: true } } } });
     await tx.seat.deleteMany({ where: { tripId: cancelled.id } });
     await tx.seat.createMany({ data: seatNumbers.map((seatNumber) => ({ tripId: cancelled.id, seatNumber })) });
@@ -2606,7 +2796,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
         hijriDate: toHijriLabel(departure),
         price: outbound.reversePrice ?? outbound.price,
         totalSeats: seatNumbers.length,
-        availableSeats: seatNumbers.length,
+        availableSeats: available,
         seatLayout: storedSeatLayout(tripSeatLayout(outbound)),
         busId: outbound.busId,
         channelApp: dto.channelApp ?? true,
@@ -2951,14 +3141,18 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
     if (trip.reverseOfTripId && trip.tripStatus !== 'CANCELLED' && (await returningBookingIds(this.prisma, trip.reverseOfTripId)).length > 0) {
       throw new ConflictException('لا يمكن حذف رحلة عكسية يرجع بها ركاب ذهاب وعودة');
     }
-    const reverseCount = await this.prisma.trip.count({ where: { reverseOfTripId: id } });
+    const reverseCount = await this.prisma.trip.count({ where: { reverseOfTripId: id, tripStatus: { not: 'DRAFT' } } });
     if (reverseCount > 0) {
       throw new ConflictException('لا يمكن حذف رحلة فُتحت لها رحلة عكسية');
     }
+    // Its draft return was made with it and sold nothing, so it goes too.
+    const draftReverse = await this.prisma.trip.findFirst({ where: { reverseOfTripId: id, tripStatus: 'DRAFT' }, select: { id: true, _count: { select: { bookings: true } } } });
+    if (draftReverse && draftReverse._count.bookings > 0) throw new ConflictException('Cannot delete trip with bookings');
     // With no bookings nobody was ever placed in its rooms, so its hotel stays go with it; they would otherwise hold the trip in place.
     await this.prisma.$transaction(async (tx) => {
       await lockPeriods(tx, [trip.codePeriod]);
       await tx.hotelBooking.deleteMany({ where: { tripId: id } });
+      if (draftReverse) await tx.trip.delete({ where: { id: draftReverse.id } });
       await tx.trip.delete({ where: { id } });
       // The month closes up behind it, so its numbers stay in date order without a gap.
       if (!trip.reverseOfTripId && !trip.convoyLeadId) await renumberPeriods(tx, [trip.codePeriod]);

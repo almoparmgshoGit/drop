@@ -9,7 +9,7 @@ import { AppSettingsService, withinHours } from '../../common/services/app-setti
 import { csvCell } from '../../common/utils/csv.util';
 import { invoiceNumber } from '../../common/utils/invoice.util';
 import { tripSeatLayout } from '../../common/utils/bus-layout.util';
-import { goOnlyBookings, lockTripsWithLinked, releaseLinkedSeats, returnRideOf, reverseSeatsSummary, takeLinkedSeats } from '../../common/utils/linked-seats.util';
+import { goOnlyBookings, hasOtherLeg, lockTripsWithLinked, releaseLinkedPlaces, releaseLinkedSeats, returnRideOf, reverseSeatsSummary, takeLinkedSeats } from '../../common/utils/linked-seats.util';
 import { passengerWeights } from '../../common/utils/housing-price.util';
 import { paymentFigures } from '../../common/utils/payment.util';
 import { normalizeSaudiPhone } from '../../common/utils/phone.util';
@@ -38,7 +38,7 @@ export interface BookingsActor {
 
 const LIST_INCLUDE = {
   branch: { select: { id: true, name: true } },
-  trip: { select: { id: true, tripCode: true, origin: true, destination: true, departureTime: true, estimatedArrivalAt: true, busType: true, bookingType: true } },
+  trip: { select: { id: true, tripCode: true, origin: true, destination: true, departureTime: true, estimatedArrivalAt: true, busType: true, bookingType: true, direction: true } },
   passengers: { orderBy: { position: 'asc' }, select: { id: true, fullName: true, phone: true, nationalId: true, gender: true, nationality: true, seatNumber: true, hotelRoom: { select: { number: true, type: true, hotelBooking: { select: { hotel: { select: { id: true, name: true } } } } } }, ticket: TICKET_SELECT } },
   payment: true,
   collections: { select: { amount: true } },
@@ -515,8 +515,10 @@ export class BookingsAdminService {
           data: { isBooked: false, heldByUserId: null, heldUntil: null },
         });
       }
-      await takeLinkedSeats(tx, booking.tripId, [seatNumber], holdAvailableTo(actorId, new Date()));
+      const tookSeat = await takeLinkedSeats(tx, booking.tripId, [seatNumber], holdAvailableTo(actorId, new Date()));
       if (passenger.seatNumber) await releaseLinkedSeats(tx, booking.tripId, [passenger.seatNumber]);
+      // A seatless rider held a place there by count; the seat now holds it, so the count goes back.
+      else if (tookSeat > 0 && !(await hasOtherLeg(tx, booking))) await releaseLinkedPlaces(tx, booking.tripId, tookSeat);
       await tx.bookingPassenger.update({ where: { id: passengerId }, data: { seatNumber } });
 
       // A new number retires the old one, so a saved copy of the previous ticket stops working at the door.

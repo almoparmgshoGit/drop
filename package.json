@@ -13,6 +13,7 @@
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate deploy",
     "admin:set": "ts-node prisma/set-admin.ts",
+    "returns:fix": "ts-node prisma/fix-returns.ts",
     "test:e2e": "jest --config test/jest-e2e.json --runInBand"
   },
   "dependencies": {

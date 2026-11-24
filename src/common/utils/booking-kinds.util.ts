@@ -40,6 +40,13 @@ export const BOOKING_KIND_DIRECTIONS: Record<BookingKind, string> = {
   PACKAGE_ROUND_NO_STAY: 'ذهاب وعودة',
 };
 
+/**
+ * A booking of the way there alone on a round trip (ذهاب وعودة) still rides back on its own seat, as the trip promises:
+ * the counter's default "ذهاب فقط" and the app's single leg both land here, so its label says ذهاب وعودة.
+ */
+const onRoundTripBus = (kind: BookingKind, tripDirection: string | null | undefined) =>
+  tripDirection === 'ROUND_TRIP' && (kind === 'TRANSPORT_OUTBOUND' || kind === 'PACKAGE_OUTBOUND_STAY');
+
 const HOTEL_SERVICES: BookingServiceType[] = ['WITH_HOTEL', 'WITH_HOTEL_VISITS'];
 const VISIT_SERVICES: BookingServiceType[] = ['WITH_VISITS', 'WITH_HOTEL_VISITS'];
 
@@ -49,12 +56,18 @@ export const serviceHasStay = (serviceType: string | null | undefined) => HOTEL_
 export const serviceHasVisits = (serviceType: string | null | undefined) => VISIT_SERVICES.includes(serviceType as BookingServiceType);
 
 /**
- * The one label for a booking's type, built only from what is stored on the booking, so the bookings list, the booking's
+ * The one label for a booking's type, built from what is stored on the booking, so the bookings list, the booking's
  * page, the manifest, the invoice and the app all say the same thing: "نقل مع سكن · ذهاب فقط", with "باقة ·" before a package.
+ * Given the booking's trip, a way-there-only kind on a round trip reads ذهاب وعودة (see onRoundTripBus).
  */
-export function bookingTypeLabel(booking: { serviceType?: BookingServiceType | string | null; kind?: BookingKind | string | null }) {
+export function bookingTypeLabel(booking: {
+  serviceType?: BookingServiceType | string | null;
+  kind?: BookingKind | string | null;
+  // Any trip the caller selected; only its direction is read, and a caller without one gets the kind's own words.
+  trip?: { direction?: string | null; [field: string]: unknown } | null;
+}) {
   const service = BOOKING_SERVICE_LABELS[(booking.serviceType ?? 'TRANSPORT_ONLY') as BookingServiceType] ?? BOOKING_SERVICE_LABELS.TRANSPORT_ONLY;
   const kind = booking.kind as BookingKind | null | undefined;
-  const direction = kind ? BOOKING_KIND_DIRECTIONS[kind] : null;
+  const direction = kind ? (onRoundTripBus(kind, booking.trip?.direction) ? 'ذهاب وعودة' : BOOKING_KIND_DIRECTIONS[kind]) : null;
   return [kind?.startsWith('PACKAGE_') ? 'باقة' : null, service, direction].filter(Boolean).join(' · ');
 }

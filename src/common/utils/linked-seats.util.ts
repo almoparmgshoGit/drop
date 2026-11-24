@@ -1,5 +1,5 @@
 import { ConflictException } from '@nestjs/common';
-import { BookingKind, BookingStatus, Prisma } from '@prisma/client';
+import { BookingStatus, Prisma } from '@prisma/client';
 
 const HOLDS_A_SEAT: BookingStatus[] = ['CONFIRMED', 'BOARDED', 'PENDING_CANCELLATION_REVIEW'];
 
@@ -29,21 +29,67 @@ async function withoutOtherLeg<T extends { tripId: string; groupReference: strin
   return bookings.filter((booking) => !legs.some((leg) => leg.groupReference === booking.groupReference && leg.tripId !== booking.tripId));
 }
 
-/**
- * Bookings bought as the way there alone ("ذهاب فقط"). The counter sells that on a round trip too, and then only the booking's
- * own kind says so. It is the same word the manifest and the bookings list show beside the passenger, so they cannot disagree.
- */
-const OUTBOUND_ONLY_KINDS: BookingKind[] = ['TRANSPORT_OUTBOUND', 'PACKAGE_OUTBOUND_STAY'];
+/** The linked reverse of a way there, or null for a reverse itself and for trips with no link (see linkedTripId). */
+async function reverseOfOutbound(tx: Prisma.TransactionClient, tripId: string) {
+  const trip = await tx.trip.findUnique({ where: { id: tripId }, select: { reverseOfTripId: true } });
+  return trip && !trip.reverseOfTripId ? linkedTripId(tx, tripId) : null;
+}
 
-/** Bookings with no ride back on trips with a reverse enabled (every one of a one-way trip's, or bought as ذهاب فقط), and their seats. */
+/** Whether the booking has an active leg on another trip, so it rides that leg and not this trip's linked one. */
+export async function hasOtherLeg(db: Pick<Prisma.TransactionClient, 'booking'>, booking: { tripId: string; groupReference: string | null }) {
+  return (await withoutOtherLeg(db, [booking])).length === 0;
+}
+
+/**
+ * Places, not seats. The counter may save a passenger without a seat number, and the seat link above only works by number,
+ * so such a passenger of a linked pair took nothing on the other trip: the reverse kept selling the place of every seatless
+ * round-trip rider. They take a place there by count instead, as the trip's own capacity counts them. A booking with its own
+ * leg on another trip rides that leg and takes nothing. `soft` takes what is left rather than refusing, for a journey sent
+ * home on its own trip again after a cancellation, which must not fail.
+ * Only from a way there to its reverse: a return-only passenger without a seat is not on the way there at all.
+ */
+export async function takeLinkedPlaces(tx: Prisma.TransactionClient, tripId: string, count: number, options: { hasOtherLeg?: boolean; soft?: boolean } = {}) {
+  if (count <= 0 || options.hasOtherLeg) return;
+  const linkedId = await reverseOfOutbound(tx, tripId);
+  if (!linkedId) return;
+  if (options.soft) {
+    const linked = await tx.trip.findUnique({ where: { id: linkedId }, select: { availableSeats: true } });
+    const take = Math.min(count, Math.max(0, linked?.availableSeats ?? 0));
+    if (take > 0) await tx.trip.update({ where: { id: linkedId }, data: { availableSeats: { decrement: take } } });
+    return;
+  }
+  const taken = await tx.trip.updateMany({ where: { id: linkedId, availableSeats: { gte: count } }, data: { availableSeats: { decrement: count } } });
+  if (taken.count !== 1) {
+    const linked = await tx.trip.findUnique({ where: { id: linkedId }, select: { tripCode: true } });
+    throw new ConflictException(`لا توجد أماكن كافية في الرحلة المرتبطة ${linked?.tripCode ?? ''}، فلا مكان لهؤلاء الركاب في طريق العودة`);
+  }
+}
+
+/** Gives back the places takeLinkedPlaces took: a seatless rider cancelled, or given a seat, which now holds their place. */
+export async function releaseLinkedPlaces(tx: Prisma.TransactionClient, tripId: string, count: number) {
+  if (count <= 0) return;
+  const linkedId = await reverseOfOutbound(tx, tripId);
+  if (!linkedId) return;
+  await tx.trip.update({ where: { id: linkedId }, data: { availableSeats: { increment: count } } });
+}
+
+/** Passengers riding this trip without a seat number and with no leg elsewhere: the places they hold on its linked trip. */
+export async function seatlessRiders(db: Pick<Prisma.TransactionClient, 'booking'>, tripId: string) {
+  const bookings = await db.booking.findMany({
+    where: { tripId, status: { in: HOLDS_A_SEAT }, passengers: { some: { seatNumber: null } } },
+    select: { tripId: true, groupReference: true, passengers: { where: { seatNumber: null }, select: { id: true } } },
+  });
+  return (await withoutOtherLeg(db, bookings)).reduce((sum, booking) => sum + booking.passengers.length, 0);
+}
+
+/**
+ * Bookings on one-way trips with a reverse enabled that have no return leg, and how many seats they free coming back.
+ * The trip's direction decides, not the booking's kind: on a round trip everyone rides back on their own seat (see the trip
+ * form's help), even a booking the counter recorded as ذهاب فقط, whose label says ذهاب وعودة for that reason.
+ */
 export async function goOnlyBookings(db: Pick<Prisma.TransactionClient, 'booking'>, tripIds: string[]) {
   const bookings = await db.booking.findMany({
-    where: {
-      tripId: { in: tripIds },
-      status: { in: HOLDS_A_SEAT },
-      trip: { reverseEnabled: true },
-      OR: [{ trip: { direction: 'ONE_WAY' } }, { kind: { in: OUTBOUND_ONLY_KINDS } }],
-    },
+    where: { tripId: { in: tripIds }, status: { in: HOLDS_A_SEAT }, trip: { direction: 'ONE_WAY', reverseEnabled: true } },
     select: { id: true, tripId: true, groupReference: true, _count: { select: { passengers: true } } },
   });
 
@@ -62,13 +108,7 @@ export async function goOnlyBookings(db: Pick<Prisma.TransactionClient, 'booking
  */
 export async function returningBookingIds(db: Pick<Prisma.TransactionClient, 'booking'>, outboundId: string) {
   const bookings = await db.booking.findMany({
-    where: {
-      tripId: outboundId,
-      status: { in: HOLDS_A_SEAT },
-      trip: { direction: 'ROUND_TRIP' },
-      // Bought as ذهاب فقط, it stays at the destination and is not on the way-back sheet. A booking from before kinds has none.
-      OR: [{ kind: null }, { kind: { notIn: OUTBOUND_ONLY_KINDS } }],
-    },
+    where: { tripId: outboundId, status: { in: HOLDS_A_SEAT }, trip: { direction: 'ROUND_TRIP' } },
     select: { id: true, tripId: true, groupReference: true },
   });
   return (await withoutOtherLeg(db, bookings)).map((booking) => booking.id);
@@ -138,11 +178,7 @@ export async function manifestSeatsByTrip(
   );
   if (reverseOf.size > 0) {
     const outbound = await db.booking.findMany({
-      where: {
-        tripId: { in: [...reverseOf.keys()] },
-        status: { in: HOLDS_A_SEAT },
-        OR: [{ kind: null }, { kind: { notIn: OUTBOUND_ONLY_KINDS } }],
-      },
+      where: { tripId: { in: [...reverseOf.keys()] }, status: { in: HOLDS_A_SEAT } },
       select: { tripId: true, groupReference: true, _count: { select: { passengers: true } } },
     });
     for (const booking of await withoutOtherLeg(db, outbound)) {
@@ -157,13 +193,18 @@ export async function manifestSeatsByTrip(
 export async function reverseSeatsSummary(db: Pick<Prisma.TransactionClient, 'booking' | 'trip'>, tripId: string) {
   const trip = await db.trip.findUnique({
     where: { id: tripId },
-    select: { reverseEnabled: true, reverseTrip: { select: { id: true, tripCode: true, tripStatus: true, availableSeats: true } } },
+    select: { direction: true, reverseEnabled: true, reverseTrip: { select: { id: true, tripCode: true, tripStatus: true, availableSeats: true } } },
   });
   if (!trip?.reverseEnabled) return null;
   const { seatsByTrip } = await goOnlyBookings(db, [tripId]);
   const reverse = trip.reverseTrip;
   const booked = reverse ? await bookedOnTrips(db, [reverse.id]) : null;
+  // A round trip's passengers ride back on the reverse, so its sheet says how many; a one-way trip's say how many seats they free.
+  const returning = trip.direction === 'ROUND_TRIP' ? await returningBookingIds(db, tripId) : [];
+  const returningSeats = returning.length ? await db.booking.findMany({ where: { id: { in: returning } }, select: { _count: { select: { passengers: true } } } }) : [];
   return {
+    direction: trip.direction,
+    returningSeats: returningSeats.reduce((sum, booking) => sum + booking._count.passengers, 0),
     goOnlySeats: seatsByTrip.get(tripId) ?? 0,
     isOpen: reverse?.tripStatus === 'PUBLISHED',
     tripCode: reverse?.tripCode ?? null,
@@ -207,21 +248,23 @@ export async function takeLinkedSeats(
   seatNumbers: string[],
   available: Prisma.SeatWhereInput,
   options: { returnsOnOtherLeg?: boolean } = {},
-) {
+): Promise<number> {
   if (options.returnsOnOtherLeg) {
     const trip = await tx.trip.findUnique({ where: { id: tripId }, select: { reverseOfTripId: true } });
-    if (trip && !trip.reverseOfTripId) return;
+    if (trip && !trip.reverseOfTripId) return 0;
   }
   const linkedId = await linkedTripId(tx, tripId);
-  if (!linkedId) return;
+  if (!linkedId) return 0;
   const existing = await tx.seat.count({ where: { tripId: linkedId, seatNumber: { in: seatNumbers } } });
-  if (existing === 0) return;
+  if (existing === 0) return 0;
   const taken = await tx.seat.updateMany({
     where: { tripId: linkedId, seatNumber: { in: seatNumbers }, ...available },
     data: { isBooked: true, heldByUserId: null, heldUntil: null },
   });
   if (taken.count !== existing) throw new ConflictException('بعض المقاعد المختارة لم تعد متاحة، يرجى اختيار مقاعد أخرى');
   await tx.trip.update({ where: { id: linkedId }, data: { availableSeats: { decrement: taken.count } } });
+  // How many places it took there, so a seatless rider given a seat can hand back the place they held by count.
+  return taken.count;
 }
 
 /**

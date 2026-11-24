@@ -159,7 +159,8 @@ export class ManifestsService {
           bookingStatus: booking.status,
           bookingUpdatedAt: booking.updatedAt,
           // The booking's own type, the same words as the bookings list, its page, the invoice and the app.
-          bookingKind: bookingTypeLabel(booking),
+          // A rider coming back was booked on its round trip's way there, whatever this sheet's own direction.
+          bookingKind: bookingTypeLabel({ ...booking, trip: { direction: isReturning ? 'ROUND_TRIP' : trip.direction } }),
           leg: booking.leg,
           goOnly: goOnly.has(booking.id),
           branchName: booking.branch?.name ?? null,
@@ -338,6 +339,7 @@ export class ManifestsService {
     const trip = await this.prisma.trip.findUnique({
       where: { id: tripId },
       select: {
+        direction: true,
         busRentalPrice: true,
         accommodations: { select: { nights: true } },
         hotelBookings: {
@@ -412,7 +414,7 @@ export class ManifestsService {
           fullName: passenger.fullName,
           seatNumber: passenger.seatNumber,
           bookingReference: booking.bookingReference,
-          bookingType: bookingTypeLabel(booking),
+          bookingType: bookingTypeLabel({ ...booking, trip: { direction: trip.direction } }),
           nights: trip.accommodations[0]?.nights ?? null,
           price: toSar(prices[idx]),
           cash: toSar(cashShares[idx]),

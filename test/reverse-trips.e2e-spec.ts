@@ -435,11 +435,25 @@ describe('Reverse trips (e2e)', () => {
       const told = () => prisma.notification.count({ where: { tripId: trip.id, event: 'REVERSE_TRIP_READY', userId: admin.user.id } });
       await sweep();
       expect(await told()).toBe(1);
-      expect(await prisma.trip.count({ where: { reverseOfTripId: trip.id } })).toBe(0);
+      // Only the draft return made with the draft way there: nothing opened for sale.
+      expect(await prisma.trip.count({ where: { reverseOfTripId: trip.id, tripStatus: { not: 'DRAFT' } } })).toBe(0);
 
       await edit(trip.id, { channelApp: true }).expect(200);
       expect(await prisma.trip.count({ where: { reverseOfTripId: trip.id, tripStatus: 'PUBLISHED' } })).toBe(1);
       expect(await told()).toBe(1);
+    });
+
+    it('makes a draft way there with its draft way back, which goes on sale only with it', async () => {
+      const trip = await createPublished('ONE_WAY', { tripStatus: 'DRAFT' });
+      const draft = await prisma.trip.findFirstOrThrow({ where: { reverseOfTripId: trip.id } });
+      expect(draft.tripStatus).toBe('DRAFT');
+      // Published on its own it would sell seats the way there has not settled.
+      await edit(draft.id, { tripStatus: 'PUBLISHED' }).expect(400);
+
+      await edit(trip.id, { tripStatus: 'PUBLISHED' }).expect(200);
+      const opened = await prisma.trip.findUniqueOrThrow({ where: { id: draft.id } });
+      expect(opened.tripStatus).toBe('PUBLISHED');
+      expect(await prisma.trip.count({ where: { reverseOfTripId: trip.id } })).toBe(1);
     });
   });
 

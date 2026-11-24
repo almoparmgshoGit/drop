@@ -8,7 +8,7 @@ import { WalletService } from './wallet.service';
 import { InvoiceLedgerService } from './invoice-ledger.service';
 import { PaymentLedgerService, refundMethodLabel } from './payment-ledger.service';
 import { WaitlistService } from './waitlist.service';
-import { lockTripsWithLinked, releaseLinkedSeats, retakeReturnSeats } from '../utils/linked-seats.util';
+import { hasOtherLeg, lockTripsWithLinked, releaseLinkedPlaces, releaseLinkedSeats, retakeReturnSeats, takeLinkedPlaces } from '../utils/linked-seats.util';
 import { halalas, paymentFigures, splitOriginalRefund } from '../utils/payment.util';
 
 /**
@@ -101,6 +101,8 @@ export class BookingCancellationService {
       data: { availableSeats: { increment: booking.passengers.length } },
     });
     await releaseLinkedSeats(tx, booking.tripId, seatNumbers);
+    // The places its seatless passengers held on the linked trip, unless it rode another leg and so held none there.
+    if (!(await hasOtherLeg(tx, booking))) await releaseLinkedPlaces(tx, booking.tripId, booking.passengers.length - seatNumbers.length);
     await this.returnHomeOnOwnTrip(tx, booking);
     // The freed seats go first to whoever is waiting for this trip; a whole trip being cancelled has nothing to offer.
     if (options.notifyAs !== 'TRIP_CANCELLED') await this.waitlist.offerFreedSeats(tx, booking.tripId);
@@ -198,6 +200,8 @@ export class BookingCancellationService {
     if (outbound.trip.direction !== 'ROUND_TRIP' || outbound.trip.reverseOfTripId) return;
     await lockTripsWithLinked(tx, [outbound.tripId]);
     await retakeReturnSeats(tx, outbound.tripId, outbound.passengers.map((passenger) => passenger.seatNumber).filter((seat): seat is string => !!seat));
+    // Its passengers without a seat number come back too, on whatever places are left there.
+    await takeLinkedPlaces(tx, outbound.tripId, outbound.passengers.filter((passenger) => !passenger.seatNumber).length, { soft: true });
   }
 
   private async releaseVoucher(tx: Prisma.TransactionClient, booking: { id: string; couponId: string | null; groupReference: string | null }) {
