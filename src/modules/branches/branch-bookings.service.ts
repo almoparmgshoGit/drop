@@ -24,7 +24,7 @@ import { CollectionsService } from '../cash/collections.service';
 import { CreateJourneyDto, CustomerDto, JourneyQuoteDto, TripSearchQuery } from './branches.dto';
 import { identityData, idTypeOfNumber } from '../../common/utils/identity.util';
 import { cityTripWhere, servedCity } from '../../common/utils/branch-city.util';
-import { PACKAGE_PRICE_SELECT, packageGroupTotal, packagePriceTiers } from '../../common/utils/package-price.util';
+import { PACKAGE_MAX_PERSONS, PACKAGE_PRICE_SELECT, packageGroupTotal, packagePriceTiers } from '../../common/utils/package-price.util';
 import { seatPricing } from '../../common/utils/dynamic-pricing.util';
 import { assertBookingOpened, bookingOpenedWhere } from '../../common/utils/booking-opens.util';
 import { compareSeats, seatLabel } from '../../common/utils/seat-label.util';
@@ -70,6 +70,7 @@ const JOURNEY_TRIP = {
   housingPriceMode: true,
   privateRoomPriceBasis: true,
   housingPricePeriod: true,
+  packageId: true,
   package: { select: { ...PACKAGE_PRICE_SELECT, status: true } },
   hotelBookings: { where: { status: 'CONFIRMED' as const }, select: { hotelId: true } },
   convoyLeadId: true,
@@ -149,11 +150,11 @@ export class BranchBookingsService {
     };
   }
 
-  async searchTrips(query: TripSearchQuery, actor?: { userId: string; permissions: string[] }) {
-    const now = new Date();
+  /** What the counter may sell now: published to branches, not yet left, opened for booking, in the branch's city. */
+  private async openTripsWhere(now: Date, actor?: { userId: string; permissions: string[] }): Promise<Prisma.TripWhereInput> {
     // A city's branch sells its city's trips: leaving from it or arriving at it.
     const city = actor ? await servedCity(this.prisma, actor) : null;
-    const open: Prisma.TripWhereInput = {
+    return {
       tripStatus: 'PUBLISHED' as const,
       channelBranch: true,
       salesClosedAt: null,
@@ -161,17 +162,14 @@ export class BranchBookingsService {
       // The counter sells only what the app could: a trip waiting for its opening day stays out of the picker.
       AND: [{ OR: [{ packageId: null }, { package: { status: 'PUBLISHED' as const } }] }, bookingOpenedWhere(now), ...(city ? [cityTripWhere(city)] : [])],
     };
-    const day = query.date ? new Date(`${query.date}T00:00:00+03:00`) : null;
-    const [items, places] = await Promise.all([
-      this.prisma.trip.findMany({
-        where: {
-          ...open,
-          ...(query.origin && { origin: query.origin }),
-          ...(query.destination && { destination: query.destination }),
-          ...(day && { departureTime: { gte: day > now ? day : now, lt: new Date(day.getTime() + DAY_MS) } }),
-        },
+  }
+
+  /** Trips as the counter lists them: one bus per convoy, the linked trip the other way, the hotel and the price. */
+  private async counterTrips(where: Prisma.TripWhereInput, take = 100) {
+    const items = await this.prisma.trip.findMany({
+        where,
         orderBy: { departureTime: 'asc' },
-        take: 100,
+        take,
         select: {
           id: true,
           tripCode: true,
@@ -192,13 +190,11 @@ export class BranchBookingsService {
           reverseTrip: { select: { id: true, convoyLeadId: true } },
           convoyLeadId: true,
           convoyOrder: true,
+          packageId: true,
         },
-      }),
-      this.prisma.trip.findMany({ where: open, distinct: ['origin', 'destination'], select: { origin: true, destination: true } }),
-    ]);
-    return {
-      // A trip on several buses sells its buses in order, at the counter as in the app.
-      items: oneBusPerConvoy(items).map(({ package: pack, price, pricingRules, hotelBookings, reverseOfTripId, reverseOf, reverseTrip, ...trip }) => ({
+      });
+    // A trip on several buses sells its buses in order, at the counter as in the app.
+    return oneBusPerConvoy(items).map(({ package: pack, price, pricingRules, hotelBookings, reverseOfTripId, reverseOf, reverseTrip, ...trip }) => ({
         ...trip,
         // The trip it is linked to in the other direction, either way round, so a round trip books the pair together.
         linkedTripId: reverseTrip?.id ?? reverseOfTripId ?? null,
@@ -209,10 +205,56 @@ export class BranchBookingsService {
         price: pack ? Number(pack.price) : seatPricing({ price, pricingRules, ...trip }).price / 100,
         basePrice: Number(pack?.price ?? price),
         packagePriceTiers: pack ? packagePriceTiers(pack) : null,
-      })),
+      }));
+  }
+
+  async searchTrips(query: TripSearchQuery, actor?: { userId: string; permissions: string[] }) {
+    const now = new Date();
+    const open = await this.openTripsWhere(now, actor);
+    const day = query.date ? new Date(`${query.date}T00:00:00+03:00`) : null;
+    const [items, places] = await Promise.all([
+      this.counterTrips({
+        ...open,
+        ...(query.origin && { origin: query.origin }),
+        ...(query.destination && { destination: query.destination }),
+        ...(day && { departureTime: { gte: day > now ? day : now, lt: new Date(day.getTime() + DAY_MS) } }),
+      }),
+      this.prisma.trip.findMany({ where: open, distinct: ['origin', 'destination'], select: { origin: true, destination: true } }),
+    ]);
+    return {
+      items,
       origins: [...new Set(places.map((place) => place.origin))].sort(),
       destinations: [...new Set(places.map((place) => place.destination))].sort(),
     };
+  }
+
+  /**
+   * The company's fixed packages the counter can sell: each with its departures (the package's outbound trips) and the
+   * trips back that carry the same package. Dates, nights and prices come from the package; the counter picks the size.
+   */
+  async fixedPackages(actor?: { userId: string; permissions: string[] }) {
+    const now = new Date();
+    const open = await this.openTripsWhere(now, actor);
+    const packaged: Prisma.TripWhereInput = { ...open, package: { kind: 'FIXED', status: 'PUBLISHED' } };
+    const [outbound, back] = await Promise.all([
+      this.counterTrips({ ...packaged, reverseOfTripId: null }, 300),
+      this.counterTrips({ ...packaged, reverseOfTripId: { not: null } }, 300),
+    ]);
+    const ids = [...new Set(outbound.map((trip) => trip.packageId).filter((id): id is string => !!id))];
+    if (ids.length === 0) return [];
+    const packages = await this.prisma.package.findMany({
+      where: { id: { in: ids } },
+      orderBy: { name: 'asc' },
+      select: { id: true, name: true, description: true, nights: true, startDate: true, endDate: true, ...PACKAGE_PRICE_SELECT, services: { select: { service: { select: { name: true } } } } },
+    });
+    return packages.map(({ services, price, price2, price3, price4, ...pkg }) => ({
+      ...pkg,
+      services: services.map((row) => row.service.name),
+      priceTiers: packagePriceTiers({ price, price2, price3, price4 }),
+      maxPersons: PACKAGE_MAX_PERSONS,
+      departures: outbound.filter((trip) => trip.packageId === pkg.id),
+      returns: back.filter((trip) => trip.packageId === pkg.id),
+    }));
   }
 
   async seatMap(tripId: string) {
@@ -494,8 +536,16 @@ export class BranchBookingsService {
       roundJourney && outboundListed && listed.every((row) => !row.trip.package)
         ? allocate(outboundListed.transport, listed.map((row) => row.transport))
         : null;
-    const priced = roundShares
-      ? listed.map((row, index) => ({ ...row, transport: roundShares[index], unitPrice: row.seats.length ? Math.round(roundShares[index] / row.seats.length) : row.unitPrice }))
+    // A fixed package booked with its outbound and its linked return: both trips carry the package, whose group total is the
+    // whole price, so it is charged once and split between the two tickets instead of once on each.
+    const packageIds = new Set(listed.map((row) => row.trip.packageId));
+    const packageShares =
+      listed.length === 2 && packageIds.size === 1 && listed[0].trip.package
+        ? allocate(packageGroupTotal(listed[0].trip.package, persons), listed.map(() => 1))
+        : null;
+    const shares = roundShares ?? packageShares;
+    const priced = shares
+      ? listed.map((row, index) => ({ ...row, transport: shares[index], unitPrice: row.seats.length ? Math.round(shares[index] / row.seats.length) : row.unitPrice }))
       : listed;
     const outboundTrip = priced.find((row) => row.leg.leg === 'OUTBOUND')?.trip;
     const returnTrip = priced.find((row) => row.leg.leg === 'RETURN')?.trip;

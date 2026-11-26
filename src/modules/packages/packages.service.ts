@@ -10,11 +10,21 @@ import { CreatePackageDto, CustomJourneyQuery, CustomPreviewDto, PackageSearchQu
 import {
   CUSTOM_PACKAGE_MAX_NIGHTS,
   CUSTOM_PACKAGE_SELECT,
+  HOTEL_PACKAGE_SELECT,
   customPackageStay,
+  customRoomOptions,
+  hotelCustomPackage,
   loadCustomPackage,
   riyadhHour,
   toPublicCustomPackage,
 } from '../../common/utils/custom-package.util';
+
+/** One city written two ways ("مكة" and "مكة المكرمة") is still one city. */
+const sameCity = (a: string | null | undefined, b: string | null | undefined) => {
+  const x = (a ?? '').trim();
+  const y = (b ?? '').trim();
+  return !!x && !!y && (x === y || x.includes(y) || y.includes(x));
+};
 
 /** How far ahead the package builder lists days to travel on. */
 const JOURNEY_DAYS_AHEAD = 120;
@@ -140,7 +150,18 @@ export class PackagesService {
    * package takes and a return the other way, both still on sale with a seat. A route without trips is left out.
    */
   async getCustomRoutes() {
-    const packages = await this.getCustomPackages({});
+    const now = new Date();
+    const until = new Date(now.getTime() + JOURNEY_DAYS_AHEAD * DAY_MS);
+    const [packages, hotels, pairs] = await Promise.all([
+      this.getCustomPackages({}),
+      this.hotelsForPackages(),
+      // Every route with transport trips on sale: the customer builds a package on any of them that has a hotel.
+      this.prisma.trip.findMany({
+        where: { ...appTripWhere({}), packageId: null, availableSeats: { gt: 0 }, departureTime: { gt: now, lt: until }, AND: [...(appTripWhere({}).AND as Prisma.TripWhereInput[]), bookingTypeWhere('TRANSPORT_ONLY')] },
+        distinct: ['origin', 'destination'],
+        select: { origin: true, destination: true },
+      }),
+    ]);
     const routes = new Map<string, { origin: string; destination: string; minHour: number }>();
     for (const pkg of packages) {
       if (!pkg.origin || !pkg.destination) continue;
@@ -148,8 +169,11 @@ export class PackagesService {
       const known = routes.get(key);
       routes.set(key, { origin: pkg.origin, destination: pkg.destination, minHour: Math.min(known?.minHour ?? 24, pkg.minDepartureHour) });
     }
-    const now = new Date();
-    const until = new Date(now.getTime() + JOURNEY_DAYS_AHEAD * DAY_MS);
+    // A hotel's own prices take any outbound, at any hour.
+    for (const pair of pairs) {
+      if (!hotels.some((hotel) => sameCity(hotel.city, pair.destination))) continue;
+      routes.set(`${pair.origin}→${pair.destination}`, { origin: pair.origin, destination: pair.destination, minHour: 0 });
+    }
     const legWhere = (from: string, to: string): Prisma.TripWhereInput => {
       const base = appTripWhere({});
       return {
@@ -182,14 +206,21 @@ export class PackagesService {
    */
   async getCustomJourney(query: CustomJourneyQuery) {
     const persons = query.persons ?? 1;
-    const found = await this.getCustomPackages({ origin: query.origin, destination: query.destination });
-    if (found.length === 0) {
-      return { origin: query.origin ?? null, destination: query.destination ?? null, maxNights: CUSTOM_PACKAGE_MAX_NIGHTS, packages: [], outbound: [], inbound: [] };
-    }
-    // The search matches loosely; the trips must run exactly on the package's route, as the booking checks.
-    const origin = found[0].origin!;
-    const destination = found[0].destination!;
-    const packages = found.filter((pkg) => pkg.origin === origin && pkg.destination === destination);
+    const [found, hotels] = await Promise.all([this.getCustomPackages({ origin: query.origin, destination: query.destination }), this.hotelsForPackages()]);
+    // The search matches loosely; the trips must run exactly on the route, as the booking checks. An office package names
+    // it; without one the app asks with the route it was given.
+    const origin = found[0]?.origin ?? query.origin?.trim();
+    const destination = found[0]?.destination ?? query.destination?.trim();
+    const empty = { origin: origin ?? null, destination: destination ?? null, maxNights: CUSTOM_PACKAGE_MAX_NIGHTS, packages: [], outbound: [], inbound: [] };
+    if (!origin || !destination) return empty;
+    const published = found.filter((pkg) => pkg.origin === origin && pkg.destination === destination);
+    // Every other priced hotel in the destination city, as a package the customer builds on its own prices.
+    const taken = new Set(published.map((pkg) => pkg.hotel?.id));
+    const fromHotels = hotels
+      .filter((hotel) => sameCity(hotel.city, destination) && !taken.has(hotel.id))
+      .map((hotel) => ({ ...toPublicCustomPackage(hotelCustomPackage(hotel)), origin, destination }));
+    const packages = [...published, ...fromHotels];
+    if (packages.length === 0) return empty;
     const now = new Date();
     const until = new Date(now.getTime() + JOURNEY_DAYS_AHEAD * DAY_MS);
     const legWhere = (from: string, to: string): Prisma.TripWhereInput => {
@@ -261,6 +292,22 @@ export class PackagesService {
       // Prices include VAT, as everywhere in the app.
       total: Math.round((out.subtotal + back.subtotal + stayAmount) * 100) / 100,
     };
+  }
+
+  /** Active hotels with a customer price for a room type they offer: each can be built into a package to its city. */
+  private async hotelsForPackages() {
+    const hotels = await this.prisma.hotel.findMany({
+      where: {
+        isActive: true,
+        OR: [
+          { offersSharedRoom: true, bedPrice: { not: null } },
+          { offersPrivateRoom: true, privateRoomPrice: { not: null } },
+        ],
+      },
+      select: HOTEL_PACKAGE_SELECT,
+      orderBy: { name: 'asc' },
+    });
+    return hotels.filter((hotel) => customRoomOptions(hotelCustomPackage(hotel)).length > 0);
   }
 
   async getPublishedPackages(search: PackageSearchQuery = {}) {

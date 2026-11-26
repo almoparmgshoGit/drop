@@ -38,7 +38,7 @@ import { tripDayWindow } from '../../common/utils/trip-day.util';
 import { PACKAGE_MAX_PERSONS, PACKAGE_PRICE_SELECT, packageGroupTotal, packagePriceTiers } from '../../common/utils/package-price.util';
 import { BookingLegDto, CreateBookingDto, HoldSeatsDto, QuoteDto, ReviewCancellationDto } from './bookings.dto';
 import { PublicService, SERVICE_SELECT, withHotelServices } from '../../common/utils/services.util';
-import { customPackageStay, loadCustomPackage } from '../../common/utils/custom-package.util';
+import { customPackageStay, isHotelPackageId, loadCustomPackage } from '../../common/utils/custom-package.util';
 import { assertBookingOpened } from '../../common/utils/booking-opens.util';
 import { seatPricing } from '../../common/utils/dynamic-pricing.util';
 import { WaitlistService } from '../../common/services/waitlist.service';
@@ -961,7 +961,8 @@ export class BookingsService {
                 ...(quote.customStay && {
                   kind: 'PACKAGE_ROUND_STAY' as const,
                   leg: legIndex === 0 ? ('OUTBOUND' as const) : ('RETURN' as const),
-                  customPackageId: dto.customPackageId,
+                  // A package built on a hotel has no row of its own: the booking keeps the hotel and the dates.
+                  customPackageId: isHotelPackageId(dto.customPackageId) ? null : dto.customPackageId,
                   ...(legIndex === 0 && {
                     stayHotelId: quote.customStay.hotelId,
                     stayCheckIn: quote.customStay.checkIn,

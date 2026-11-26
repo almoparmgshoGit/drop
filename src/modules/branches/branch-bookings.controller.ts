@@ -24,6 +24,13 @@ export class BranchBookingsController {
     return this.bookings.searchTrips(query, req.user);
   }
 
+  @Get('packages')
+  @RequirePermission('bookings.create')
+  @ApiOperation({ summary: 'Fixed packages on sale at branches, with their departures and the trips back' })
+  fixedPackages(@Req() req) {
+    return this.bookings.fixedPackages(req.user);
+  }
+
   @Get('trips/:id/seats')
   @RequirePermission('bookings.create')
   @ApiOperation({ summary: 'Seat map of a trip open for sale at branches' })

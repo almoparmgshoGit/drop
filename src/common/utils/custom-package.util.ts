@@ -3,7 +3,7 @@ import { Prisma, RoomType } from '@prisma/client';
 import { riyadhDate } from './time.util';
 import { SERVICE_SELECT, withHotelServices } from './services.util';
 import { GALLERY_SELECT } from './gallery.util';
-import { privateRoomsNeeded } from './housing-price.util';
+import { HousingTerms, hotelHousingTerms, housingCharge, privateRoomsNeeded } from './housing-price.util';
 import { familyRooms } from './family-room.util';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -45,7 +45,53 @@ export const CUSTOM_PACKAGE_SELECT = {
   },
 } satisfies Prisma.PackageSelect;
 
-export type CustomPackage = Prisma.PackageGetPayload<{ select: typeof CUSTOM_PACKAGE_SELECT }>;
+/**
+ * A package the customer builds. Either one the office published (its route, hotel and nightly prices), or one made on the
+ * spot from any active hotel at the destination, with no record of its own: then `hotelTerms` holds the hotel's own customer
+ * prices, charged the way the counter charges them, and the route is whatever the customer's two trips run on.
+ */
+export type CustomPackage = Prisma.PackageGetPayload<{ select: typeof CUSTOM_PACKAGE_SELECT }> & { hotelTerms?: HousingTerms | null };
+
+/** The id of a package made from a hotel: no package row, so nothing points to one. */
+export const HOTEL_PACKAGE_PREFIX = 'hotel.';
+export const isHotelPackageId = (id: string | null | undefined) => !!id && id.startsWith(HOTEL_PACKAGE_PREFIX);
+
+/** What a hotel needs to be built into a package: the package's hotel fields and the hotel's customer prices. */
+export const HOTEL_PACKAGE_SELECT = {
+  ...CUSTOM_PACKAGE_SELECT.hotel.select,
+  bedPrice: true,
+  privateRoomPrice: true,
+  privateRoomPriceBasis: true,
+  housingPricePeriod: true,
+} satisfies Prisma.HotelSelect;
+
+type HotelForPackage = Prisma.HotelGetPayload<{ select: typeof HOTEL_PACKAGE_SELECT }>;
+
+/** A hotel as a package the customer builds on any route to its city. Its prices are the hotel's own, as at the counter. */
+export function hotelCustomPackage(hotel: HotelForPackage): CustomPackage {
+  const { bedPrice, privateRoomPrice, privateRoomPriceBasis, housingPricePeriod, ...place } = hotel;
+  const terms = hotelHousingTerms({ bedPrice, privateRoomPrice, privateRoomCapacity: hotel.privateRoomCapacity, privateRoomPriceBasis, housingPricePeriod });
+  return {
+    id: `${HOTEL_PACKAGE_PREFIX}${hotel.id}`,
+    name: hotel.name,
+    description: hotel.description,
+    terms: null,
+    kind: 'CUSTOM',
+    status: 'PUBLISHED',
+    origin: null,
+    destination: hotel.city,
+    startDate: null,
+    endDate: null,
+    nightlyBedPrice: bedPrice,
+    nightlyRoomPrice: privateRoomPrice,
+    // Any outbound the customer likes: no office set an hour for it.
+    minDepartureHour: 0,
+    images: [],
+    services: [],
+    hotel: place,
+    hotelTerms: terms,
+  };
+}
 
 const halalas = (value: Prisma.Decimal | number | null) => Math.round(Number(value ?? 0) * 100);
 const sar = (value: number) => value / 100;
@@ -55,19 +101,34 @@ export const riyadhHour = (date: Date) => new Date(date.getTime() + RIYADH_OFFSE
 
 /** The room types a customer can pick: the hotel must offer it and the package must have a price for it. */
 export const customRoomOptions = (pkg: CustomPackage): RoomType[] => [
+  // A hotel's own prices: a room type is sold where the hotel offers it and has a price for it.
+  ...(pkg.hotelTerms
+    ? [
+        ...(pkg.hotel?.offersSharedRoom && pkg.hotelTerms.housingPrice !== null ? (['SHARED'] as const) : []),
+        ...(pkg.hotel?.offersPrivateRoom && pkg.hotelTerms.privateRoomPrice !== null ? (['PRIVATE'] as const) : []),
+      ]
+    : []),
+  ...(pkg.hotelTerms ? [] : customPackageRooms(pkg)),
+];
+
+const customPackageRooms = (pkg: CustomPackage): RoomType[] => [
   ...(pkg.hotel?.offersSharedRoom && pkg.nightlyBedPrice !== null ? (['SHARED'] as const) : []),
   ...(pkg.hotel?.offersPrivateRoom && pkg.nightlyRoomPrice !== null ? (['PRIVATE'] as const) : []),
 ];
 
 /** Halalas for the stay: a shared room charges each person's bed, a private room is one price a night for the group. */
 export const customStayCharge = (pkg: CustomPackage, room: RoomType, persons: number, nights: number, privateRooms = 1) =>
-  room === 'SHARED' ? halalas(pkg.nightlyBedPrice) * persons * nights : halalas(pkg.nightlyRoomPrice) * nights * Math.max(1, privateRooms);
+  pkg.hotelTerms
+    ? housingCharge(pkg.hotelTerms, room, persons, nights, privateRooms)
+    : room === 'SHARED' ? halalas(pkg.nightlyBedPrice) * persons * nights : halalas(pkg.nightlyRoomPrice) * nights * Math.max(1, privateRooms);
 
 /** What the app shows for a custom package: its route, hotel and nightly prices. */
 export function toPublicCustomPackage(pkg: CustomPackage) {
-  const { hotel, nightlyBedPrice, nightlyRoomPrice, ...rest } = pkg;
+  const { hotel, nightlyBedPrice, nightlyRoomPrice, hotelTerms, ...rest } = pkg;
   return {
     ...rest,
+    // A hotel priced for the whole stay charges its bed once, not each night; the app says so beside the price.
+    bedPriceForStay: !!hotelTerms && hotelTerms.housingPricePeriod !== 'PER_NIGHT',
     nightlyBedPrice: nightlyBedPrice === null ? null : Number(nightlyBedPrice),
     nightlyRoomPrice: nightlyRoomPrice === null ? null : Number(nightlyRoomPrice),
     roomOptions: customRoomOptions(pkg),
@@ -77,6 +138,11 @@ export function toPublicCustomPackage(pkg: CustomPackage) {
 }
 
 export async function loadCustomPackage(db: Prisma.TransactionClient, id: string) {
+  if (isHotelPackageId(id)) {
+    const hotel = await db.hotel.findUnique({ where: { id: id.slice(HOTEL_PACKAGE_PREFIX.length) }, select: HOTEL_PACKAGE_SELECT });
+    if (!hotel?.isActive) throw new BadRequestException('الفندق غير متاح حاليًا');
+    return hotelCustomPackage(hotel);
+  }
   const pkg = await db.package.findUnique({ where: { id }, select: CUSTOM_PACKAGE_SELECT });
   if (!pkg || pkg.kind !== 'CUSTOM' || pkg.status !== 'PUBLISHED') throw new NotFoundException('الباقة غير متاحة');
   if (!pkg.hotel?.isActive) throw new BadRequestException('فندق الباقة غير متاح حاليًا');
@@ -99,11 +165,14 @@ export function customPackageStay(
 ) {
   const same = (a: string, b: string | null) => a.trim() === (b ?? '').trim();
   if (outbound.trip.package || inbound.trip.package) throw new BadRequestException('رحلات الباقة المصممة تكون من رحلات النقل، لا من باقة أخرى');
-  if (!same(outbound.trip.origin, pkg.origin) || !same(outbound.trip.destination, pkg.destination)) {
-    throw new BadRequestException(`رحلة الذهاب يجب أن تكون من ${pkg.origin} إلى ${pkg.destination}`);
+  // A hotel's package runs on whatever route the customer picked: the trip back only has to reverse the trip there.
+  const origin = pkg.hotelTerms ? outbound.trip.origin : pkg.origin;
+  const destination = pkg.hotelTerms ? outbound.trip.destination : pkg.destination;
+  if (!same(outbound.trip.origin, origin) || !same(outbound.trip.destination, destination)) {
+    throw new BadRequestException(`رحلة الذهاب يجب أن تكون من ${origin} إلى ${destination}`);
   }
-  if (!same(inbound.trip.origin, pkg.destination) || !same(inbound.trip.destination, pkg.origin)) {
-    throw new BadRequestException(`رحلة العودة يجب أن تكون من ${pkg.destination} إلى ${pkg.origin}`);
+  if (!same(inbound.trip.origin, destination) || !same(inbound.trip.destination, origin)) {
+    throw new BadRequestException(`رحلة العودة يجب أن تكون من ${destination} إلى ${origin}`);
   }
   if (riyadhHour(outbound.trip.departureTime) < pkg.minDepartureHour) {
     throw new BadRequestException(`رحلة الذهاب في هذه الباقة تبدأ من الساعة ${pkg.minDepartureHour}:00`);
@@ -136,7 +205,8 @@ export function customPackageStay(
     amount: choice ? customStayCharge(pkg, choice, persons, nights, rooms) : 0,
     details: {
       ...place,
-      customPackageId: pkg.id,
+      // A hotel's package has no row: the booking keeps its hotel and dates, and no package.
+      customPackageId: pkg.hotelTerms ? null : pkg.id,
       packageName: pkg.name,
       nights,
       checkIn,
