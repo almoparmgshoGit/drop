@@ -527,6 +527,24 @@ export class ZatcaService {
     }
   }
 
+  /** The same as for an invoice: a credit note issued after switching on prints the signed phase 2 QR. */
+  async printableCreditNoteQr(creditNoteId: string): Promise<string | null> {
+    try {
+      const existing = await this.prisma.zatcaDocument.findUnique({ where: { creditNoteId }, select: { qr: true } });
+      if (existing?.qr) return existing.qr;
+      const stored = await this.readAll();
+      if (stored.enabled !== 'true' || !stored.activatedAt) return null;
+      const note = await this.prisma.creditNote.findUnique({ where: { id: creditNoteId }, select: { issuedAt: true } });
+      if (!note || note.issuedAt < new Date(stored.activatedAt)) return null;
+      if (!existing) await this.enrol();
+      await this.signPending();
+      return (await this.prisma.zatcaDocument.findUnique({ where: { creditNoteId }, select: { qr: true } }))?.qr ?? null;
+    } catch (err) {
+      this.logger.error(`Could not sign credit note ${creditNoteId} for printing: ${(err as Error).message}`);
+      return null;
+    }
+  }
+
   // ---------- reporting ----------
 
   /** Sends signed documents to ZATCA. Keeps going while e-invoicing is paused: what was handed out signed must still be reported. */
@@ -712,5 +730,11 @@ export class ZatcaService {
     if (invoiceIds.length === 0) return new Map<string, ZatcaStatus>();
     const rows = await this.prisma.zatcaDocument.findMany({ where: { invoiceId: { in: invoiceIds } }, select: { invoiceId: true, status: true } });
     return new Map(rows.map((row) => [row.invoiceId!, row.status]));
+  }
+
+  async statusByCreditNote(creditNoteIds: string[]) {
+    if (creditNoteIds.length === 0) return new Map<string, ZatcaStatus>();
+    const rows = await this.prisma.zatcaDocument.findMany({ where: { creditNoteId: { in: creditNoteIds } }, select: { creditNoteId: true, status: true } });
+    return new Map(rows.map((row) => [row.creditNoteId!, row.status]));
   }
 }

@@ -8,7 +8,7 @@ import { halalas, netBookingFigures } from '../../common/utils/payment.util';
 import { riyadhDate, riyadhDaysRange } from '../../common/utils/time.util';
 import { toSar } from '../bookings/bookings.service';
 import { CashActor, CashService, custodyCode as custodyCodeOf } from '../cash/cash.service';
-import { TripAccountsService } from '../invoices/trip-accounts.service';
+import { columnOf, SHARED_COLUMN, TripAccountsService } from '../invoices/trip-accounts.service';
 import { ClosingsService } from './closings.service';
 import { addMonths, FixedExpensesService, monthName } from './fixed-expenses.service';
 import { remittanceCode, RemittancesService } from './remittances.service';
@@ -102,8 +102,9 @@ export class SettlementService {
   // ───────────────────────────── the figures ─────────────────────────────
 
   /**
-   * Each column's revenue and costs over a period. A trip's revenue and its costs are shared by the columns whose bookings
-   * sold it, by their share of its tickets. Head-office costs are then shared by every column's share of the revenue.
+   * Each column's revenue and costs over a period. A trip's revenue and its costs reach the columns whose bookings sold it,
+   * by their share of its tickets, as posted when the trip's account was closed (TripProfitPosting): a trip not closed yet
+   * adds nothing. Head-office costs are then shared by every column's share of the revenue.
    */
   async figures(from: string, to: string) {
     const range = riyadhDaysRange(from, to);
@@ -126,7 +127,10 @@ export class SettlementService {
     // What belongs to no branch: head-office expenses and salaries, shared out by revenue at the end.
     let pool = 0;
 
-    const [bookings, generals, custodies, fixedRows, runs, settlements, sessions] = await Promise.all([
+    // Accounts closed before profits were posted are posted now, dated when they were closed.
+    await this.accounts.postMissing();
+    const [postings, bookings, generals, custodies, fixedRows, runs, settlements, sessions] = await Promise.all([
+      this.prisma.tripProfitPosting.findMany({ where: { postedAt: range }, select: { columnKey: true, revenue: true, costs: true } }),
       legOf.size
         ? this.prisma.booking.findMany({
             where: { tripId: { in: [...legOf.keys()] } },
@@ -142,7 +146,7 @@ export class SettlementService {
               payment: { select: { amount: true, walletAmount: true, status: true } },
               collections: { select: { amount: true } },
               cashMovements: { where: { type: 'BOOKING_REFUND' }, select: { amount: true } },
-              _count: { select: { passengers: true } },
+              _count: { select: { passengers: { where: { cancelled: false } } } },
             },
           })
         : [],
@@ -154,17 +158,13 @@ export class SettlementService {
       this.prisma.cashSession.findMany({ where: { businessDate: days, status: 'CLOSED' }, select: { branchId: true, difference: true } }),
     ]);
 
-    // Tickets by column within each trip, to share the trip's revenue and costs.
-    const keyOf = (booking: { source: string; branchId: string | null }) => (booking.source === 'APP' ? APP_KEY : booking.branchId ?? HQ_KEY);
-    const tickets = new Map<string, Map<string, number>>();
+    // Booking counts, VAT and cash are each column's by the trips that left in the period. The trips' profit is not: it reaches
+    // a column only through the postings made when each trip's account was closed (below).
     for (const booking of bookings) {
-      const journey = legOf.get(booking.tripId)!;
-      const key = keyOf(booking);
+      const key = columnOf(booking);
       const f = of(key);
       const net = netBookingFigures(booking);
       const sold = booking.status === 'CANCELLED' ? net.held : halalas(booking.totalPrice);
-      const byKey = tickets.get(journey) ?? tickets.set(journey, new Map()).get(journey)!;
-      byKey.set(key, (byKey.get(key) ?? 0) + sold);
       // The VAT priced into the booking, or what is inside the money kept from a cancelled one.
       f.vat += booking.status === 'CANCELLED' ? vatInside(net.held, vatRate) : halalas(booking.vatAmount) > 0 ? halalas(booking.vatAmount) : vatInside(sold, vatRate);
       f.collected += net.held;
@@ -175,21 +175,19 @@ export class SettlementService {
         f.passengers += booking._count.passengers;
       }
     }
-    for (const item of trips.items) {
-      const byKey = tickets.get(item.id);
-      const total = byKey ? [...byKey.values()].reduce((sum, value) => sum + value, 0) : 0;
-      const revenue = halalas(item.revenue);
-      const costs = halalas(item.expenses);
-      if (!byKey || total <= 0) {
+    // Each closed trip's profit as posted to the columns when its account closed, and any adjustment since, in the month
+    // it was posted: so a trip counts once, and a change after reopening counts only by its difference.
+    for (const posting of postings) {
+      const revenue = halalas(posting.revenue);
+      const costs = halalas(posting.costs);
+      if (posting.columnKey === SHARED_COLUMN) {
         // Nothing was sold on it: what it earned or cost is the company's, shared like the head office.
         pool += costs - revenue;
         continue;
       }
-      for (const [key, value] of byKey) {
-        const f = of(key);
-        f.revenue += Math.round((revenue * value) / total);
-        f.tripCosts += Math.round((costs * value) / total);
-      }
+      const f = of(posting.columnKey);
+      f.revenue += revenue;
+      f.tripCosts += costs;
     }
     if (figures.has(HQ_KEY)) columns.set(HQ_KEY, { key: HQ_KEY, name: 'الإدارة العامة', kind: 'HQ', isActive: true });
 
@@ -412,7 +410,7 @@ export class SettlementService {
     steps.push({
       key: 'trips',
       title: 'الإغلاق المالي للرحلات المنفذة',
-      detail: awaiting ? `${awaiting} رحلة منفذة بانتظار الإغلاق المالي` : notRun ? `${notRun} رحلة مضى موعدها ولم تُنفذ` : data.trips.length ? 'كل رحلات الشهر المنفذة مغلقة ماليًا' : 'لا توجد رحلات في هذا الشهر',
+      detail: awaiting ? `${awaiting} رحلة منفذة بانتظار الإغلاق المالي، ولا يدخل ربحها في التصفية قبل الإغلاق` : notRun ? `${notRun} رحلة مضى موعدها ولم تُنفذ` : data.trips.length ? 'كل رحلات الشهر المنفذة مغلقة ماليًا' : 'لا توجد رحلات في هذا الشهر',
       state: awaiting || notRun ? 'todo' : 'done',
       badge: awaiting ? `${awaiting} رحلات` : notRun ? `${notRun} لم تُنفذ` : 'مكتمل',
       link: '/trip-accounts',

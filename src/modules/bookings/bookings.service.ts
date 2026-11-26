@@ -25,6 +25,7 @@ import { riyadhDate } from '../../common/utils/time.util';
 import { hotelHousingTerms, housingCharge, HousingTerms, isRoomSellable, privateRoomsNeeded } from '../../common/utils/housing-price.util';
 import { applicableRule, daysUntil, parseCancellationRules } from '../../common/utils/cancellation-policy.util';
 import { paymentFigures } from '../../common/utils/payment.util';
+import { cancelledTicketsTake, ticketCancelFigures } from '../../common/utils/ticket-cancel.util';
 import { normalizeSaudiPhone } from '../../common/utils/phone.util';
 import { isLinkedReturn } from '../../common/utils/linked-return.util';
 import { signTicketToken } from '../../common/utils/ticket-token.util';
@@ -82,7 +83,15 @@ const BOOKING_INCLUDE = {
       seatNumber: true,
       gender: true,
       roomNote: true,
-      ticket: true,
+      cancelled: true,
+      // Every ticket field but who on the staff cancelled it.
+      ticket: {
+        select: {
+          id: true, bookingId: true, passengerId: true, ticketNumber: true, signedToken: true, isBoarded: true, boardedAt: true, returnBoardedAt: true,
+          noShowAt: true, returnNoShowAt: true, boardedOffline: true, returnBoardedOffline: true, createdAt: true,
+          status: true, cancelledAt: true, cancelReason: true, cancelledSeatNumber: true, refundAmount: true,
+        },
+      },
       hotelRoom: {
         select: {
           number: true,
@@ -1242,7 +1251,8 @@ export class BookingsService {
     if (!rule) return null;
     const collections = await this.prisma.bookingCollection.findMany({ where: { bookingId: booking.id }, select: { amount: true } });
     const { received, wallet } = paymentFigures(booking.payment, collections);
-    return { percent: rule.percent, amount: toSar(((received + wallet) * rule.percent) / 100) };
+    const paid = Math.max(0, received + wallet - (await cancelledTicketsTake(this.prisma, booking.id)));
+    return { percent: rule.percent, amount: toSar((paid * rule.percent) / 100) };
   }
 
   async requestCancellation(userId: string, bookingId: string, reason?: string) {
@@ -1319,6 +1329,63 @@ export class BookingsService {
     }, CANCELLATION_TX_OPTIONS);
   }
 
+  /** Cancels one passenger's ticket from the panel, under the same refund policy and permissions as cancelling a booking. */
+  async adminCancelTicket(actor: { userId: string; permissions: string[] }, bookingId: string, passengerId: string, dto: { refundAmount?: number; refundMethod?: RefundDestination; note: string }, ip?: string) {
+    return this.prisma.$transaction(async (tx) => {
+      await lockBookingWithTrip(tx, bookingId);
+      const passenger = await tx.bookingPassenger.findFirst({ where: { id: passengerId, bookingId }, select: { id: true } });
+      if (!passenger) throw new NotFoundException('التذكرة غير موجودة في هذا الحجز');
+      const refundAmount = await this.decideTicketRefund(tx, actor, bookingId, dto.refundAmount);
+      return this.cancellation.cancelTicket(tx, bookingId, passengerId, { refundAmount, refundDestination: dto.refundMethod ?? 'WALLET', reviewedById: actor.userId, note: dto.note, ip });
+    }, CANCELLATION_TX_OPTIONS);
+  }
+
+  /** What cancelling this ticket now would move, for the panel's dialog. Amounts in SAR. */
+  async ticketCancelEstimate(bookingId: string, passengerId: string) {
+    const passenger = await this.prisma.bookingPassenger.findFirst({ where: { id: passengerId, bookingId }, select: { cancelled: true } });
+    if (!passenger) throw new NotFoundException('التذكرة غير موجودة في هذا الحجز');
+    const figures = await ticketCancelFigures(this.prisma, bookingId);
+    const policy = await this.ticketPolicy(this.prisma, bookingId, figures.paidShare);
+    return {
+      lastTicket: figures.active <= 1,
+      price: toSar(figures.price),
+      paid: toSar(figures.paidShare),
+      unpaidRemoved: toSar(figures.debtCut),
+      percent: policy.percent,
+      suggested: policy.amount === null ? null : toSar(policy.amount),
+      max: toSar(figures.paidShare),
+    };
+  }
+
+  /** The policy applied to a ticket's paid share: null when no policy is saved. A trip that has left gives back nothing. */
+  private async ticketPolicy(db: Pick<Prisma.TransactionClient, 'booking' | 'setting'>, bookingId: string, paidShare: number) {
+    const booking = await db.booking.findUniqueOrThrow({ where: { id: bookingId }, select: { trip: { select: { departureTime: true } } } });
+    const now = new Date();
+    if (booking.trip.departureTime <= now) return { percent: 0, amount: 0 };
+    const setting = await db.setting.findUnique({ where: { key: 'cancellationRules' } });
+    const rules = parseCancellationRules(setting?.value);
+    if (rules.length === 0) return { percent: null, amount: null };
+    const percent = applicableRule(rules, daysUntil(booking.trip.departureTime, now))?.percent ?? 0;
+    return { percent, amount: Math.round((paidShare * percent) / 100) };
+  }
+
+  /** decideRefund for one ticket: its paid share in place of the booking's. Going above the policy takes its own permission. */
+  private async decideTicketRefund(tx: Prisma.TransactionClient, actor: { permissions: string[] }, bookingId: string, requested?: number) {
+    const figures = await ticketCancelFigures(tx, bookingId);
+    // The last active ticket is the booking itself, so the booking's own rules decide it.
+    if (figures.active <= 1) return this.decideRefund(tx, actor, bookingId, requested);
+    const policy = await this.ticketPolicy(tx, bookingId, figures.paidShare);
+    const refund = requested ?? (policy.amount ?? figures.paidShare) / 100;
+    if (policy.amount === null) {
+      if (refund > 0 && !actor.permissions.includes('cancellations.approve')) {
+        throw new ForbiddenException('لا توجد سياسة استرداد محددة، والاسترداد يحتاج صلاحية قبول الاسترداد');
+      }
+    } else if (toHalalas(refund) > policy.amount && !actor.permissions.includes('refunds.override_policy')) {
+      throw new ForbiddenException(`الحد المسموح لك وفق سياسة الإلغاء هو ${toSar(policy.amount).toFixed(2)} ر.س`);
+    }
+    return refund;
+  }
+
   /**
    * How much a cancellation may give back, by who is asking. The policy sets the amount and going above it takes its own permission.
    * A trip that has left has no notice to reward, so a no-show gets nothing unless someone with that permission decides otherwise.
@@ -1337,8 +1404,8 @@ export class BookingsService {
       },
     });
     const { received, wallet } = paymentFigures(booking.payment, booking.collections);
-    // What was already paid out as compensation is not paid out a second time as a refund.
-    const paid = Math.max(0, received + wallet - toHalalas(booking.compensation?.amount ?? 0));
+    // What was already paid out as compensation is not paid out a second time as a refund, nor what cancelled tickets took.
+    const paid = Math.max(0, received + wallet - toHalalas(booking.compensation?.amount ?? 0) - (await cancelledTicketsTake(tx, bookingId)));
     // Notice is counted from the customer's request, so a slow review never costs them a better percentage.
     const now = booking.status === 'PENDING_CANCELLATION_REVIEW' && booking.cancelRequestedAt ? booking.cancelRequestedAt : new Date();
     const setting = await tx.setting.findUnique({ where: { key: 'cancellationRules' } });

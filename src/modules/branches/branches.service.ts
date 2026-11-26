@@ -172,7 +172,7 @@ export class BranchesService {
           totalPrice: true,
           createdByName: true,
           trip: { select: { origin: true, destination: true } },
-          _count: { select: { passengers: true } },
+          _count: { select: { passengers: { where: { cancelled: false } } } },
         },
       }),
       this.prisma.bookingCollection.groupBy({ by: ['method'], where: { branchId: id, createdAt: { gte: since } }, _sum: { amount: true } }),

@@ -538,7 +538,7 @@ const TYPE_LABELS: Partial<Record<AuditRecordType, Record<string, string>>> = {
   loyaltyVoucher: { pointsCost: 'تكلفتها بالنقاط', validDays: 'صلاحيتها بالأيام' },
   package: { price2: 'سعر الثنائي', price3: 'سعر الثلاثي', price4: 'سعر الرباعي', nights: 'الليالي', terms: 'الشروط', kind: 'نوع الباقة', origin: 'من', destination: 'إلى', nightlyBedPrice: 'سعر السرير لليلة', nightlyRoomPrice: 'سعر الغرفة لليلة', minDepartureHour: 'أبكر ساعة انطلاق' },
   bus: { plateNumber: 'رقم اللوحة', model: 'الطراز', color: 'اللون', company: 'الشركة', kind: 'نوع المركبة', seatCount: 'عدد المقاعد', singlesFromSeat: 'بداية مقاعد الأفراد', singlesToSeat: 'نهاية مقاعد الأفراد' },
-  hotel: { nightlyRate: 'سعر الليلة', offersSharedRoom: 'غرف مشتركة', offersPrivateRoom: 'غرف خاصة', rateUnit: 'وحدة السعر', bedPrice: 'سعر السرير', privateRoomPrice: 'سعر الغرفة الخاصة', privateRoomCapacity: 'سعة الغرفة الخاصة' },
+  hotel: { nightlyRate: 'سعر الليلة', privateNightlyRate: 'تكلفة ليلة الغرفة الخاصة', offersSharedRoom: 'غرف مشتركة', offersPrivateRoom: 'غرف خاصة', rateUnit: 'وحدة السعر', bedPrice: 'سعر السرير', privateRoomPrice: 'سعر الغرفة الخاصة', privateRoomCapacity: 'سعة الغرفة الخاصة' },
   busOffice: { contractNumber: 'رقم العقد' },
 };
 

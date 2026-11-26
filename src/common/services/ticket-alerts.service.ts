@@ -19,7 +19,7 @@ export class TicketAlertsService {
     if (!trip || trip.tripStatus === 'CANCELLED' || trip.tripStatus === 'DRAFT') return newlyTold;
 
     const bookings = await tx.booking.findMany({
-      where: { tripId, status: { in: [...CAN_BOARD_STATUSES] }, tickets: { some: { isBoarded: false } }, compensation: { is: null } },
+      where: { tripId, status: { in: [...CAN_BOARD_STATUSES] }, tickets: { some: { isBoarded: false, status: 'CONFIRMED' } }, compensation: { is: null } },
       select: { id: true, boardingPointId: true, boardingPointName: true, lateAlertAt: true, stoppedAlertAt: true },
     });
     const now = Date.now();

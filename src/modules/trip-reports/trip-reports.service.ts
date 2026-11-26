@@ -307,7 +307,7 @@ export class TripReportsService {
         },
       }),
       this.prisma.ticket.findMany({
-        where: { booking: { tripId: report.tripId, status: { in: [...TRAVELING_STATUSES] } } },
+        where: { booking: { tripId: report.tripId, status: { in: [...TRAVELING_STATUSES] } }, status: 'CONFIRMED' },
         select: { isBoarded: true, noShowAt: true, booking: { select: { boardingPointId: true, boardingPointName: true } } },
       }),
       this.prisma.tripStatusUpdate.findMany({ where: { tripId: report.tripId }, orderBy: { createdAt: 'desc' }, take: 30 }),

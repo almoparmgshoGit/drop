@@ -300,7 +300,7 @@ export class TripChatService {
     const bookings = customerIds.length
       ? await this.prisma.booking.findMany({
           where: { userId: { in: customerIds }, OR: [{ tripId, status: { in: [...TRAVELING_STATUSES] } }, { id: { in: returning } }] },
-          select: { userId: true, passengers: { select: { seatNumber: true } } },
+          select: { userId: true, passengers: { where: { cancelled: false }, select: { seatNumber: true } } },
         })
       : [];
     const seatsOf = (customerId: string) =>

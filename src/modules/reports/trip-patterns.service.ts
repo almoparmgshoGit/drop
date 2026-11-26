@@ -180,7 +180,7 @@ export class TripPatternsService {
                COALESCE(SUM(p.count) FILTER (WHERE b.status <> 'CANCELLED'), 0)::int AS passengers
         FROM "Booking" b
         JOIN "Trip" t ON t.id = b."tripId"
-        LEFT JOIN LATERAL (SELECT COUNT(*) AS count FROM "BookingPassenger" bp WHERE bp."bookingId" = b.id) p ON true
+        LEFT JOIN LATERAL (SELECT COUNT(*) AS count FROM "BookingPassenger" bp WHERE bp."bookingId" = b.id AND bp."cancelled" = false) p ON true
         WHERE ${tripWhere} AND ${bookingWhere}
         GROUP BY t.origin, t.destination`,
       this.prisma.$queryRaw<(Key & { expected: number; noShows: number })[]>`

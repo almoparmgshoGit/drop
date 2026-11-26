@@ -578,6 +578,8 @@ model Trip {
   /// The office closed the trip's account after reviewing it; set on the way there (D), which carries the DR journey's account.
   financeClosedAt            DateTime?
   financeClosedByName        String?
+  /// The journey's profit posted to the branches when its account closed, plus later adjustments (on the way there only).
+  profitPostings             TripProfitPosting[]
   tripStatus                 TripStatus            @default(DRAFT)
   scheduleType               TripScheduleType      @default(TEMPORARY)
   /// Which calendar a fixed trip repeats on; the employee picks it per trip.
@@ -1233,8 +1235,18 @@ model BookingPassenger {
   roomNote        String?
   hotelRoomId     String?
   hotelRoom       HotelRoom?       @relation(fields: [hotelRoomId], references: [id], onDelete: SetNull)
+  /// Mirrors a cancelled ticket (Ticket.status). A cancelled passenger stays on the booking for the record, but holds no seat,
+  /// place or bed and is left out of manifests, boarding and passenger counts: every such query filters on this.
+  cancelled       Boolean          @default(false)
   ticket          Ticket?
   hotelComplaints HotelComplaint[]
+
+  @@index([bookingId, cancelled])
+}
+
+enum TicketStatus {
+  CONFIRMED
+  CANCELLED
 }
 
 model Ticket {
@@ -1257,10 +1269,23 @@ model Ticket {
   boardedOffline       Boolean          @default(false)
   /// The same for the way back on a round trip's reverse.
   returnBoardedOffline Boolean          @default(false)
+  /// مؤكدة / ملغية. A whole booking cancelled cancels all its tickets; staff may also cancel one ticket of a booking. Final.
+  status               TicketStatus     @default(CONFIRMED)
+  cancelledAt          DateTime?
+  cancelledById        String?
+  cancelledByName      String?
+  cancelReason         String?
+  /// The seat it held: cancelling one ticket frees its seat, so the passenger's own seatNumber is cleared.
+  cancelledSeatNumber  String?
+  /// What cancelling this one ticket gave back (wallet and original method together) and what of its paid share the company kept.
+  /// Zero on tickets cancelled with their whole booking, whose money lives on the booking.
+  refundAmount         Decimal          @default(0) @db.Decimal(10, 2)
+  keptAmount           Decimal          @default(0) @db.Decimal(10, 2)
   createdAt            DateTime         @default(now())
 
   @@index([ticketNumber])
   @@index([bookingId])
+  @@index([status, cancelledAt])
 }
 
 model LoyaltyTransaction {
@@ -1526,6 +1551,8 @@ model Hotel {
   offersSharedRoom      Boolean               @default(true)
   offersPrivateRoom     Boolean               @default(true)
   rateUnit              HotelRateUnit         @default(ROOM)
+  /// What the company pays a night for a private room (or a bed in one when rateUnit is BED); null = nightlyRate.
+  privateNightlyRate    Decimal?              @db.Decimal(10, 2)
   /// Customer prices copied to a trip when this hotel is chosen; nightlyRate above is what the company pays.
   bedPrice              Decimal?              @db.Decimal(10, 2)
   privateRoomPrice      Decimal?              @db.Decimal(10, 2)
@@ -1564,6 +1591,8 @@ model HotelBooking {
   nightlyRate       Decimal            @db.Decimal(10, 2)
   /// Copied from the hotel with the rate, so later contract changes leave this stay's cost alone.
   rateUnit          HotelRateUnit      @default(ROOM)
+  /// The private-room cost copied from the hotel with nightlyRate; null = private rooms cost nightlyRate too.
+  privateNightlyRate Decimal?          @db.Decimal(10, 2)
   extraCost         Decimal            @default(0) @db.Decimal(10, 2)
   supplierReference String?
   mealPlan          String?
@@ -3685,4 +3714,36 @@ model RoomCardTemplate {
   updatedAt       DateTime @updatedAt
 
   @@index([hotelId, isActive])
+}
+
+enum TripPostingKind {
+  /// Posted when the account was closed.
+  CLOSE
+  /// The difference posted when a reopened account was closed again, so the profit is never posted twice.
+  ADJUSTMENT
+}
+
+/// A closed journey's net profit (or loss) posted as income to each branch, by its share of the journey's bookings.
+/// The monthly settlement and branch performance read these, in the month they were posted. Never edited: a change
+/// after reopening is posted as an ADJUSTMENT of the difference.
+model TripProfitPosting {
+  id           String          @id @default(uuid())
+  /// The way there (D), which carries the DR journey's account.
+  tripId       String
+  trip         Trip            @relation(fields: [tripId], references: [id], onDelete: Restrict)
+  /// A branch id, 'APP' for the app's bookings, or 'HQ' for a journey nobody sold.
+  columnKey    String
+  /// The branch's name when posted, so the record reads the same after a rename.
+  columnName   String
+  kind         TripPostingKind
+  /// This column's share of the journey's revenue and costs, and the net between them. Negative on a loss or an adjustment down.
+  revenue      Decimal         @db.Decimal(12, 2)
+  costs        Decimal         @db.Decimal(12, 2)
+  net          Decimal         @db.Decimal(12, 2)
+  postedAt     DateTime        @default(now())
+  postedByName String?
+
+  @@index([postedAt])
+  @@index([tripId])
+  @@index([columnKey, postedAt])
 }

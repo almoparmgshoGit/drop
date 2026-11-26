@@ -57,10 +57,12 @@ export class InvoiceLedgerService {
   /**
    * Reverses part of an invoice, never more than is left on it. VAT is worked out on the running
    * total, so several partial notes still add up to exactly the VAT on the invoice.
+   * A booking that never had an invoice gets none here either: there is nothing to reverse, so no note is issued.
    */
   async credit(tx: Db, input: { bookingId: string; amount: number; reason?: string | null; actorId?: string | null }) {
     if (input.amount <= 0) return null;
-    const invoice = await this.ensure(tx, input.bookingId);
+    const invoice = await tx.invoice.findUnique({ where: { bookingId: input.bookingId } });
+    if (!invoice) return null;
     const notes = await tx.creditNote.findMany({ where: { invoiceId: invoice.id }, select: { total: true, vat: true } });
     const creditedTotal = notes.reduce((sum, note) => sum + halalas(note.total), 0);
     const creditedVat = notes.reduce((sum, note) => sum + halalas(note.vat), 0);

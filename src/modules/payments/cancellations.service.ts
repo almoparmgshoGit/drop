@@ -35,11 +35,23 @@ const TAB_ORDER: Record<CancellationTab, Prisma.BookingOrderByWithRelationInput>
   finished: { cancelReviewedAt: 'desc' },
 };
 
-type PaymentFields = { payment: { amount: Prisma.Decimal; walletAmount: Prisma.Decimal; status: string } | null; collections: { amount: Prisma.Decimal }[] };
+type PaymentFields = {
+  payment: { amount: Prisma.Decimal; walletAmount: Prisma.Decimal; status: string } | null;
+  collections: { amount: Prisma.Decimal }[];
+  /** Tickets cancelled on their own: what they gave back or kept is no longer the booking's to refund. */
+  tickets: { refundAmount: Prisma.Decimal; keptAmount: Prisma.Decimal }[];
+};
+const CANCELLED_TICKETS = { where: { status: 'CANCELLED' as const }, select: { refundAmount: true, keptAmount: true } };
+
+const grossPaid = (booking: Omit<PaymentFields, 'tickets'>) => {
+  const { received, wallet } = paymentFigures(booking.payment, booking.collections);
+  return received + wallet;
+};
 
 const paidOf = (booking: PaymentFields) => {
   const { received, wallet } = paymentFigures(booking.payment, booking.collections);
-  return { received: sar(received), wallet: sar(wallet), paid: sar(received + wallet) };
+  const taken = booking.tickets.reduce((sum, ticket) => sum + halalas(ticket.refundAmount) + halalas(ticket.keptAmount), 0);
+  return { received: sar(Math.max(0, received - taken)), wallet: sar(wallet), paid: sar(Math.max(0, received + wallet - taken)) };
 };
 
 const toRefund = (row: Prisma.PaymentTransactionGetPayload<object>) => ({
@@ -100,6 +112,7 @@ export class CancellationsService {
           trip: { select: { origin: true, destination: true, departureTime: true, bookingType: true } },
           payment: { select: { amount: true, walletAmount: true, status: true } },
           collections: { select: { amount: true } },
+          tickets: CANCELLED_TICKETS,
           paymentTransactions: { where: { type: 'REFUND', status: { in: ['PENDING', 'SUCCEEDED'] } }, select: { amount: true } },
         },
       }),
@@ -119,7 +132,8 @@ export class CancellationsService {
         typeLabel: bookingTypeLabel(booking),
         requestedAt: booking.cancelRequestedAt,
         reviewedAt: booking.cancelReviewedAt,
-        paid: paidOf(booking).paid,
+        // Everything paid, as the refunds beside it include those of tickets cancelled on their own.
+        paid: sar(grossPaid(booking)),
         refunded: sar(booking.paymentTransactions.reduce((sum, row) => sum + halalas(row.amount), 0)),
       })),
     };
@@ -134,6 +148,7 @@ export class CancellationsService {
         passengers: { select: { id: true } },
         payment: true,
         collections: { select: { amount: true } },
+        tickets: CANCELLED_TICKETS,
         paymentTransactions: { where: { type: 'REFUND' }, orderBy: { number: 'asc' } },
       },
     });

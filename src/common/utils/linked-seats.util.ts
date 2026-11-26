@@ -87,8 +87,8 @@ export async function releaseLinkedPlaces(tx: Prisma.TransactionClient, tripId: 
 /** Passengers riding this trip back without a seat number and with no leg elsewhere: the places they hold on its linked trip. */
 export async function seatlessRiders(db: Pick<Prisma.TransactionClient, 'booking'>, tripId: string) {
   const bookings = await db.booking.findMany({
-    where: { tripId, status: { in: HOLDS_A_SEAT }, passengers: { some: { seatNumber: null } }, AND: [RIDES_BACK] },
-    select: { tripId: true, groupReference: true, passengers: { where: { seatNumber: null }, select: { id: true } } },
+    where: { tripId, status: { in: HOLDS_A_SEAT }, passengers: { some: { seatNumber: null, cancelled: false } }, AND: [RIDES_BACK] },
+    select: { tripId: true, groupReference: true, passengers: { where: { seatNumber: null, cancelled: false }, select: { id: true } } },
   });
   return (await withoutOtherLeg(db, bookings)).reduce((sum, booking) => sum + booking.passengers.length, 0);
 }
@@ -113,7 +113,7 @@ export async function goOnlyBookings(db: Pick<Prisma.TransactionClient, 'booking
       status: { in: HOLDS_A_SEAT },
       OR: [{ trip: { direction: 'ONE_WAY', reverseEnabled: true } }, { trip: { direction: 'ROUND_TRIP', reverseEnabled: true }, kind: { in: ONE_WAY_KINDS } }],
     },
-    select: { id: true, tripId: true, groupReference: true, _count: { select: { passengers: true } } },
+    select: { id: true, tripId: true, groupReference: true, _count: { select: { passengers: { where: { cancelled: false } } } } },
   });
 
   const bookingIds = new Set<string>();
@@ -168,7 +168,7 @@ export async function returnRideOf(db: Pick<Prisma.TransactionClient, 'booking' 
 export async function bookedOnTrips(db: Pick<Prisma.TransactionClient, 'booking'>, tripIds: string[]) {
   const bookings = await db.booking.findMany({
     where: { tripId: { in: tripIds }, status: { not: 'CANCELLED' } },
-    select: { tripId: true, totalPrice: true, _count: { select: { passengers: true } } },
+    select: { tripId: true, totalPrice: true, _count: { select: { passengers: { where: { cancelled: false } } } } },
   });
   const totals = new Map<string, { seats: number; revenue: number }>();
   for (const booking of bookings) {
@@ -190,7 +190,7 @@ export async function manifestSeatsByTrip(
   const seats = new Map<string, number>(trips.map((trip) => [trip.id, 0]));
   const own = await db.booking.findMany({
     where: { tripId: { in: trips.map((trip) => trip.id) }, status: { in: HOLDS_A_SEAT } },
-    select: { tripId: true, _count: { select: { passengers: true } } },
+    select: { tripId: true, _count: { select: { passengers: { where: { cancelled: false } } } } },
   });
   for (const booking of own) seats.set(booking.tripId, (seats.get(booking.tripId) ?? 0) + booking._count.passengers);
 
@@ -203,7 +203,7 @@ export async function manifestSeatsByTrip(
   if (reverseOf.size > 0) {
     const outbound = await db.booking.findMany({
       where: { tripId: { in: [...reverseOf.keys()] }, status: { in: HOLDS_A_SEAT }, AND: [RIDES_BACK] },
-      select: { tripId: true, groupReference: true, _count: { select: { passengers: true } } },
+      select: { tripId: true, groupReference: true, _count: { select: { passengers: { where: { cancelled: false } } } } },
     });
     for (const booking of await withoutOtherLeg(db, outbound)) {
       const reverseId = reverseOf.get(booking.tripId)!;
@@ -225,7 +225,7 @@ export async function reverseSeatsSummary(db: Pick<Prisma.TransactionClient, 'bo
   const booked = reverse ? await bookedOnTrips(db, [reverse.id]) : null;
   // A round trip's passengers ride back on the reverse, so its sheet says how many; a one-way trip's say how many seats they free.
   const returning = trip.direction === 'ROUND_TRIP' ? await returningBookingIds(db, tripId) : [];
-  const returningSeats = returning.length ? await db.booking.findMany({ where: { id: { in: returning } }, select: { _count: { select: { passengers: true } } } }) : [];
+  const returningSeats = returning.length ? await db.booking.findMany({ where: { id: { in: returning } }, select: { _count: { select: { passengers: { where: { cancelled: false } } } } } }) : [];
   return {
     direction: trip.direction,
     returningSeats: returningSeats.reduce((sum, booking) => sum + booking._count.passengers, 0),

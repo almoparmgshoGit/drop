@@ -456,7 +456,7 @@ class TrackingService {
         boardingPointId: true,
         boardingPointName: true,
         boardingPointTime: true,
-        passengers: { select: { seatNumber: true, ticket: { select: { isBoarded: true } } } },
+        passengers: { where: { cancelled: false }, select: { seatNumber: true, ticket: { select: { isBoarded: true } } } },
         // Staff notes in other events are not the customer's concern; this one was written for them.
         events: { where: { action: 'CREW_NOTICE' }, orderBy: { createdAt: 'desc' }, take: MAX_NOTICES, select: { id: true, after: true, createdAt: true } },
         trip: {

@@ -61,7 +61,7 @@ export class CollectionsService {
           branchId: true,
           user: { select: { phone: true, name: true } },
           trip: { select: { id: true, tripCode: true, departureTime: true } },
-          passengers: { select: { fullName: true, phone: true }, orderBy: { seatNumber: 'asc' } },
+          passengers: { where: { cancelled: false }, select: { fullName: true, phone: true }, orderBy: { seatNumber: 'asc' } },
           payment: { select: { amount: true, walletAmount: true, status: true, followUpNote: true } },
           collections: { select: { amount: true } },
         },

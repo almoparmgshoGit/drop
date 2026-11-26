@@ -612,8 +612,8 @@ export class UsersService implements OnModuleInit, OnModuleDestroy {
           // Field by field: a ticket's signed token boards whoever holds it, and costs are not a support employee's concern.
           include: {
             trip: { select: { id: true, tripCode: true, origin: true, destination: true, departureTime: true, arrivalTime: true, tripStatus: true } },
-            passengers: { select: { id: true, fullName: true, phone: true, seatNumber: true } },
-            tickets: { select: { id: true, passengerId: true, ticketNumber: true, isBoarded: true, boardedAt: true } },
+            passengers: { select: { id: true, fullName: true, phone: true, seatNumber: true, cancelled: true } },
+            tickets: { select: { id: true, passengerId: true, ticketNumber: true, isBoarded: true, boardedAt: true, status: true, cancelledAt: true } },
             payment: { select: { id: true, amount: true, walletAmount: true, currency: true, status: true, method: true, createdAt: true } },
           },
           orderBy: { createdAt: 'desc' },

@@ -65,14 +65,19 @@ export class InvoicesService {
     const scope = await this.collections.branchScope(actor);
     const days = query.from && query.to ? riyadhDaysRange(query.from, query.to) : null;
     const inMonth: Prisma.InvoiceWhereInput = { issuedAt: days ?? riyadhMonthRange(month), booking: scope };
-    const where: Prisma.InvoiceWhereInput = { ...inMonth, ...(query.tripId && { tripId: query.tripId }) };
+    const where: Prisma.InvoiceWhereInput = {
+      ...inMonth,
+      ...(query.tripId && { tripId: query.tripId }),
+      ...(query.status === 'active' && { creditNotes: { none: {} } }),
+      ...(query.status === 'credited' && { creditNotes: { some: {} } }),
+    };
 
     const [invoices, trips, vatRate] = await Promise.all([
       this.prisma.invoice.findMany({
         where,
         orderBy: { number: 'desc' },
         include: {
-          creditNotes: { select: { total: true } },
+          creditNotes: { select: { id: true, number: true, tripCode: true, total: true, taxable: true, vat: true }, orderBy: { number: 'asc' } },
           booking: {
             select: {
               id: true,
@@ -93,14 +98,20 @@ export class InvoicesService {
     // Phase 2 only: empty until e-invoicing has signed something, and then the register shows each invoice's reporting state.
     const zatcaStatuses = await this.zatca.statusByInvoice(invoices.map((invoice) => invoice.id));
 
-    const totals = { taxable: 0, vat: 0, total: 0, collected: 0, remaining: 0 };
+    const totals = { taxable: 0, vat: 0, total: 0, credits: 0, creditsTaxable: 0, creditsVat: 0, collected: 0, remaining: 0 };
     const rows = invoices.map((invoice) => {
       const { held, remaining } = netBookingFigures(invoice.booking);
+      const credited = invoice.creditNotes.reduce((sum, note) => sum + halalas(note.total), 0);
+      const creditedVat = invoice.creditNotes.reduce((sum, note) => sum + halalas(note.vat), 0);
       totals.taxable += halalas(invoice.taxable);
       totals.vat += halalas(invoice.vat);
       totals.total += halalas(invoice.total);
+      totals.credits += credited;
+      totals.creditsTaxable += invoice.creditNotes.reduce((sum, note) => sum + halalas(note.taxable), 0);
+      totals.creditsVat += creditedVat;
       totals.collected += held;
       totals.remaining += remaining;
+      const isCancelled = invoice.booking.status === 'CANCELLED';
       return {
         id: invoice.id,
         number: invoiceNumber(invoice.tripCode, invoice.number),
@@ -117,8 +128,12 @@ export class InvoicesService {
         total: Number(invoice.total),
         paid: sar(held),
         remaining: sar(remaining),
-        isCancelled: invoice.booking.status === 'CANCELLED',
-        credited: sar(invoice.creditNotes.reduce((sum, note) => sum + halalas(note.total), 0)),
+        isCancelled,
+        credited: sar(credited),
+        creditedVat: sar(creditedVat),
+        // The invoice itself never changes; what was reversed shows beside it, with the notes that did it.
+        creditState: credited === 0 ? 'NONE' : isCancelled || credited >= halalas(invoice.total) ? 'FULL' : 'PARTIAL',
+        creditNotes: invoice.creditNotes.map((note) => ({ id: note.id, number: creditNoteNumber(note.tripCode, note.number) })),
         zatcaStatus: zatcaStatuses.get(invoice.id) ?? null,
       };
     });
@@ -133,6 +148,12 @@ export class InvoicesService {
         taxable: sar(totals.taxable),
         vat: sar(totals.vat),
         total: sar(totals.total),
+        // Net of the credit notes against these invoices, so a cancelled booking no longer counts as a sale.
+        credits: sar(totals.credits),
+        creditsVat: sar(totals.creditsVat),
+        netTaxable: sar(totals.taxable - totals.creditsTaxable),
+        netVat: sar(totals.vat - totals.creditsVat),
+        netTotal: sar(totals.total - totals.credits),
         collected: sar(totals.collected),
         remaining: sar(totals.remaining),
         rate: owed > 0 ? Math.round((totals.collected / owed) * 1000) / 10 : null,
@@ -157,6 +178,115 @@ export class InvoicesService {
     // The reason for a manual price is a staff note; the customer sees the amount.
     const { boardingCode: _code, branchName: _branch, breakdown: { adjustmentReason: _why, ...breakdown }, ...invoice } = await this.buildPrintable(bookingId);
     return { ...invoice, breakdown };
+  }
+
+  /** Credit notes issued in the period, each against its original invoice, with why and by whom. */
+  async creditNotes(actor: CashActor, query: InvoicesQuery) {
+    const month = query.month ?? riyadhMonth(new Date());
+    const scope = await this.collections.branchScope(actor);
+    const days = query.from && query.to ? riyadhDaysRange(query.from, query.to) : null;
+    const where: Prisma.CreditNoteWhereInput = {
+      issuedAt: days ?? riyadhMonthRange(month),
+      booking: scope,
+      ...(query.tripId && { invoice: { tripId: query.tripId } }),
+    };
+    const notes = await this.prisma.creditNote.findMany({
+      where,
+      orderBy: { number: 'desc' },
+      include: {
+        invoice: { select: { tripCode: true, number: true, passengerName: true, issuedAt: true } },
+        booking: { select: { id: true, bookingReference: true, user: { select: { name: true } } } },
+      },
+    });
+    const actorIds = [...new Set(notes.map((note) => note.createdById).filter((id): id is string => !!id))];
+    const [staff, zatcaStatuses] = await Promise.all([
+      this.prisma.user.findMany({ where: { id: { in: actorIds } }, select: { id: true, name: true } }),
+      this.zatca.statusByCreditNote(notes.map((note) => note.id)),
+    ]);
+    const names = new Map(staff.map((user) => [user.id, user.name]));
+
+    const totals = { taxable: 0, vat: 0, total: 0 };
+    const rows = notes.map((note) => {
+      totals.taxable += halalas(note.taxable);
+      totals.vat += halalas(note.vat);
+      totals.total += halalas(note.total);
+      return {
+        id: note.id,
+        number: creditNoteNumber(note.tripCode, note.number),
+        invoiceNumber: invoiceNumber(note.invoice.tripCode, note.invoice.number),
+        bookingId: note.booking.id,
+        reference: note.booking.bookingReference,
+        customer: note.invoice.passengerName ?? note.booking.user.name,
+        taxable: Number(note.taxable),
+        vat: Number(note.vat),
+        total: Number(note.total),
+        issuedAt: note.issuedAt,
+        reason: note.reason,
+        // Issued by the system itself (a payment gateway refund, an old cancellation) when nobody is recorded.
+        createdByName: note.createdById ? names.get(note.createdById) ?? null : null,
+        zatcaStatus: zatcaStatuses.get(note.id) ?? null,
+      };
+    });
+
+    const page = query.page ?? 1;
+    return {
+      month,
+      summary: { count: rows.length, taxable: sar(totals.taxable), vat: sar(totals.vat), total: sar(totals.total) },
+      items: rows.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE),
+      total: rows.length,
+      page,
+    };
+  }
+
+  /** A credit note on its own, with the seller, VAT number and QR like the invoice it reverses. */
+  async printableCreditNote(actor: CashActor, id: string) {
+    const note = await this.prisma.creditNote.findUnique({
+      where: { id },
+      include: {
+        invoice: true,
+        booking: { select: { bookingReference: true, user: { select: { name: true } } } },
+      },
+    });
+    if (!note) throw new NotFoundException('إشعار الدائن غير موجود');
+    await this.collections.assertBookingVisible(actor, note.bookingId);
+
+    const { invoice } = note;
+    const settings = await this.ledger.invoiceSettings(this.prisma);
+    const frozen = (invoice.seller ?? {}) as { name?: string; vatNumber?: string; crNumber?: string; city?: string };
+    const seller = {
+      name: frozen.name || settings.sellerName,
+      tagline: settings.sellerTagline,
+      vatNumber: frozen.vatNumber || settings.vatNumber,
+      crNumber: frozen.crNumber || settings.crNumber,
+      city: frozen.city || settings.sellerCity,
+    };
+    const total = Number(note.total);
+    const vat = Number(note.vat);
+    const createdBy = note.createdById ? await this.prisma.user.findUnique({ where: { id: note.createdById }, select: { name: true } }) : null;
+    const signedQr = await this.zatca.printableCreditNoteQr(note.id);
+
+    return {
+      number: creditNoteNumber(note.tripCode, note.number),
+      issuedAt: note.issuedAt,
+      reason: note.reason,
+      createdByName: createdBy?.name ?? null,
+      invoice: { number: invoiceNumber(invoice.tripCode, invoice.number), issuedAt: invoice.issuedAt, total: Number(invoice.total), vat: Number(invoice.vat) },
+      reference: note.booking.bookingReference,
+      customer: invoice.passengerName ?? note.booking.user.name,
+      nationalId: invoice.nationalId,
+      tripCode: invoice.tripCode,
+      destination: invoice.destination,
+      tripDate: invoice.tripDate,
+      taxable: Number(note.taxable),
+      vat,
+      vatRate: Number(invoice.vatRate),
+      total,
+      amountInWords: amountInWords(total),
+      seller,
+      qr: signedQr ?? (seller.vatNumber ? zatcaQr({ seller: seller.name, vatNumber: seller.vatNumber, issuedAt: note.issuedAt, total, vat }) : null),
+      qrPhase: signedQr ? 2 : 1,
+      contacts: settings.invoiceContacts.split('\n').map((line) => line.trim()).filter(Boolean),
+    };
   }
 
   private async buildPrintable(bookingId: string) {
@@ -188,7 +318,7 @@ export class InvoicesService {
             payment: { select: { amount: true, walletAmount: true, status: true, method: true } },
             collections: { select: { amount: true } },
             cashMovements: { where: { type: 'BOOKING_REFUND' }, select: { amount: true } },
-            passengers: { select: { fullName: true, seatNumber: true, hotelRoom: { select: { type: true } } } },
+            passengers: { select: { fullName: true, seatNumber: true, cancelled: true, hotelRoom: { select: { type: true } }, ticket: { select: { status: true, cancelledAt: true, cancelledSeatNumber: true } } } },
             trip: { select: { bookingType: true, direction: true, departureTime: true, arrivalTime: true, reverseDepartureAt: true } },
           },
         },
@@ -206,7 +336,11 @@ export class InvoicesService {
       crNumber: frozen.crNumber || settings.crNumber,
       city: frozen.city || settings.sellerCity,
     };
-    const passengers = [...booking.passengers].sort((a, b) => compareSeats(a.seatNumber, b.seatNumber));
+    // A ticket cancelled on its own stays on the invoice as a cancelled line, not among the seats travelling.
+    const passengers = booking.passengers.filter((p) => !p.cancelled).sort((a, b) => compareSeats(a.seatNumber, b.seatNumber));
+    const cancelledTickets = booking.passengers
+      .filter((p) => p.cancelled)
+      .map((p) => ({ fullName: p.fullName, seat: seatLabel(p.ticket?.cancelledSeatNumber ?? null), cancelledAt: p.ticket?.cancelledAt ?? null }));
     const { held, remaining } = netBookingFigures(booking);
     const total = Number(invoice.total);
     const vat = Number(invoice.vat);
@@ -219,6 +353,7 @@ export class InvoicesService {
       passengerName: invoice.passengerName,
       passengerCount: passengers.length,
       seats: passengers.map((p) => seatLabel(p.seatNumber)),
+      cancelledTickets,
       tripCode: invoice.tripCode,
       destination: invoice.destination,
       tripDate: invoice.tripDate,
@@ -254,6 +389,7 @@ export class InvoicesService {
       isCancelled: booking.status === 'CANCELLED',
       amountInWords: amountInWords(total),
       creditNotes: invoice.creditNotes.map((note) => ({
+        id: note.id,
         number: creditNoteNumber(note.tripCode, note.number),
         total: Number(note.total),
         vat: Number(note.vat),
@@ -330,7 +466,7 @@ export class InvoicesService {
           busCost: { select: { rentHasTaxInvoice: true } },
           hotelBookings: {
             where: { status: 'CONFIRMED', hasTaxInvoice: true },
-            select: { nightlyRate: true, rateUnit: true, extraCost: true, checkIn: true, checkOut: true, rooms: { select: { _count: { select: { occupants: true } } } } },
+            select: { nightlyRate: true, privateNightlyRate: true, rateUnit: true, extraCost: true, checkIn: true, checkOut: true, rooms: { select: { type: true, _count: { select: { occupants: true } } } } },
           },
         },
       }),

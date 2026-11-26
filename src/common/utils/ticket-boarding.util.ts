@@ -67,9 +67,9 @@ export async function boardingOfBookings(
     trip: { findMany: (args: { where: { id: { in: string[] } }; select: typeof TICKET_BOARDING_TRIP_SELECT }) => Promise<TripFacts[]> };
     ticketCompensation: { findMany: (args: { where: { bookingId: { in: string[] } }; select: { bookingId: true; amount: true } }) => Promise<{ bookingId: string; amount: unknown }[]> };
   },
-  bookings: (PointOfBooking & { id: string; status: string; tripId: string; passengers: { ticket: { isBoarded: boolean } | null }[] })[],
+  bookings: (PointOfBooking & { id: string; status: string; tripId: string; passengers: { cancelled?: boolean; ticket: { isBoarded: boolean } | null }[] })[],
 ) {
-  const waiting = bookings.filter((booking) => CAN_BOARD_STATUSES.includes(booking.status) && booking.passengers.some((passenger) => passenger.ticket && !passenger.ticket.isBoarded));
+  const waiting = bookings.filter((booking) => CAN_BOARD_STATUSES.includes(booking.status) && booking.passengers.some((passenger) => !passenger.cancelled && passenger.ticket && !passenger.ticket.isBoarded));
   const result = new Map<string, BookingBoarding>();
   if (waiting.length === 0) return result;
   const trips = await db.trip.findMany({ where: { id: { in: [...new Set(waiting.map((booking) => booking.tripId))] } }, select: TICKET_BOARDING_TRIP_SELECT });

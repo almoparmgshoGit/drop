@@ -48,6 +48,8 @@ const MANIFEST_BOOKING_SELECT = {
   branch: { select: { name: true } },
   user: { select: { phone: true, ...PROFILE_ACCOUNT_SELECT } },
   passengers: {
+    // A cancelled ticket's passenger is off the bus: no row, no seat, no count.
+    where: { cancelled: false },
     // The booking's owner first, so the account phone below lands on them.
     orderBy: { position: 'asc' },
     // Signed ticket tokens stay out on purpose: a manifest is printed and passed around.
@@ -306,7 +308,7 @@ export class ManifestsService {
     if (trip._count.drivers + trip._count.supervisors === 0) throw new ConflictException('أسند سائقًا أو مشرفًا للرحلة أولًا');
 
     const sender = await this.prisma.user.findUnique({ where: { id: actor.userId }, select: { name: true } });
-    const passengerCount = await this.prisma.bookingPassenger.count({ where: { booking: { tripId, status: { in: ON_MANIFEST } } } });
+    const passengerCount = await this.prisma.bookingPassenger.count({ where: { cancelled: false, booking: { tripId, status: { in: ON_MANIFEST } } } });
     const sentAt = new Date();
     await this.prisma.$transaction(async (tx) => {
       await tx.trip.update({ where: { id: tripId }, data: { manifestSentAt: sentAt, manifestSentByName: sender?.name ?? null } });
@@ -344,7 +346,7 @@ export class ManifestsService {
         accommodations: { select: { nights: true } },
         hotelBookings: {
           where: { status: 'CONFIRMED' },
-          select: { nightlyRate: true, rateUnit: true, extraCost: true, checkIn: true, checkOut: true, rooms: { select: { _count: { select: { occupants: true } } } } },
+          select: { nightlyRate: true, privateNightlyRate: true, rateUnit: true, extraCost: true, checkIn: true, checkOut: true, rooms: { select: { type: true, _count: { select: { occupants: true } } } } },
         },
         bookings: {
           select: {
@@ -363,7 +365,7 @@ export class ManifestsService {
             serviceType: true,
             housingAmount: true,
             subtotal: true,
-            passengers: { orderBy: { position: 'asc' }, select: { id: true, fullName: true, notes: true, seatNumber: true } },
+            passengers: { where: { cancelled: false }, orderBy: { position: 'asc' }, select: { id: true, fullName: true, notes: true, seatNumber: true } },
           },
         },
       },

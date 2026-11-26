@@ -90,4 +90,18 @@ export class BookingsController {
   async adminCancel(@Req() req, @Param('id') id: string, @Body() dto: AdminCancelDto) {
     return this.bookingsService.adminCancel(req.user, id, dto, req.ip);
   }
+
+  @Get(':id/passengers/:passengerId/cancel-estimate')
+  @RequirePermission('bookings.cancel')
+  @ApiOperation({ summary: "What cancelling one passenger's ticket would move, and what the cancellation policy suggests refunding" })
+  async ticketCancelEstimate(@Param('id') id: string, @Param('passengerId') passengerId: string) {
+    return this.bookingsService.ticketCancelEstimate(id, passengerId);
+  }
+
+  @Post(':id/passengers/:passengerId/cancel')
+  @RequirePermission('bookings.cancel')
+  @ApiOperation({ summary: "Cancel one passenger's ticket; the rest of the booking keeps travelling" })
+  async cancelTicket(@Req() req, @Param('id') id: string, @Param('passengerId') passengerId: string, @Body() dto: AdminCancelDto) {
+    return this.bookingsService.adminCancelTicket(req.user, id, passengerId, dto, req.ip);
+  }
 }

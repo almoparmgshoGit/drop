@@ -349,6 +349,120 @@ describe('Invoices, tax report and trip accounts', () => {
       expect(rows.reduce((sum, row) => sum + Math.round(Number(row.total) * 100), 0)).toBe(10000);
       expect(rows.reduce((sum, row) => sum + Math.round(Number(row.vat) * 100), 0)).toBe(Math.round(Number(invoice.vat) * 100));
     });
+
+    // The client's test cases (ZATCA: an issued invoice is never changed; a credit note reverses it).
+    describe('client cases', () => {
+      /** Two travellers on one booking, as a round trip or a package sells them: one ticket can be cancelled alone. */
+      const twoTravellers = async (total = 230) => {
+        const booking = await prisma.booking.create({
+          data: {
+            bookingReference: `DR-${key()}`,
+            userId: adminUser.id,
+            tripId,
+            branchId,
+            source: 'BRANCH',
+            status: 'CONFIRMED',
+            totalPrice: total,
+            passengers: {
+              create: [
+                { fullName: 'ناصر الحربي', nationalId: '1012345678', phone: '+966544102231', seatNumber: '4' },
+                { fullName: 'سعد الحربي', nationalId: '1012345679', phone: '+966544102232', seatNumber: '5' },
+              ],
+            },
+            payment: { create: { amount: total, walletAmount: 0, status: 'SIMULATED', method: 'cash' } },
+          },
+          include: { passengers: true },
+        });
+        for (const passenger of booking.passengers) {
+          await prisma.ticket.create({ data: { bookingId: booking.id, passengerId: passenger.id, ticketNumber: `TK-${key()}`, signedToken: 'test' } });
+        }
+        await prisma.$transaction((tx) => app.get(InvoiceLedgerService).ensure(tx, booking.id));
+        return booking;
+      };
+      const cancelTicket = (bookingId: string, passengerId: string) =>
+        prisma.$transaction((tx) => app.get(BookingCancellationService).cancelTicket(tx, bookingId, passengerId, { note: 'طلب العميل', reviewedById: adminUser.id }));
+
+      it('cancelled before its invoice was issued: no invoice and no credit note', async () => {
+        const booking = await prisma.booking.create({
+          data: {
+            bookingReference: `DR-${key()}`,
+            userId: adminUser.id,
+            tripId,
+            branchId,
+            source: 'BRANCH',
+            status: 'CONFIRMED',
+            totalPrice: 115,
+            passengers: { create: [{ fullName: 'ناصر الحربي', nationalId: '1012345678', phone: '+966544102231', seatNumber: '4' }] },
+            payment: { create: { amount: 115, walletAmount: 0, status: 'PENDING' } },
+          },
+        });
+        await cancel(booking.id);
+        expect(await prisma.invoice.findUnique({ where: { bookingId: booking.id } })).toBeNull();
+        expect(await notes(booking.id)).toHaveLength(0);
+      });
+
+      it('cancelled after its invoice: a credit note against it, with the reason and employee, and the invoice left as issued', async () => {
+        const booking = await makeBooking({ total: 115, due: 115, status: 'SIMULATED' });
+        const before = await prisma.invoice.findUniqueOrThrow({ where: { bookingId: booking.id } });
+        await prisma.$transaction((tx) => app.get(BookingCancellationService).cancel(tx, booking.id, { note: 'تعذر السفر', reviewedById: adminUser.id }));
+
+        const after = await prisma.invoice.findUniqueOrThrow({ where: { bookingId: booking.id } });
+        expect(after).toEqual(before);
+        const [note] = await notes(booking.id);
+        expect(note).toMatchObject({ invoiceId: before.id, reason: 'تعذر السفر', createdById: adminUser.id });
+        expect(Number(note.total)).toBe(115);
+        expect(Number(note.vat)).toBe(15);
+
+        const register = (await get(`/invoices?month=${month()}`).expect(200)).body;
+        const row = register.items.find((item: { bookingId: string }) => item.bookingId === booking.id);
+        expect(row).toMatchObject({ total: 115, credited: 115, creditState: 'FULL', creditNotes: [{ id: note.id, number: expect.stringMatching(/^CN-/) }] });
+        expect(register.summary).toMatchObject({ total: 115, credits: 115, netTotal: 0, netVat: 0 });
+
+        const printed = (await get(`/invoices/credit-notes/${note.id}`).expect(200)).body;
+        expect(printed).toMatchObject({ total: 115, vat: 15, taxable: 100, reason: 'تعذر السفر', invoice: { number: expect.stringMatching(/^INV-/) } });
+        expect(printed.number).toMatch(/^CN-/);
+
+        const list = (await get(`/invoices/credit-notes?month=${month()}`).expect(200)).body;
+        expect(list.items).toHaveLength(1);
+        expect(list.items[0]).toMatchObject({ number: printed.number, invoiceNumber: printed.invoice.number, customer: 'ناصر الحربي', total: 115, vat: 15, reason: 'تعذر السفر' });
+        expect(list.items[0].createdByName).toBeTruthy();
+      });
+
+      it('one ticket of a two-traveller booking: the note covers that ticket only', async () => {
+        const booking = await twoTravellers(230);
+        await cancelTicket(booking.id, booking.passengers[0].id);
+
+        const [note] = await notes(booking.id);
+        expect(Number(note.total)).toBe(115);
+        expect(Number(note.vat)).toBe(15);
+        expect(Number((await prisma.invoice.findUniqueOrThrow({ where: { bookingId: booking.id } })).total)).toBe(230);
+
+        const row = (await get(`/invoices?month=${month()}`).expect(200)).body.items.find((item: { bookingId: string }) => item.bookingId === booking.id);
+        expect(row).toMatchObject({ creditState: 'PARTIAL', credited: 115 });
+      });
+
+      it('filters the register into all, active and credited', async () => {
+        const kept = await makeBooking({ total: 115, due: 115, status: 'SIMULATED' });
+        const cancelled = await makeBooking({ total: 115, due: 115, status: 'SIMULATED' });
+        await cancel(cancelled.id);
+        const ids = async (status: string) => (await get(`/invoices?month=${month()}&status=${status}`).expect(200)).body.items.map((row: { bookingId: string }) => row.bookingId);
+        expect((await ids('all')).sort()).toEqual([kept.id, cancelled.id].sort());
+        expect(await ids('active')).toEqual([kept.id]);
+        expect(await ids('credited')).toEqual([cancelled.id]);
+        await get(`/invoices?status=void`).expect(400);
+      });
+
+      it('the tax report keeps the sale and nets out the credit note in the month it was issued', async () => {
+        const report = async () => (await get(`/invoices/tax-report?month=${month()}`).expect(200)).body.totals;
+        const booking = await twoTravellers(230);
+        const before = await report();
+        expect(before).toMatchObject({ sales: 230, outputVat: 30, credits: 0, creditsVat: 0, netOutputVat: 30 });
+
+        await cancelTicket(booking.id, booking.passengers[0].id);
+        const after = await report();
+        expect(after).toMatchObject({ sales: 230, outputVat: 30, credits: 115, creditsVat: 15, netOutputVat: 15 });
+      });
+    });
   });
 
   describe('tax report', () => {

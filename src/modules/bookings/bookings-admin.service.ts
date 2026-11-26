@@ -23,6 +23,7 @@ import { compareSeats, NO_SEAT_LABEL, seatLabel } from '../../common/utils/seat-
 import { assertIdsFreeOnTrips } from '../../common/utils/passenger-ids.util';
 import { singlesOverflow } from '../../common/utils/singles-seats.util';
 import { allocate, BookingsService, holdAvailableTo, randomCode, toHalalas, toSar } from './bookings.service';
+import { LIVE_PASSENGER } from '../../common/utils/ticket-cancel.util';
 
 const EDIT_TX_OPTIONS = { maxWait: 10_000, timeout: 30_000 };
 const EXPORT_LIMIT = 5000;
@@ -30,7 +31,12 @@ const SEARCH_LIMIT = 100;
 const PAID_STATUSES = ['COMPLETED', 'SIMULATED'];
 
 // Signed tokens are what a passenger scans to board, so they never leave through the panel endpoints.
-const TICKET_SELECT = { select: { id: true, ticketNumber: true, isBoarded: true, boardedAt: true, returnBoardedAt: true, noShowAt: true, returnNoShowAt: true } };
+const TICKET_SELECT = {
+  select: {
+    id: true, ticketNumber: true, isBoarded: true, boardedAt: true, returnBoardedAt: true, noShowAt: true, returnNoShowAt: true,
+    status: true, cancelledAt: true, cancelledByName: true, cancelReason: true, cancelledSeatNumber: true, refundAmount: true, keptAmount: true,
+  },
+};
 
 export interface BookingsActor {
   userId: string;
@@ -40,7 +46,8 @@ export interface BookingsActor {
 const LIST_INCLUDE = {
   branch: { select: { id: true, name: true } },
   trip: { select: { id: true, tripCode: true, origin: true, destination: true, departureTime: true, estimatedArrivalAt: true, busType: true, bookingType: true, direction: true } },
-  passengers: { orderBy: { position: 'asc' }, select: { id: true, fullName: true, phone: true, nationalId: true, gender: true, nationality: true, seatNumber: true, hotelRoom: { select: { number: true, type: true, hotelBooking: { select: { hotel: { select: { id: true, name: true } } } } } }, ticket: TICKET_SELECT } },
+  // Lists, searches and exports show who travels: a cancelled ticket stays only on the booking's own page.
+  passengers: { where: LIVE_PASSENGER, orderBy: { position: 'asc' }, select: { id: true, fullName: true, phone: true, nationalId: true, gender: true, nationality: true, seatNumber: true, hotelRoom: { select: { number: true, type: true, hotelBooking: { select: { hotel: { select: { id: true, name: true } } } } } }, ticket: TICKET_SELECT } },
   payment: true,
   collections: { select: { amount: true } },
   user: { select: { id: true, name: true, phone: true } },
@@ -110,6 +117,11 @@ export class BookingsAdminService {
     return city ? { AND: [{ OR: [{ branchId: me.branchId }, { trip: cityTripWhere(city) }] }] } : { branchId: me.branchId };
   }
 
+  /** The same branch limit, for other tables of bookings (the tickets table). */
+  scopeFor(actor: BookingsActor, requested?: string) {
+    return this.branchScope(actor, requested);
+  }
+
   /** A booking of another branch reads as missing or refused the same way everywhere on these routes. */
   async assertVisible(actor: BookingsActor, bookingId: string) {
     if (actor.permissions.includes('bookings.all_branches')) return;
@@ -151,8 +163,8 @@ export class BookingsAdminService {
     // A passenger left behind once the trip was executed is a no-show (لم يحضر), no longer waiting.
     if (query.boarding === 'WAITING') where.tickets = { none: { OR: [{ isBoarded: true }, { noShowAt: { not: null } }] } };
     if (query.boarding === 'NO_SHOW') where.tickets = { some: { isBoarded: false, noShowAt: { not: null } } };
-    if (query.boarding === 'BOARDED') where.AND = [{ tickets: { some: {} } }, { tickets: { none: { isBoarded: false } } }];
-    if (query.boarding === 'PARTIAL') where.AND = [{ tickets: { some: { isBoarded: true } } }, { tickets: { some: { isBoarded: false } } }];
+    if (query.boarding === 'BOARDED') where.AND = [{ tickets: { some: {} } }, { tickets: { none: { isBoarded: false, status: 'CONFIRMED' } } }];
+    if (query.boarding === 'PARTIAL') where.AND = [{ tickets: { some: { isBoarded: true } } }, { tickets: { some: { isBoarded: false, status: 'CONFIRMED' } } }];
     if (query.month) {
       const [year, month] = query.month.split('-').map(Number);
       const offset = 3 * 60 * 60 * 1000;
@@ -387,7 +399,7 @@ export class BookingsAdminService {
             drivers: { where: { isPrimary: true }, select: { user: { select: { name: true } } } },
           },
         },
-        passengers: { select: { id: true, fullName: true, phone: true, nationalId: true, notes: true, roomNote: true, seatNumber: true, hotelRoom: { select: { number: true, type: true, hotelBooking: { select: { hotel: { select: { id: true, name: true } } } } } }, ticket: TICKET_SELECT } },
+        passengers: { select: { id: true, fullName: true, phone: true, nationalId: true, notes: true, roomNote: true, seatNumber: true, cancelled: true, hotelRoom: { select: { number: true, type: true, hotelBooking: { select: { hotel: { select: { id: true, name: true } } } } } }, ticket: TICKET_SELECT } },
         payment: true,
         paymentTransactions: { where: { type: 'REFUND' }, orderBy: { number: 'asc' } },
         collections: { orderBy: { createdAt: 'asc' }, select: { id: true, method: true, amount: true, reference: true, createdByName: true, createdAt: true } },
@@ -405,8 +417,11 @@ export class BookingsAdminService {
       total: counts.reduce((sum, row) => sum + row._count, 0),
       cancelled: counts.find((row) => row.status === 'CANCELLED')?._count ?? 0,
     };
+    // Who decided the cancellation (or rejected the request), shown beside its date and reason.
+    const cancelReviewer = booking.cancelReviewedById ? await this.prisma.user.findUnique({ where: { id: booking.cancelReviewedById }, select: { name: true } }) : null;
     return {
       ...booking,
+      cancelReviewerName: cancelReviewer?.name ?? null,
       passengers: [...booking.passengers].sort((a, b) => compareSeats(a.seatNumber, b.seatNumber)),
       customerBookings,
     };
@@ -456,10 +471,12 @@ export class BookingsAdminService {
     return booking;
   }
 
-  private findPassenger<T extends { id: string }>(booking: { passengers: T[] }, passengerId: string): T {
+  private findPassenger<T extends { id: string; cancelled: boolean }>(booking: { passengers: T[] }, passengerId: string): T {
     // Looked up inside the booking so an id from another booking can never be edited through this one.
     const passenger = booking.passengers.find((p) => p.id === passengerId);
     if (!passenger) throw new NotFoundException('المسافر لا يتبع هذا الحجز');
+    // A cancelled ticket is final: its passenger is kept on the booking for the record only.
+    if (passenger.cancelled) throw new BadRequestException('تذكرة هذا المسافر ملغاة، فلا يمكن تعديلها أو تسجيل صعوده');
     return passenger;
   }
 
@@ -643,7 +660,7 @@ export class BookingsAdminService {
 
       const now = new Date();
       await tx.ticket.update({ where: { id: passenger.ticket.id }, data: { isBoarded: true, boardedAt: now, noShowAt: null } });
-      const allBoarded = booking.passengers.every((p) => p.id === passengerId || p.ticket?.isBoarded);
+      const allBoarded = booking.passengers.every((p) => p.id === passengerId || p.cancelled || p.ticket?.isBoarded);
       await tx.booking.update({ where: { id: bookingId }, data: allBoarded ? { status: 'BOARDED' } : { updatedAt: now } });
       await this.events.record(tx, {
         bookingId,

@@ -57,6 +57,13 @@ class HotelsController {
     return this.hotels.overview(query.month, query.from, query.to);
   }
 
+  @Get(':id/statement')
+  @RequirePermission('hotels.rates')
+  @ApiOperation({ summary: "A hotel's statement for a period: room bills by room type, extras, prepayments and balance" })
+  statement(@Param('id') id: string, @Query() query: HotelsOverviewQuery) {
+    return this.hotels.statement(id, query);
+  }
+
   @Get('trips/:tripId')
   @RequirePermission('hotels.view')
   @ApiOperation({ summary: 'Passengers who need rooms on a trip, with its hotel bookings' })

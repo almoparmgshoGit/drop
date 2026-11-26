@@ -1,4 +1,4 @@
-import { HotelRateUnit } from '@prisma/client';
+import { HotelRateUnit, RoomType } from '@prisma/client';
 type Money = number | string | { toString(): string };
 
 export const PAID_PAYMENT_STATUSES = ['COMPLETED', 'SIMULATED'];
@@ -54,14 +54,37 @@ export function splitOriginalRefund(refund: number, received: number, collection
   return { wallet: refund - original, cash, external: original - cash };
 }
 
+type BilledRoom = { type: RoomType; _count: { occupants: number } };
+type CostedHotelBooking = { nightlyRate: Money; privateNightlyRate?: Money | null; rateUnit: HotelRateUnit; extraCost: Money; checkIn: Date; checkOut: Date; rooms: BilledRoom[] };
+
 /** What the hotel bills on: each room with someone in it, or each person when the contract is by the bed. */
 export function billedUnits(booking: { rateUnit: HotelRateUnit; rooms: { _count: { occupants: number } }[] }) {
   const occupied = booking.rooms.filter((room) => room._count.occupants > 0);
   return booking.rateUnit === 'BED' ? occupied.reduce((sum, room) => sum + room._count.occupants, 0) : occupied.length;
 }
 
-/** The billed units for every night of the stay, plus any extra charge. In halalas. */
-export function hotelBookingCost(booking: { nightlyRate: Money; rateUnit: HotelRateUnit; extraCost: Money; checkIn: Date; checkOut: Date; rooms: { _count: { occupants: number } }[] }) {
-  const nights = Math.round((booking.checkOut.getTime() - booking.checkIn.getTime()) / (24 * 60 * 60 * 1000));
-  return halalas(booking.nightlyRate) * billedUnits(booking) * nights + halalas(booking.extraCost);
+/** Nights between check-in and check-out. */
+export const hotelNights = (booking: { checkIn: Date; checkOut: Date }) =>
+  Math.round((booking.checkOut.getTime() - booking.checkIn.getTime()) / (24 * 60 * 60 * 1000));
+
+/**
+ * The stay's cost by room type, in halalas: shared rooms at nightlyRate, private ones at
+ * privateNightlyRate (or nightlyRate when the hotel has no separate private cost). Without extraCost.
+ */
+export function hotelCostByType(booking: CostedHotelBooking) {
+  const nights = hotelNights(booking);
+  return (['SHARED', 'PRIVATE'] as RoomType[])
+    .map((type) => {
+      const rooms = booking.rooms.filter((room) => room.type === type);
+      const rate = halalas(type === 'PRIVATE' ? (booking.privateNightlyRate ?? booking.nightlyRate) : booking.nightlyRate);
+      const units = billedUnits({ rateUnit: booking.rateUnit, rooms });
+      const occupied = rooms.filter((room) => room._count.occupants > 0).length;
+      return { type, rooms: occupied, units, nights, rate, amount: rate * units * nights };
+    })
+    .filter((row) => row.rooms > 0);
+}
+
+/** The billed units for every night of the stay at their room type's rate, plus any extra charge. In halalas. */
+export function hotelBookingCost(booking: CostedHotelBooking) {
+  return hotelCostByType(booking).reduce((sum, row) => sum + row.amount, 0) + halalas(booking.extraCost);
 }

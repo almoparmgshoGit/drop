@@ -158,6 +158,7 @@ const RETURN_TICKET_INCLUDE = {
 
 /** What the crew's phone keeps of each ticket for boarding without internet. */
 const OFFLINE_TICKET_SELECT = {
+  status: true,
   ticketNumber: true,
   signedToken: true,
   isBoarded: true,
@@ -230,7 +231,7 @@ export class TicketsService {
   private async returningTickets(tripId: string) {
     const bookingIds = await this.returningOn(this.prisma, tripId);
     if (bookingIds.length === 0) return [];
-    return this.prisma.ticket.findMany({ where: { bookingId: { in: bookingIds } }, include: RETURN_TICKET_INCLUDE });
+    return this.prisma.ticket.findMany({ where: { bookingId: { in: bookingIds }, status: 'CONFIRMED' }, include: RETURN_TICKET_INCLUDE });
   }
 
   async getTicketsForBooking(actor: Actor, bookingId: string) {
@@ -249,7 +250,8 @@ export class TicketsService {
       include: { passenger: { select: { id: true, fullName: true, seatNumber: true } } },
     });
     // Only the booking's owner gets the token that opens the bus door.
-    return booking.userId === actor.userId ? tickets : tickets.map((t) => ({ ...t, signedToken: undefined }));
+    // Who on the staff cancelled a ticket is not the customer's concern.
+    return booking.userId === actor.userId ? tickets.map((t) => ({ ...t, cancelledById: undefined, cancelledByName: undefined })) : tickets.map((t) => ({ ...t, signedToken: undefined }));
   }
 
   async getMyAssignedTrips(actor: Actor) {
@@ -279,7 +281,7 @@ export class TicketsService {
     });
 
     const tickets = await this.prisma.ticket.findMany({
-      where: { booking: { tripId: { in: trips.map((trip) => trip.id) }, status: { in: [...TRAVELING_STATUSES] } }, ...STILL_EXPECTED },
+      where: { booking: { tripId: { in: trips.map((trip) => trip.id) }, status: { in: [...TRAVELING_STATUSES] } }, status: 'CONFIRMED', ...STILL_EXPECTED },
       select: { isBoarded: true, noShowAt: true, booking: { select: { tripId: true } } },
     });
     return Promise.all(trips.map(async (trip) => {
@@ -332,7 +334,7 @@ export class TicketsService {
     if (!trip) throw new NotFoundException('Trip not found');
 
     const tickets = await this.prisma.ticket.findMany({
-      where: { booking: { tripId, status: { in: [...TRAVELING_STATUSES] } }, ...STILL_EXPECTED },
+      where: { booking: { tripId, status: { in: [...TRAVELING_STATUSES] } }, status: 'CONFIRMED', ...STILL_EXPECTED },
       select: { isBoarded: true, noShowAt: true },
     });
     const returning = await this.returningTickets(tripId);
@@ -593,7 +595,7 @@ export class TicketsService {
   ) {
     const bookingIds = await this.returningOn(tx, tripId);
     if (bookingIds.length === 0) return;
-    const waiting = await tx.ticket.findMany({ where: { bookingId: { in: bookingIds }, returnBoardedAt: null }, select: { bookingId: true }, distinct: ['bookingId'] });
+    const waiting = await tx.ticket.findMany({ where: { bookingId: { in: bookingIds }, returnBoardedAt: null, status: 'CONFIRMED' }, select: { bookingId: true }, distinct: ['bookingId'] });
     const route = tripValues(trip);
     const here = { ...route, boardingPoint: pointName ?? trip.currentBoardingPoint?.name ?? trip.origin, boardingTime: formatRiyadhTime(trip.departureTime) };
     const waitingIds = waiting.map((ticket) => ticket.bookingId);
@@ -622,7 +624,7 @@ export class TicketsService {
 
     // The crew's copy leaves phone numbers out: the office reaches the passengers, the crew works from names and seats.
     const tickets = await this.prisma.ticket.findMany({
-      where: { booking: { tripId, status: { in: [...TRAVELING_STATUSES] } } },
+      where: { booking: { tripId, status: { in: [...TRAVELING_STATUSES] } }, status: 'CONFIRMED' },
       include: {
         passenger: { include: { hotelRoom: { select: { number: true, type: true } } } },
         booking: {
@@ -635,7 +637,7 @@ export class TicketsService {
             stayHotelId: true,
             user: { select: PROFILE_ACCOUNT_SELECT },
             passengers: { select: PROFILE_PASSENGER_SELECT },
-            _count: { select: { passengers: true } },
+            _count: { select: { passengers: { where: { cancelled: false } } } },
             ...RIDE_STATE_SELECT,
           },
         },
@@ -729,14 +731,16 @@ export class TicketsService {
     // Tickets from the app board with their own signed code only.
     const booking = await this.prisma.booking.findFirst({
       where: { bookingReference: reference, source: 'BRANCH' },
-      select: { tickets: { select: { ticketNumber: true }, orderBy: { ticketNumber: 'asc' } } },
+      select: { tickets: { select: { ticketNumber: true, status: true }, orderBy: { ticketNumber: 'asc' } } },
     });
     if (!booking?.tickets.length) return { result: 'INVALID' };
 
     let boarded: { result: ScanResult; ticket?: any } | null = null;
     let last: { result: ScanResult; ticket?: any } | null = null;
     let boardedCount = 0;
-    for (const { ticketNumber } of booking.tickets) {
+    // A passenger whose ticket was cancelled does not board with the rest; a wholly cancelled booking still answers as cancelled.
+    const live = booking.tickets.filter((ticket) => ticket.status === 'CONFIRMED');
+    for (const { ticketNumber } of live.length ? live : booking.tickets) {
       last = await this.boardByNumber(actor, ticketNumber, tripId, overrides, offline);
       if (last.result === 'BOARDED') {
         boardedCount += 1;
@@ -784,6 +788,7 @@ export class TicketsService {
     if (!trip.manifestSentAt) this.assertTripOpen(actor, trip);
 
     const secret = this.config.getOrThrow<string>('TICKET_SIGNING_SECRET');
+    // Cancelled tickets come too, marked, so an offline scan of one says it is cancelled rather than unknown; the app leaves them off its lists.
     const own = await this.prisma.ticket.findMany({ where: { booking: { tripId, status: { in: [...TRAVELING_STATUSES] } } }, select: OFFLINE_TICKET_SELECT });
     const returningIds = await this.returningOn(this.prisma, tripId);
     const returning = returningIds.length ? await this.prisma.ticket.findMany({ where: { bookingId: { in: returningIds } }, select: OFFLINE_TICKET_SELECT }) : [];
@@ -802,6 +807,7 @@ export class TicketsService {
         boardedAt: isReturning ? ticket.returnBoardedAt : ticket.boardedAt,
         boardedOffline: isReturning ? ticket.returnBoardedOffline : ticket.boardedOffline,
         bookingStatus: ticket.booking.status,
+        ticketStatus: ticket.status,
         hold,
         // Riyals, as on the manifest.
         remaining: paymentFigures(ticket.booking.payment, ticket.booking.collections).remaining / 100,
@@ -889,6 +895,7 @@ export class TicketsService {
         }
       : null;
     if (status === 'ALREADY_BOARDED') reason = ticket?.boardedBy ? `سبق تسجيل صعوده بواسطة ${ticket.boardedBy}` : 'سبق تسجيل صعوده';
+    if (status === 'REJECTED' && outcome.ticket?.ticketCancelled) reason ??= outcome.ticket.message;
     if (status === 'REJECTED') reason ??= OFFLINE_REJECT_REASONS[outcome.result] ?? OFFLINE_REJECT_REASONS.INVALID;
     const response = { clientId: item.clientId, status, result: outcome.result, reason: reason ?? null, ticket, boardedCount: outcome.boardedCount ?? (status === 'ACCEPTED' ? 1 : 0) };
 
@@ -922,6 +929,8 @@ export class TicketsService {
       if (!ticket) return { result: 'INVALID' as const };
 
       const details = describeTicket(ticket);
+      // One passenger's ticket cancelled on a booking that still travels: that passenger has no seat on the bus.
+      if (ticket.status === 'CANCELLED' && ticket.booking.status !== 'CANCELLED') return { result: 'CANCELLED' as const, ticket: { ...details, ticketCancelled: true, message: 'هذه التذكرة ملغاة' } };
       const isReturning = ticket.booking.tripId !== tripId && (await this.returningOn(tx, tripId)).includes(ticket.bookingId);
       if (ticket.booking.tripId !== tripId && !isReturning) return { result: 'WRONG_TRIP' as const, ticket: details };
       if (ticket.booking.status === 'CANCELLED') return { result: 'CANCELLED' as const, ticket: details };
@@ -986,7 +995,7 @@ export class TicketsService {
           ...(offline && { offline: true, scannedAt: boardedAt.toISOString() }),
         },
       });
-      const remaining = await tx.ticket.count({ where: { bookingId: ticket.bookingId, isBoarded: false } });
+      const remaining = await tx.ticket.count({ where: { bookingId: ticket.bookingId, isBoarded: false, status: 'CONFIRMED' } });
       await tx.booking.update({
         where: { id: ticket.bookingId },
         data: remaining === 0 ? { status: 'BOARDED' } : { updatedAt: boardedAt },

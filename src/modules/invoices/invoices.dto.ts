@@ -1,5 +1,5 @@
 import { Type } from 'class-transformer';
-import { IsInt, IsOptional, IsString, Length, Matches, Min, ValidateIf } from 'class-validator';
+import { IsIn, IsInt, IsOptional, IsString, Length, Matches, Min, ValidateIf } from 'class-validator';
 
 const MONTH = /^\d{4}-(0[1-9]|1[0-2])$/;
 const DAY = /^\d{4}-\d{2}-\d{2}$/;
@@ -22,6 +22,11 @@ export class InvoicesQuery {
   @IsString()
   @Length(1, 60)
   tripId?: string;
+
+  /** سارية: nothing credited; ملغاة بإشعار دائن: reversed in whole or in part. Ignored by the credit note register. */
+  @IsOptional()
+  @IsIn(['all', 'active', 'credited'], { message: 'الحالة غير صحيحة' })
+  status?: 'all' | 'active' | 'credited';
 
   @IsOptional()
   @Type(() => Number)

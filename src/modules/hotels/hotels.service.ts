@@ -9,7 +9,7 @@ import { bookingTypeLabel } from '../../common/utils/booking-kinds.util';
 import { includedBedValue } from '../../common/utils/housing-price.util';
 import { HOUSING_BOOKING_TYPES, includesHousing } from '../../common/utils/booking-types.util';
 import { CREW_WINDOW_SELECT, crewWindow } from '../../common/utils/crew-window.util';
-import { hotelBookingCost } from '../../common/utils/payment.util';
+import { halalas, hotelBookingCost, hotelCostByType } from '../../common/utils/payment.util';
 import { SERVICE_SELECT, withHotelServices } from '../../common/utils/services.util';
 import { GALLERY_SELECT, galleryRows } from '../../common/utils/gallery.util';
 import { hotelRatingSummaries, NO_RATINGS, withHotelRatings } from '../../common/utils/hotel-ratings.util';
@@ -117,7 +117,7 @@ export class HotelsService {
       (await this.prisma.hotel.findMany({ orderBy: [{ isActive: 'desc' }, { name: 'asc' }], include: HOTEL_PROFILE })).map(withHotelServices),
     );
     // The contract rate is a purchase price, so only ranks allowed to see costs get it.
-    return actor.permissions.includes('hotels.rates') ? hotels : hotels.map(({ nightlyRate, ...hotel }) => hotel);
+    return actor.permissions.includes('hotels.rates') ? hotels : hotels.map(({ nightlyRate, privateNightlyRate, ...hotel }) => hotel);
   }
 
   /** Every registered hotel, booked or not, with what is happening in it today. */
@@ -136,11 +136,11 @@ export class HotelsService {
       },
     });
     const canSeeRates = actor.permissions.includes('hotels.rates');
-    return (await withHotelRatings(this.prisma, hotels.map(withHotelServices))).map(({ bookings, roomBlocks, _count, nightlyRate, ...hotel }) => {
+    return (await withHotelRatings(this.prisma, hotels.map(withHotelServices))).map(({ bookings, roomBlocks, _count, nightlyRate, privateNightlyRate, ...hotel }) => {
       const current = bookings.filter((b) => b.checkIn <= today).flatMap((b) => b.rooms);
       return {
         ...hotel,
-        ...(canSeeRates && { nightlyRate }),
+        ...(canSeeRates && { nightlyRate, privateNightlyRate }),
         occupiedRooms: current.filter((r) => r._count.occupants > 0).length,
         guests: current.reduce((sum, r) => sum + r._count.occupants, 0),
         upcomingBookings: bookings.filter((b) => b.checkIn > today).length,
@@ -200,9 +200,9 @@ export class HotelsService {
     if (!hotel) throw new NotFoundException('الفندق غير موجود');
 
     const canSeeRates = actor.permissions.includes('hotels.rates');
-    const { bookings, complaints, roomBlocks, nightlyRate, ...details } = withHotelServices(hotel);
+    const { bookings, complaints, roomBlocks, nightlyRate, privateNightlyRate, ...details } = withHotelServices(hotel);
     return {
-      hotel: { ...details, ...(canSeeRates && { nightlyRate }), rating: (await hotelRatingSummaries(this.prisma, [hotel.id])).get(hotel.id) ?? NO_RATINGS },
+      hotel: { ...details, ...(canSeeRates && { nightlyRate, privateNightlyRate }), rating: (await hotelRatingSummaries(this.prisma, [hotel.id])).get(hotel.id) ?? NO_RATINGS },
       roomBlocks,
       bookings: bookings.map((b) => {
         const occupied = b.rooms.filter((r) => r.occupants.length > 0).length;
@@ -239,8 +239,9 @@ export class HotelsService {
           })),
           ...(canSeeRates && {
             nightlyRate: money(b.nightlyRate),
+            privateNightlyRate: b.privateNightlyRate === null ? null : money(b.privateNightlyRate),
             rateUnit: b.rateUnit,
-            cost: bookingCost({ ...b, rooms: b.rooms.map((r) => ({ _count: { occupants: r.occupants.length } })) }),
+            cost: bookingCost({ ...b, rooms: b.rooms.map((r) => ({ type: r.type, _count: { occupants: r.occupants.length } })) }),
           }),
         };
       }),
@@ -523,6 +524,148 @@ export class HotelsService {
     });
   }
 
+  /**
+   * The hotel's statement (كشف حساب الفندق) for the stays checking in between from and to (Riyadh days, both included;
+   * the current month when not given): each confirmed stay's room bill by room type, the trips' extras and fines posted
+   * to the hotel, and what was prepaid to it. The balance follows the trip account: bills + extras − prepaid.
+   */
+  async statement(id: string, query: { month?: string; from?: string; to?: string } = {}) {
+    const hotel = await this.prisma.hotel.findUnique({
+      where: { id },
+      select: { id: true, name: true, city: true, phone: true, contactName: true, address: true, rateUnit: true, nightlyRate: true, privateNightlyRate: true },
+    });
+    if (!hotel) throw new NotFoundException('الفندق غير موجود');
+    let from = query.from;
+    let to = query.to;
+    if (!from || !to) {
+      const month = query.month ?? riyadhDate(new Date()).slice(0, 7);
+      const [year, monthNumber] = month.split('-').map(Number);
+      from = `${month}-01`;
+      to = new Date(Date.UTC(year, monthNumber, 0)).toISOString().slice(0, 10);
+    }
+    if (!riyadhDaysRange(from, to)) throw new BadRequestException('التاريخ غير صحيح');
+    if (from > to) [from, to] = [to, from];
+    if (toDate(to).getTime() - toDate(from).getTime() > 366 * DAY_MS) throw new BadRequestException('الفترة أطول من سنة');
+
+    const stays = await this.prisma.hotelBooking.findMany({
+      where: { hotelId: id, checkIn: { gte: toDate(from), lte: toDate(to) } },
+      orderBy: [{ checkIn: 'asc' }, { number: 'asc' }],
+      select: { tripId: true },
+    });
+    const tripIds = [...new Set(stays.map((stay) => stay.tripId))];
+    const trips = await this.prisma.trip.findMany({
+      where: { id: { in: tripIds } },
+      select: {
+        id: true,
+        tripCode: true,
+        tripStatus: true,
+        departureTime: true,
+        hotelBookings: {
+          orderBy: { number: 'asc' },
+          select: {
+            id: true,
+            number: true,
+            hotelId: true,
+            status: true,
+            checkIn: true,
+            checkOut: true,
+            nightlyRate: true,
+            privateNightlyRate: true,
+            rateUnit: true,
+            extraCost: true,
+            hasTaxInvoice: true,
+            hotel: { select: { name: true } },
+            rooms: { select: { type: true, _count: { select: { occupants: true } } } },
+          },
+        },
+        accountEntries: {
+          where: { voidedAt: null, chargedTo: 'HOTEL', category: { group: { not: 'INCOME' } } },
+          orderBy: [{ spentOn: 'asc' }, { createdAt: 'asc' }],
+          select: { id: true, amount: true, settlement: true, settledAt: true, spentOn: true, supplierName: true, notes: true, category: { select: { name: true } } },
+        },
+      },
+    });
+
+    const sar = (value: number) => value / 100;
+    const rows: object[] = [];
+    const charges: object[] = [];
+    const prepayments: object[] = [];
+    const totals = { rooms: 0, bills: 0, extras: 0, prepaid: 0 };
+    for (const trip of trips) {
+      const live = trip.tripStatus !== 'CANCELLED';
+      for (const booking of trip.hotelBookings) {
+        const inPeriod = booking.hotelId === id && riyadhDate(booking.checkIn) >= from && riyadhDate(booking.checkIn) <= to;
+        if (!inPeriod || !live || booking.status !== 'CONFIRMED') continue;
+        const byType = hotelCostByType(booking);
+        const cost = hotelBookingCost(booking);
+        const rooms = byType.reduce((sum, row) => sum + row.rooms, 0);
+        totals.rooms += rooms;
+        totals.bills += cost;
+        rows.push({
+          hotelBookingId: booking.id,
+          reference: hotelBookingReference(booking.number),
+          tripId: trip.id,
+          tripCode: trip.tripCode,
+          checkIn: booking.checkIn,
+          checkOut: booking.checkOut,
+          nights: nightsBetween(booking.checkIn, booking.checkOut),
+          rateUnit: booking.rateUnit,
+          rooms,
+          byType: byType.map((row) => ({ ...row, rate: sar(row.rate), amount: sar(row.amount) })),
+          extraCost: money(booking.extraCost),
+          cost: sar(cost),
+          hasTaxInvoice: booking.hasTaxInvoice,
+        });
+      }
+      // Trip lines name no hotel: with several on the trip, the one the supplier name matches, else the trip's first stay.
+      const candidates = trip.hotelBookings.filter((booking) => booking.status === 'CONFIRMED');
+      const pool = candidates.length ? candidates : trip.hotelBookings;
+      for (const entry of trip.accountEntries) {
+        const named = entry.supplierName?.trim();
+        const owner = (named && pool.find((booking) => booking.hotel.name.trim() === named)) || pool[0];
+        if (owner?.hotelId !== id) continue;
+        const amount = halalas(entry.amount);
+        const line = {
+          id: entry.id,
+          tripId: trip.id,
+          tripCode: trip.tripCode,
+          spentOn: entry.spentOn.toISOString().slice(0, 10),
+          categoryName: entry.category.name,
+          supplierName: entry.supplierName,
+          notes: entry.notes,
+          settlement: entry.settlement,
+          settledAt: entry.settledAt,
+          amount: sar(amount),
+        };
+        if (entry.settlement === 'PREPAID') {
+          totals.prepaid += amount;
+          prepayments.push(line);
+        } else {
+          totals.extras += amount;
+          charges.push(line);
+        }
+      }
+    }
+
+    return {
+      hotel: { ...hotel, nightlyRate: money(hotel.nightlyRate), privateNightlyRate: hotel.privateNightlyRate === null ? null : money(hotel.privateNightlyRate) },
+      from,
+      to,
+      rows,
+      charges,
+      prepayments,
+      summary: {
+        stays: rows.length,
+        rooms: totals.rooms,
+        bills: sar(totals.bills),
+        extras: sar(totals.extras),
+        due: sar(totals.bills + totals.extras),
+        prepaid: sar(totals.prepaid),
+        balance: sar(totals.bills + totals.extras - totals.prepaid),
+      },
+    };
+  }
+
   async overview(month?: string, from?: string, to?: string) {
     const [year, monthNumber] = (month ?? riyadhDate(new Date()).slice(0, 7)).split('-').map(Number);
     const days = from && to ? riyadhDaysRange(from, to) : null;
@@ -549,12 +692,12 @@ export class HotelsService {
         privateRoomPriceBasis: true,
         housingPricePeriod: true,
         accommodations: { select: { nights: true } },
-        bookings: { where: { status: { in: HOUSED_STATUSES } }, select: { housingAmount: true, _count: { select: { passengers: true } } } },
+        bookings: { where: { status: { in: HOUSED_STATUSES } }, select: { housingAmount: true, _count: { select: { passengers: { where: { cancelled: false } } } } } },
         hotelBookings: {
           orderBy: { number: 'asc' },
           include: {
             hotel: { select: { id: true, name: true, city: true } },
-            rooms: { select: { _count: { select: { occupants: true } } } },
+            rooms: { select: { type: true, _count: { select: { occupants: true } } } },
           },
         },
       },
@@ -682,6 +825,8 @@ export class HotelsService {
                 // For the automatic rooming's checks: the same identity twice, and an elderly traveller written in a note.
                 nationalId: true,
                 notes: true,
+                // A cancelled ticket holds no bed: it stays out of the rooming list, though the owner's details still come from position.
+                cancelled: true,
                 hotelRoom: { select: { id: true, number: true, type: true, hotelBookingId: true } },
               },
             },
@@ -699,7 +844,7 @@ export class HotelsService {
           passengerId: p.id,
           bookingId: booking.id,
           bookingReference: booking.bookingReference,
-          bookingSize: booking.passengers.length,
+          bookingSize: booking.passengers.filter((q) => !q.cancelled).length,
           roomChoice: booking.roomChoice,
           bookingKind: bookingTypeLabel(booking),
           stayHotel: booking.stayHotel,
@@ -721,7 +866,7 @@ export class HotelsService {
           transportOnly: !booking.stayHotel && (booking.serviceType === 'TRANSPORT_ONLY' || booking.serviceType === 'WITH_VISITS'),
           boardingPointName: booking.boardingPointName,
           bookedAt: booking.createdAt,
-        }));
+        })).filter((_, idx) => !booking.passengers[idx].cancelled);
       })
       .sort((a, b) => compareSeats(a.seatNumber, b.seatNumber));
 
@@ -755,7 +900,7 @@ export class HotelsService {
           rooms: b.rooms
             .map((r) => ({ id: r.id, number: r.number, type: r.type, capacity: r.capacity, floor: r.floor, occupants: r._count.occupants }))
             .sort((x, y) => (parseInt(x.number, 10) || 0) - (parseInt(y.number, 10) || 0)),
-          ...(canSeeRates && { nightlyRate: money(b.nightlyRate), rateUnit: b.rateUnit, extraCost: money(b.extraCost), cost: bookingCost(b) }),
+          ...(canSeeRates && { nightlyRate: money(b.nightlyRate), privateNightlyRate: b.privateNightlyRate === null ? null : money(b.privateNightlyRate), rateUnit: b.rateUnit, extraCost: money(b.extraCost), cost: bookingCost(b) }),
         };
       }),
       passengers,
@@ -780,6 +925,7 @@ export class HotelsService {
         checkIn,
         checkOut,
         nightlyRate: canSetRates && dto.nightlyRate !== undefined ? dto.nightlyRate : hotel.nightlyRate,
+        privateNightlyRate: canSetRates && dto.privateNightlyRate !== undefined ? dto.privateNightlyRate : hotel.privateNightlyRate,
         rateUnit: hotel.rateUnit,
         extraCost: canSetRates ? dto.extraCost ?? 0 : 0,
         supplierReference: dto.supplierReference || null,
@@ -802,7 +948,7 @@ export class HotelsService {
    */
   async updateBooking(actor: HotelActor, id: string, dto: UpdateHotelBookingDto) {
     const canSetRates = actor.permissions.includes('hotels.rates');
-    if (!canSetRates && (dto.nightlyRate !== undefined || dto.extraCost !== undefined)) {
+    if (!canSetRates && (dto.nightlyRate !== undefined || dto.privateNightlyRate !== undefined || dto.extraCost !== undefined)) {
       throw new ForbiddenException('تعديل الأسعار يحتاج صلاحية أسعار الفنادق');
     }
     return this.prisma.$transaction(async (tx) => {
@@ -845,6 +991,7 @@ export class HotelsService {
           checkIn,
           checkOut,
           nightlyRate: dto.nightlyRate,
+          privateNightlyRate: dto.privateNightlyRate,
           extraCost: dto.extraCost,
           supplierReference: optionalText(dto.supplierReference),
           mealPlan: optionalText(dto.mealPlan),
@@ -903,6 +1050,7 @@ export class HotelsService {
       },
     });
     if (passengers.length !== passengerIds.length) throw new NotFoundException('أحد المسافرين غير موجود');
+    if (passengers.some((p) => p.cancelled)) throw new BadRequestException('تذكرة أحد المسافرين ملغاة، فلا يمكن تسكينه');
     if (passengers.some((p) => p.booking.tripId !== hotelBooking.tripId)) {
       throw new BadRequestException('أحد المسافرين ليس على هذه الرحلة');
     }
@@ -1081,9 +1229,10 @@ export class HotelsService {
       await this.events.lock(tx, found.bookingId);
       const passenger = await tx.bookingPassenger.findUniqueOrThrow({
         where: { id: passengerId },
-        select: { fullName: true, gender: true, nationality: true, booking: { select: { status: true } } },
+        select: { fullName: true, gender: true, nationality: true, cancelled: true, booking: { select: { status: true } } },
       });
       if (!HOUSED_STATUSES.includes(passenger.booking.status)) throw new ConflictException('هذا الحجز ملغى');
+      if (passenger.cancelled) throw new BadRequestException('تذكرة هذا المسافر ملغاة');
 
       const gender = dto.gender === undefined ? passenger.gender : dto.gender;
       const next = nationality === undefined ? passenger.nationality : nationality;
@@ -1117,10 +1266,12 @@ export class HotelsService {
       const passenger = await tx.bookingPassenger.findFirst({
         where: { id: passengerId, booking: { tripId } },
         select: {
-          booking: { select: { roomChoice: true, stayHotelId: true, stayNights: true, passengers: { select: { id: true, hotelRoom: { select: { number: true } } } } } },
+          cancelled: true,
+          booking: { select: { roomChoice: true, stayHotelId: true, stayNights: true, passengers: { where: { cancelled: false }, select: { id: true, hotelRoom: { select: { number: true } } } } } },
         },
       });
       if (!passenger) throw new NotFoundException('هذا المسافر ليس على هذه الرحلة');
+      if (passenger.cancelled) throw new BadRequestException('تذكرة هذا المسافر ملغاة، فلا يمكن تسكينه');
       const { booking } = passenger;
 
       const roomType = booking.roomChoice ?? 'SHARED';
@@ -1162,7 +1313,7 @@ export class HotelsService {
         select: {
           tripId: true,
           status: true,
-          passengers: { select: { id: true } },
+          passengers: { select: { id: true, cancelled: true } },
           trip: { select: { bookingType: true, tripStatus: true, departureTime: true, accommodations: { select: { nights: true } } } },
         },
       });
@@ -1170,7 +1321,8 @@ export class HotelsService {
       await this.assertTripOpen(tx, booking.tripId, booking.trip);
 
       const owned = booking.passengers.map((p) => p.id);
-      const passengerIds = dto.passengerIds?.length ? dto.passengerIds : owned;
+      // The whole booking means everyone still travelling: a cancelled ticket holds no bed.
+      const passengerIds = dto.passengerIds?.length ? dto.passengerIds : booking.passengers.filter((p) => !p.cancelled).map((p) => p.id);
       if (passengerIds.some((id) => !owned.includes(id))) throw new BadRequestException('أحد المسافرين لا يتبع هذا الحجز');
 
       const hotel = await tx.hotel.findUnique({ where: { id: dto.hotelId } });
@@ -1188,6 +1340,7 @@ export class HotelsService {
             checkIn,
             checkOut: new Date(checkIn.getTime() + nights * DAY_MS),
             nightlyRate: hotel.nightlyRate,
+            privateNightlyRate: hotel.privateNightlyRate,
             rateUnit: hotel.rateUnit,
             createdById: actor.userId,
           },

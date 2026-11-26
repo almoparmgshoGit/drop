@@ -3,6 +3,8 @@ import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { RequirePermission } from '../../common/decorators/auth.decorators';
 import { TicketCompensationService } from '../../common/services/ticket-compensation.service';
 import { BookingsAdminService } from './bookings-admin.service';
+import { AdminTicketsQuery } from './ticket-list.dto';
+import { TicketListService } from './ticket-list.service';
 import {
   AddNoteDto,
   AdminBookingsQuery,
@@ -21,7 +23,15 @@ export class BookingsAdminController {
   constructor(
     private admin: BookingsAdminService,
     private compensation: TicketCompensationService,
+    private ticketList: TicketListService,
   ) {}
+
+  @Get('tickets')
+  @RequirePermission('bookings.list')
+  @ApiOperation({ summary: 'List tickets with their status (مؤكدة / ملغية) and cancellation record' })
+  async tickets(@Req() req, @Query() query: AdminTicketsQuery) {
+    return this.ticketList.list(await this.admin.scopeFor(req.user, query.branchId), query);
+  }
 
   @Get(':id/compensation')
   @RequirePermission('bookings.compensate')

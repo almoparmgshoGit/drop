@@ -132,14 +132,14 @@ export class StationAlertsService {
 
   private async waitingAt(db: Db | PrismaService, trip: { id: string; reverseOfTripId: string | null }, point: { id: string; name: string }) {
     const own = await db.booking.findMany({
-      where: { tripId: trip.id, status: { in: [...TRAVELING_STATUSES] }, tickets: { some: { isBoarded: false } }, ...boardsAt(point) },
+      where: { tripId: trip.id, status: { in: [...TRAVELING_STATUSES] }, tickets: { some: { isBoarded: false, status: 'CONFIRMED' } }, ...boardsAt(point) },
       select: { id: true },
     });
     const ids = own.map((booking) => booking.id);
     // Passengers riding back have no point of their own on the reverse, so wherever it boards is theirs.
     if (trip.reverseOfTripId) {
       const returning = await returningBookingIds(db, trip.reverseOfTripId);
-      const waiting = await db.ticket.findMany({ where: { bookingId: { in: returning }, returnBoardedAt: null }, select: { bookingId: true }, distinct: ['bookingId'] });
+      const waiting = await db.ticket.findMany({ where: { bookingId: { in: returning }, returnBoardedAt: null, status: 'CONFIRMED' }, select: { bookingId: true }, distinct: ['bookingId'] });
       ids.push(...waiting.map((ticket) => ticket.bookingId));
     }
     return ids;
@@ -393,11 +393,11 @@ export class StationAlertsService {
     const active = this.activeRules(trip, rules);
     const alerts = await this.prisma.stationAlert.findMany({ where: { tripId }, orderBy: { createdAt: 'desc' }, take: 300 });
     const tickets = await this.prisma.ticket.findMany({
-      where: { booking: { tripId, status: { in: [...TRAVELING_STATUSES] } } },
+      where: { booking: { tripId, status: { in: [...TRAVELING_STATUSES] } }, status: 'CONFIRMED' },
       select: { isBoarded: true, booking: { select: { boardingPointId: true, boardingPointName: true } } },
     });
     const returning = trip.reverseOfTripId ? await returningBookingIds(this.prisma, trip.reverseOfTripId) : [];
-    const returningTickets = returning.length ? await this.prisma.ticket.findMany({ where: { bookingId: { in: returning } }, select: { returnBoardedAt: true } }) : [];
+    const returningTickets = returning.length ? await this.prisma.ticket.findMany({ where: { bookingId: { in: returning }, status: 'CONFIRMED' }, select: { returnBoardedAt: true } }) : [];
     const position = trip.location;
     const isLive = !!position && now - position.recordedAt.getTime() <= LIVE_FOR_MS && trip.liveStatus !== 'ARRIVED';
 

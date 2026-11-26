@@ -1,3 +1,4 @@
+import { assertTripAccountOpen } from '../../common/utils/trip-account-lock.util';
 import {
   BadRequestException,
   ConflictException,
@@ -37,6 +38,7 @@ import { AppSettingsService } from '../../common/services/app-settings.service';
 type MonthlySchedule = Awaited<ReturnType<AppSettingsService['monthlySchedule']>>;
 import { imageTypeOf } from '../../common/utils/image-type.util';
 import { GALLERY_SELECT } from '../../common/utils/gallery.util';
+import { TAX_RECORDS_KEPT_MESSAGE, taxRecordsDeletable } from '../../common/utils/tax-records.util';
 import { CreateTripDto, OpenReverseTripDto, TripBusAssignmentDto, UpdateTripDto } from './trips.dto';
 import { assertTripFitsPackage } from '../../common/utils/package-window.util';
 import { PACKAGE_PRICE_SELECT, PackagePrices, packagePriceTiers } from '../../common/utils/package-price.util';
@@ -466,7 +468,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
       await this.prisma.$transaction((tx) => this.syncDraftReverse(tx, trip.id), TRIP_TX_OPTIONS).catch((err) => console.error(`Could not make the return of draft ${trip.id}:`, err.message));
     }
     const trips = await this.prisma.trip.findMany({
-      where: { reverseEnabled: true, tripStatus: 'PUBLISHED', OR: [{ reverseTrip: null }, { reverseTrip: { tripStatus: 'DRAFT' } }], reverseDepartureAt: { gt: new Date() } },
+      where: { reverseEnabled: true, reverseOfTripId: null, tripStatus: 'PUBLISHED', OR: [{ reverseTrip: null }, { reverseTrip: { tripStatus: 'DRAFT' } }], reverseDepartureAt: { gt: new Date() } },
       select: { id: true },
     });
     for (const trip of trips) await this.autoOpenReverse(trip.id);
@@ -1512,6 +1514,19 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
    */
   private async rentAfterEdit(
     tx: Prisma.TransactionClient,
+    existing: { id: string; busId: string | null; origin: string; destination: string; busRentalPrice: Prisma.Decimal | null },
+    next: { busId: string | null; origin: string; destination: string },
+    dto: { busId?: string | null; busRentalPrice?: number },
+  ) {
+    const rent = await this.rentAfterEditUnchecked(tx, existing, next, dto);
+    // Once the trip's account is closed its rent is part of the profit already posted, so it changes only after reopening.
+    const changes = rent !== undefined && rent !== null && (existing.busRentalPrice === null || !existing.busRentalPrice.equals(rent));
+    if (changes) await assertTripAccountOpen(tx, existing.id, 'تغيير إيجار الباص');
+    return rent;
+  }
+
+  private async rentAfterEditUnchecked(
+    tx: Prisma.TransactionClient,
     existing: { busId: string | null; origin: string; destination: string; busRentalPrice: Prisma.Decimal | null },
     next: { busId: string | null; origin: string; destination: string },
     dto: { busId?: string | null; busRentalPrice?: number },
@@ -1858,7 +1873,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
   private async openFollowerReverses(ids: string[]) {
     if (ids.length === 0) return;
     const due = await this.prisma.trip.findMany({
-      where: { id: { in: ids }, tripStatus: 'PUBLISHED', reverseEnabled: true, OR: [{ reverseTrip: null }, { reverseTrip: { tripStatus: 'DRAFT' } }], reverseDepartureAt: { gt: new Date() } },
+      where: { id: { in: ids }, tripStatus: 'PUBLISHED', reverseEnabled: true, reverseOfTripId: null, OR: [{ reverseTrip: null }, { reverseTrip: { tripStatus: 'DRAFT' } }], reverseDepartureAt: { gt: new Date() } },
       select: { id: true },
     });
     for (const trip of due) await this.autoOpenReverse(trip.id);
@@ -2237,7 +2252,8 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
       const excludeTripIds = [id, existing.reverseOfTripId, existing.reverseTrip?.id, ...siblings.map((row) => row.id)].filter(Boolean);
       await this.assertNoScheduleConflict(tx, { busId, driverIds, supervisorIds, start: departure, end: arrival, excludeTripIds, leaveCheckIds: added });
 
-      const reverseEnabled = dto.reverseEnabled ?? existing.reverseEnabled;
+      // A trip that is itself a way back never has a way back of its own.
+      const reverseEnabled = existing.reverseOfTripId ? false : dto.reverseEnabled ?? existing.reverseEnabled;
       const outboundAfter = { direction: dto.direction ?? existing.direction, departureTime: departure, arrivalTime: arrival, estimatedArrivalAt };
       const moved = departure.getTime() - existing.departureTime.getTime();
       // Moving the outbound carries the way back along with it, unless a new time for it was given.
@@ -2297,7 +2313,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
           housingPriceMode: dto.housingPriceMode,
           privateRoomPriceBasis: dto.privateRoomPriceBasis,
           housingPricePeriod: dto.housingPricePeriod,
-          reverseEnabled: dto.reverseEnabled,
+          reverseEnabled: existing.reverseOfTripId ? false : dto.reverseEnabled,
           reverseOpenPercent: dto.reverseOpenPercent,
           singlesOverflowPercent: dto.singlesOverflowPercent,
           reverseDepartureAt: reverseDepartureAt ?? undefined,
@@ -2537,6 +2553,8 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
     const trips = await this.prisma.trip.findMany({
       where: {
         reverseEnabled: true,
+        // A way back is listed under its way there, never as one with a return of its own.
+        reverseOfTripId: null,
         ...(city && { AND: [cityTripWhere(city)] }),
         OR: [
           { tripStatus: 'PUBLISHED', departureTime: { gt: now, ...(range !== 'all' && { lt: addDays(now, range === 'week' ? 7 : 30) }) } },
@@ -2571,7 +2589,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
     const returning = new Map(
       await Promise.all(trips.filter((trip) => trip.direction === 'ROUND_TRIP').map(async (trip) => {
         const bookingIds = await returningBookingIds(this.prisma, trip.id);
-        return [trip.id, await this.prisma.bookingPassenger.count({ where: { bookingId: { in: bookingIds } } })] as const;
+        return [trip.id, await this.prisma.bookingPassenger.count({ where: { bookingId: { in: bookingIds }, cancelled: false } })] as const;
       })),
     );
 
@@ -2714,6 +2732,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
         },
       });
       if (!trip) throw new NotFoundException('Trip not found');
+      if (trip.reverseOfTripId) throw new ConflictException('هذه رحلة عودة، ولا تُفتح لها رحلة عكسية');
       if (!trip.reverseEnabled) throw new ConflictException('الرحلة العكسية غير مفعلة لهذه الرحلة');
       // A draft return, made with a draft way there (syncDraftReverse), is opened like a cancelled one: everything is set afresh.
       if (trip.reverseTrip && !['CANCELLED', 'DRAFT'].includes(trip.reverseTrip.tripStatus)) throw new ConflictException('فُتحت الرحلة العكسية مسبقًا');
@@ -3153,7 +3172,8 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
 
   /**
    * A finished or cancelled trip is deleted with everything recorded on it: bookings, payments, cash movements, invoices,
-   * custodies, expenses, reports and hotel stays (the owner's decision). Only invoices already signed for ZATCA hold it:
+   * custodies, expenses, reports and hotel stays (the owner's decision). Tax invoices hold it on the live server, since they
+   * are never deleted (the client's decision, ZATCA); and invoices already signed for ZATCA hold it everywhere:
    * each signed document chains to the one before it, so removing one would get every later invoice rejected.
    */
   async purgeClosedTrip(id: string) {
@@ -3176,7 +3196,14 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
     return this.prisma.zatcaDocument.count({ where: { icv: { not: null }, OR: [{ invoiceId: { in: invoiceIds } }, { creditNoteId: { in: creditNoteIds } }] } });
   }
 
+  /** Tax invoices on the trip that must outlive it: all of them on the live server, none on the trial database. */
+  async keptTaxInvoices(tripId: string) {
+    if (taxRecordsDeletable()) return 0;
+    return this.prisma.invoice.count({ where: { OR: [{ tripId }, { booking: { tripId } }] } });
+  }
+
   private async purgeOne(tripId: string) {
+    if ((await this.keptTaxInvoices(tripId)) > 0) throw new ConflictException(TAX_RECORDS_KEPT_MESSAGE);
     if ((await this.signedZatcaDocuments(tripId)) > 0) throw new ConflictException('عليها فواتير مُرسلة لهيئة الزكاة، وحذفها يُفسد تسلسل الفواتير القادمة');
     await this.prisma.$transaction(async (tx) => {
       const bookingIds = (await tx.booking.findMany({ where: { tripId }, select: { id: true } })).map((booking) => booking.id);

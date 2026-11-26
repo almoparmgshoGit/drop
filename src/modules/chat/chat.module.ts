@@ -189,7 +189,7 @@ export class ChatService {
         boardingPointTime: true,
         payment: { select: { amount: true, walletAmount: true, status: true, method: true } },
         collections: { select: { amount: true } },
-        passengers: { orderBy: { seatNumber: 'asc' }, select: { fullName: true, seatNumber: true, ticket: { select: { ticketNumber: true, isBoarded: true, boardedAt: true } } } },
+        passengers: { where: { cancelled: false }, orderBy: { seatNumber: 'asc' }, select: { fullName: true, seatNumber: true, ticket: { select: { ticketNumber: true, isBoarded: true, boardedAt: true } } } },
         trip: {
           select: {
             tripCode: true,
@@ -407,7 +407,7 @@ export class ChatService {
         boardingPointName: true,
         boardingPointTime: true,
         trip: { select: { tripCode: true, origin: true, destination: true, departureTime: true } },
-        passengers: { select: { seatNumber: true } },
+        passengers: { where: { cancelled: false }, select: { seatNumber: true } },
       },
     });
     const { appPresence, _count, ...details } = customer;

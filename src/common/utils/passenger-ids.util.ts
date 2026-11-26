@@ -25,6 +25,7 @@ export async function assertIdsFreeOnTrips(
   const clash = await db.bookingPassenger.findFirst({
     where: {
       ...(exceptPassengerId && { id: { not: exceptPassengerId } }),
+      cancelled: false,
       nationalId: { in: [...new Set(ids)], mode: 'insensitive' },
       booking: { status: { not: 'CANCELLED' }, trip: { OR: [{ id: { in: leads } }, { convoyLeadId: { in: leads } }] } },
     },

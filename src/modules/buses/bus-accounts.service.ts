@@ -1,3 +1,4 @@
+import { assertTripAccountOpen } from '../../common/utils/trip-account-lock.util';
 import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../common/services/prisma.service';
@@ -185,7 +186,12 @@ export class BusAccountsService {
     if (trip.tripStatus === 'CANCELLED') throw new ConflictException('هذه الرحلة ملغاة');
 
     await this.prisma.$transaction(async (tx) => {
-      if (busRentalPrice !== undefined) await tx.trip.update({ where: { id: tripId }, data: { busRentalPrice } });
+      if (busRentalPrice !== undefined) {
+        // The rent is part of the profit already posted once the account is closed.
+        const current = await tx.trip.findUniqueOrThrow({ where: { id: tripId }, select: { busRentalPrice: true } });
+        if (current.busRentalPrice === null || !current.busRentalPrice.equals(busRentalPrice)) await assertTripAccountOpen(tx, tripId, 'تعديل إيجار الباص');
+        await tx.trip.update({ where: { id: tripId }, data: { busRentalPrice } });
+      }
       await tx.tripBusCost.upsert({ where: { tripId }, create: { tripId, ...cost }, update: cost });
     }, TX_OPTIONS);
     return { success: true };

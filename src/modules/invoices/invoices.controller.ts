@@ -17,6 +17,20 @@ export class InvoicesController {
     return this.invoices.list(req.user, query);
   }
 
+  @Get('credit-notes')
+  @RequirePermission('invoices.view')
+  @ApiOperation({ summary: 'Credit notes issued in a period, each against its original invoice' })
+  creditNotes(@Req() req, @Query() query: InvoicesQuery) {
+    return this.invoices.creditNotes(req.user, query);
+  }
+
+  @Get('credit-notes/:id')
+  @RequirePermission('invoices.view')
+  @ApiOperation({ summary: 'Everything needed to print one credit note' })
+  printableCreditNote(@Req() req, @Param('id') id: string) {
+    return this.invoices.printableCreditNote(req.user, id);
+  }
+
   @Get('tax-report')
   @RequirePermission('tax.view')
   @ApiOperation({ summary: 'VAT return figures for the whole company, by month or quarter' })

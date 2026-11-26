@@ -4,6 +4,7 @@ import { ArrayMaxSize, ArrayMinSize, IsArray, IsIn, IsString, MaxLength } from '
 import * as argon2 from 'argon2';
 import { PrismaService } from '../../common/services/prisma.service';
 import { RequirePermission, SkipAudit } from '../../common/decorators/auth.decorators';
+import { taxRecordsDeletable } from '../../common/utils/tax-records.util';
 
 /**
  * «تصفير بيانات النظام»: wipes one system's data, or all of it, with everything that depends on it.
@@ -165,6 +166,9 @@ export const RESET_GROUPS: Group[] = [
 export const ALL_GROUPS_KEY = 'all';
 const GROUP_KEYS = RESET_GROUPS.map((group) => group.key);
 export const CONFIRMATION_WORD = 'تصفير';
+
+/** Issued tax documents (and their signed ZATCA copies), kept forever once the system is live. */
+const TAX_RECORD_TABLES = new Set(['Invoice', 'CreditNote', 'ZatcaDocument']);
 
 /** Deleting these would break the system itself, so a reset refuses to reach them. User rows go only through a root that filters them. */
 const PROTECTED_TABLES = new Set(['_prisma_migrations', 'Setting', 'User', 'Rank', 'JobType', 'LeaveType', 'AccountCategory', 'NotificationTemplate', 'WhatsAppTemplate', 'StationAlertRule']);
@@ -365,7 +369,23 @@ export class SystemResetService {
     const groups = this.resolveGroups(dto.groups);
     const plan = this.plan(groups, await this.foreignKeys());
     const tables = await this.counts(plan);
-    return { groups: groups.map((group) => group.title), tables, total: tables.reduce((sum, row) => sum + row.count, 0) };
+    return {
+      groups: groups.map((group) => group.title),
+      tables,
+      total: tables.reduce((sum, row) => sum + row.count, 0),
+      // Shown before the password is asked for, so nobody types it for a reset that will be refused.
+      blockedBy: await this.keptTaxRecords(plan, tables),
+    };
+  }
+
+  /** On the live server, a reset that would reach issued invoices or credit notes is refused: they are never deleted. */
+  private async keptTaxRecords(plan: Plan, counted?: { table: string }[]) {
+    if (taxRecordsDeletable()) return null;
+    const tables = counted ?? (await this.counts(plan));
+    const touched = tables.filter((row) => TAX_RECORD_TABLES.has(row.table));
+    return touched.length
+      ? `لا يمكن التصفير: سيحذف ${touched.map((row) => TABLE_LABELS[row.table]).join(' و')}، والفواتير الضريبية وإشعارات الدائن لا تُحذف من النظام حفاظًا على الأثر المحاسبي. اختر أقسامًا لا تشملها.`
+      : null;
   }
 
   async reset(actor: { userId: string }, dto: ConfirmResetDto, ip?: string) {
@@ -375,6 +395,8 @@ export class SystemResetService {
 
     const groups = this.resolveGroups(dto.groups);
     const plan = this.plan(groups, await this.foreignKeys());
+    const keptTaxRecords = await this.keptTaxRecords(plan);
+    if (keptTaxRecords) throw new BadRequestException(keptTaxRecords);
     // The guards that keep financial records append-only (invoices, cash movements, closed sessions, approved payrolls…)
     // reject every delete, so they are switched off for this transaction only. ALTER TABLE is transactional: they come
     // back on at the end, and on any failure the rollback restores them along with every row.

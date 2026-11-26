@@ -3,6 +3,7 @@ import { Prisma } from '@prisma/client';
 import { returnRideOf } from '../utils/linked-seats.util';
 import { halalas, PAID_PAYMENT_STATUSES, paymentFigures } from '../utils/payment.util';
 import { boardingOfBookings } from '../utils/ticket-boarding.util';
+import { cancelledTicketsTake } from '../utils/ticket-cancel.util';
 import { AppSettingsService } from './app-settings.service';
 import { BookingEventsService } from './booking-events.service';
 import { InvoiceLedgerService } from './invoice-ledger.service';
@@ -25,7 +26,7 @@ const BOOKING_SELECT = {
   boardingPointName: true,
   payment: { select: { amount: true, walletAmount: true, status: true } },
   collections: { select: { amount: true } },
-  passengers: { select: { ticket: { select: { isBoarded: true } } } },
+  passengers: { where: { cancelled: false }, select: { ticket: { select: { isBoarded: true } } } },
   compensation: { select: { amount: true, isAutomatic: true, note: true, createdByName: true, createdAt: true } },
 } satisfies Prisma.BookingSelect;
 
@@ -55,7 +56,9 @@ export class TicketCompensationService {
     const { received, wallet } = paymentFigures(booking.payment, booking.collections);
     const total = booking.passengers.length;
     const missed = booking.passengers.filter((passenger) => !passenger.ticket?.isBoarded).length;
-    const capHalalas = total > 0 ? Math.round(((received + wallet) * missed) / total) : 0;
+    // What cancelled tickets took out of the payment is theirs, not the remaining passengers'.
+    const livePaid = Math.max(0, received + wallet - (await cancelledTicketsTake(db, bookingId)));
+    const capHalalas = total > 0 ? Math.round((livePaid * missed) / total) : 0;
     const isRoundTrip = !!(await returnRideOf(db, booking));
 
     let blockedReason: string | null = null;
@@ -162,7 +165,7 @@ export class TicketCompensationService {
     const where: Prisma.BookingWhereInput = {
       status: 'CONFIRMED',
       compensation: { is: null },
-      tickets: { some: { isBoarded: false } },
+      tickets: { some: { isBoarded: false, status: 'CONFIRMED' } },
       user: { blockedAt: null },
       trip: { tripStatus: 'COMPLETED', arrivalTime: { gte: switchedOnAt }, bookings: { some: { tickets: { some: { isBoarded: true } } } } },
       // Nothing paid means nothing to give back.

@@ -482,7 +482,10 @@ export class CashService {
       where: { id: input.bookingId },
       include: { payment: true, collections: { select: { amount: true } }, cashMovements: { where: { type: 'BOOKING_REFUND' }, select: { amount: true } } },
     });
-    if (booking.status !== 'CANCELLED') throw new ConflictException('يُسترد النقد بعد إلغاء الحجز');
+    // A ticket cancelled on its own leaves its cash refund waiting on a booking that is still live.
+    if (booking.status !== 'CANCELLED' && (await tx.ticket.count({ where: { bookingId: booking.id, status: 'CANCELLED' } })) === 0) {
+      throw new ConflictException('يُسترد النقد بعد إلغاء الحجز أو إحدى تذاكره');
+    }
 
     const { received, wallet } = paymentFigures(booking.payment, booking.collections);
     const cashRefunded = booking.cashMovements.reduce((sum, row) => sum + halalas(row.amount), 0);

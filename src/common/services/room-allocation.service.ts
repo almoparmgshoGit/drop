@@ -40,7 +40,7 @@ export class RoomAllocationService {
     if (!hotel) throw new NotFoundException('الفندق غير موجود');
     if (!hotel.isActive) throw new ConflictException('هذا الفندق غير متاح للحجز');
     const dates = this.stayDates(trip.departureTime, nights);
-    const terms = { ...dates, nightlyRate: hotel.nightlyRate, rateUnit: hotel.rateUnit, status: 'CONFIRMED' as const, cancelReason: null };
+    const terms = { ...dates, nightlyRate: hotel.nightlyRate, privateNightlyRate: hotel.privateNightlyRate, rateUnit: hotel.rateUnit, status: 'CONFIRMED' as const, cancelReason: null };
     return tx.hotelBooking.upsert({
       where: { tripId_hotelId: { tripId: trip.id, hotelId } },
       create: { tripId: trip.id, hotelId, ...terms },

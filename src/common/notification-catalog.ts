@@ -335,6 +335,19 @@ export const NOTIFICATION_CATALOG = {
       ur: { title: 'آپ کی بکنگ منسوخ کر دی گئی', body: 'بکنگ {{bookingReference}} منسوخ کر دی گئی ہے۔ {{amount}} آپ کے اصل ادائیگی کے طریقے پر واپس کیے جائیں گے اور مکمل ہوتے ہی ہم آپ کو اطلاع دیں گے۔ ابھی آپ کے والٹ میں شامل رقم: {{refundAmount}}۔ {{reviewNote}}' },
     },
   },
+  TICKET_CANCELLED: {
+    audience: 'PASSENGER',
+    group: 'الإلغاء والاسترداد',
+    label: 'إلغاء تذكرة راكب',
+    trigger: 'عند إلغاء تذكرة راكب واحد من الحجز من لوحة التحكم، وبقية تذاكر الحجز سارية',
+    title: 'تم إلغاء تذكرة',
+    body: 'تم إلغاء تذكرة {{passengerName}} في الحجز {{bookingReference}}، وبقية التذاكر سارية. المسترد إلى محفظتك: {{refundAmount}}، وإلى وسيلة الدفع الأصلية: {{amount}}. {{reviewNote}}',
+    variables: [...BOOKING, 'passengerName', 'refundAmount', 'amount', 'reviewNote'],
+    translations: {
+      en: { title: 'A ticket has been cancelled', body: "{{passengerName}}'s ticket on booking {{bookingReference}} has been cancelled; the other tickets stay valid. Refunded to your wallet: {{refundAmount}}, to your original payment method: {{amount}}. {{reviewNote}}" },
+      ur: { title: 'ایک ٹکٹ منسوخ کر دیا گیا', body: 'بکنگ {{bookingReference}} میں {{passengerName}} کا ٹکٹ منسوخ کر دیا گیا ہے، باقی ٹکٹ برقرار ہیں۔ والٹ میں واپس: {{refundAmount}}، اصل ادائیگی کے طریقے پر: {{amount}}۔ {{reviewNote}}' },
+    },
+  },
   REFUND_COMPLETED: {
     audience: 'PASSENGER',
     group: 'الإلغاء والاسترداد',

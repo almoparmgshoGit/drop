@@ -38,7 +38,7 @@ const BOOKING_CONTEXT = {
   boardingPointName: true,
   boardingPointTime: true,
   user: { select: { id: true, name: true, phone: true } },
-  passengers: { select: { seatNumber: true } },
+  passengers: { where: { cancelled: false }, select: { seatNumber: true } },
   trip: { select: TRIP_CONTEXT },
 } satisfies Prisma.BookingSelect;
 

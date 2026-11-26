@@ -134,7 +134,7 @@ const BOOKING_SELECT = {
   payment: { select: { amount: true, walletAmount: true, status: true, method: true } },
   collections: { select: { method: true, amount: true, createdAt: true } },
   cashMovements: { where: { type: 'BOOKING_REFUND' as const }, select: { amount: true } },
-  _count: { select: { passengers: true } },
+  _count: { select: { passengers: { where: { cancelled: false } } } },
 } satisfies Prisma.BookingSelect;
 
 type ReportBooking = Prisma.BookingGetPayload<{ select: typeof BOOKING_SELECT }>;
@@ -150,7 +150,7 @@ const BOOKING_COUNT_SELECT = {
   branch: { select: { name: true } },
   trip: { select: { departureTime: true } },
   collections: { select: { createdAt: true } },
-  _count: { select: { passengers: true } },
+  _count: { select: { passengers: { where: { cancelled: false } } } },
 } satisfies Prisma.BookingSelect;
 
 /** What bookingFigures reads from a cancelled booking. */
@@ -184,7 +184,7 @@ const HOTEL_BOOKING_SELECT = {
   stayCheckOut: true,
   stayHotel: { select: { id: true, name: true } },
   collections: { select: { createdAt: true } },
-  _count: { select: { passengers: true } },
+  _count: { select: { passengers: { where: { cancelled: false } } } },
   trip: {
     select: {
       departureTime: true,
@@ -483,11 +483,18 @@ export class ReportsService {
     const cancelled = orders.length - live.length;
     const passengers = live.reduce((sum, order) => sum + order._count.passengers, 0);
     const appShare = percent(sources.get('APP') ?? 0, orders.length);
+    // Tickets count per passenger and leg: those cancelled with their whole booking and those cancelled on their own.
+    const [ticketsTotal, ticketsCancelled, ticketsCancelledAlone] = await Promise.all([
+      this.prisma.ticket.count({ where: { booking: ctx.where } }),
+      this.prisma.ticket.count({ where: { booking: ctx.where, status: 'CANCELLED' } }),
+      this.prisma.ticket.count({ where: { booking: ctx.where, status: 'CANCELLED', passenger: { cancelled: true } } }),
+    ]);
     return {
       total: orders.length,
       passengers,
       cancelled,
       cancelRate: percent(cancelled, orders.length),
+      tickets: { total: ticketsTotal, cancelled: ticketsCancelled, cancelledAlone: ticketsCancelledAlone, cancelRate: percent(ticketsCancelled, ticketsTotal) },
       appShare,
       series: this.series(period, orders.map((order) => ({ at: this.atOf(order, ctx.basis, period), amount: 1 }))),
       statuses: shares(statuses, STATUS_LABELS),
@@ -495,7 +502,7 @@ export class ReportsService {
       categories: shares(categories, CATEGORY_LABELS),
       branches: shares(branches),
       basis: ctx.basis,
-      totals: { total: orders.length, passengers, cancelled, appShare },
+      totals: { total: orders.length, passengers, cancelled, appShare, cancelledTickets: ticketsCancelled },
     };
   }
 
@@ -863,7 +870,7 @@ export class ReportsService {
             ...(query.branchId && { branchId: query.branchId }),
             ...(query.source && { source: query.source }),
           },
-          select: { kind: true, roomChoice: true, stayHotelId: true, _count: { select: { passengers: true } } },
+          select: { kind: true, roomChoice: true, stayHotelId: true, _count: { select: { passengers: { where: { cancelled: false } } } } },
         },
       },
     });
@@ -1001,7 +1008,7 @@ export class ReportsService {
           branch: { select: { name: true } },
           user: { select: { name: true, phone: true } },
           trip: { select: { id: true, tripCode: true, origin: true, destination: true, departureTime: true } },
-          _count: { select: { passengers: true } },
+          _count: { select: { passengers: { where: { cancelled: false } } } },
         },
       }),
     ]);

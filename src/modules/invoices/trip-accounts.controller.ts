@@ -97,11 +97,19 @@ export class TripAccountsController {
     return this.accounts.close(req.user, id);
   }
 
+  /** Its profit is already posted to the branches, so only the owner reopens it; closing again posts only the difference. */
   @Post(':id/reopen')
-  @RequirePermission('trip_accounts.manage')
-  @ApiOperation({ summary: 'Reopen a closed trip account' })
-  reopen(@Param('id') id: string) {
-    return this.accounts.reopen(id);
+  @RequirePermission('owner.confirm')
+  @ApiOperation({ summary: 'Reopen a closed trip account (owner only)' })
+  reopen(@Req() req, @Param('id') id: string) {
+    return this.accounts.reopen(req.user, id);
+  }
+
+  @Get(':id/postings')
+  @RequirePermission('trip_accounts.view')
+  @ApiOperation({ summary: "The journey's profit postings to the branches: at closing and every adjustment since" })
+  postings(@Param('id') id: string) {
+    return this.accounts.postings(id);
   }
 
   @Patch(':id/tax-flags')

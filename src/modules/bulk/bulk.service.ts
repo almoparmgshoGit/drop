@@ -4,6 +4,7 @@ import { PrismaService } from '../../common/services/prisma.service';
 import { TripsService } from '../trips/trips.service';
 import { UsersService } from '../users/users.service';
 import { DriversService } from '../buses/drivers.service';
+import { TAX_RECORDS_KEPT_MESSAGE } from '../../common/utils/tax-records.util';
 
 /** The tables whose rows can be picked together in the panel and stopped, shown again, or deleted. */
 export const BULK_ENTITIES = [
@@ -164,12 +165,17 @@ export class BulkService {
         // A finished or cancelled trip is deleted with everything on it; only invoices signed for ZATCA hold it.
         const closedIds = trips.filter((trip) => trip.tripStatus === 'COMPLETED' || trip.tripStatus === 'CANCELLED').map((trip) => trip.id);
         const signed = new Map<string, number>();
-        for (const id of closedIds) signed.set(id, await this.trips.signedZatcaDocuments(id));
+        const kept = new Map<string, number>();
+        for (const id of closedIds) {
+          signed.set(id, await this.trips.signedZatcaDocuments(id));
+          kept.set(id, await this.trips.keptTaxInvoices(id));
+        }
         return trips.map((trip) => {
           const blockers: Blocker[] = [];
           const href = `/trips/${trip.id}`;
           if (signed.has(trip.id)) {
-            if (signed.get(trip.id)) blockers.push({ key: 'zatca', label: 'عليها فواتير مُرسلة لهيئة الزكاة، وحذفها يُفسد تسلسل الفواتير القادمة', href });
+            if (kept.get(trip.id)) blockers.push({ key: 'tax-records', label: TAX_RECORDS_KEPT_MESSAGE, href });
+            else if (signed.get(trip.id)) blockers.push({ key: 'zatca', label: 'عليها فواتير مُرسلة لهيئة الزكاة، وحذفها يُفسد تسلسل الفواتير القادمة', href });
             return { id: trip.id, name: `${trip.tripCode} · ${trip.origin} ← ${trip.destination}`, hidden: !trip.channelApp, blockers };
           }
           if (trip._count.bookings) blockers.push({ key: 'bookings', label: `عليها ${plural(trip._count.bookings, 'حجز', 'حجوزات')}`, href });

@@ -42,6 +42,14 @@ export class CreateHotelDto {
   @Max(1000000)
   nightlyRate?: number;
 
+  /** What a private room costs a night (a bed in one when rated by the bed); null = nightlyRate. */
+  @IsOptional()
+  @ValidateIf((_, value) => value !== null)
+  @IsNumber({ maxDecimalPlaces: 2 })
+  @Min(0)
+  @Max(1000000)
+  privateNightlyRate?: number | null;
+
   @IsOptional()
   @trimmed()
   @IsString()
@@ -163,6 +171,14 @@ export class UpdateHotelDto {
   @Max(1000000)
   nightlyRate?: number;
 
+  /** What a private room costs a night (a bed in one when rated by the bed); null = nightlyRate. */
+  @IsOptional()
+  @ValidateIf((_, value) => value !== null)
+  @IsNumber({ maxDecimalPlaces: 2 })
+  @Min(0)
+  @Max(1000000)
+  privateNightlyRate?: number | null;
+
   @IsOptional()
   @trimmed()
   @IsString()
@@ -276,6 +292,14 @@ export class CreateHotelBookingDto {
   @Min(0)
   @Max(1000000)
   nightlyRate?: number;
+
+  /** What a private room costs a night (a bed in one when rated by the bed); null = nightlyRate. */
+  @IsOptional()
+  @ValidateIf((_, value) => value !== null)
+  @IsNumber({ maxDecimalPlaces: 2 })
+  @Min(0)
+  @Max(1000000)
+  privateNightlyRate?: number | null;
 
   /** Admin only. */
   @IsOptional()

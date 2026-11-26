@@ -121,7 +121,7 @@ export class TripExecutionService implements OnModuleInit, OnModuleDestroy {
 
       // The trip's own passengers. A partly boarded booking is still CONFIRMED, so its missing passengers are marked too.
       await tx.ticket.updateMany({
-        where: { isBoarded: false, noShowAt: null, booking: { tripId, status: 'CONFIRMED', compensation: { is: null } } },
+        where: { isBoarded: false, noShowAt: null, status: 'CONFIRMED', booking: { tripId, status: 'CONFIRMED', compensation: { is: null } } },
         data: { noShowAt: dueAt },
       });
 
@@ -134,6 +134,7 @@ export class TripExecutionService implements OnModuleInit, OnModuleDestroy {
               bookingId: { in: returning },
               returnBoardedAt: null,
               returnNoShowAt: null,
+              status: 'CONFIRMED',
               booking: { status: { in: ['CONFIRMED', 'BOARDED'] }, compensation: { is: null } },
             },
             data: { returnNoShowAt: dueAt },

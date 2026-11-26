@@ -3,7 +3,7 @@ import { AccountCategoryGroup, AccountParty, EntrySettlement, Prisma, TripStatus
 import { InvoiceLedgerService } from '../../common/services/invoice-ledger.service';
 import { PrismaService } from '../../common/services/prisma.service';
 import { vatInside } from '../../common/utils/invoice.util';
-import { halalas, hotelBookingCost, netBookingFigures } from '../../common/utils/payment.util';
+import { halalas, hotelBookingCost, hotelCostByType, netBookingFigures } from '../../common/utils/payment.util';
 import { riyadhDate, riyadhDayRange, riyadhDaysRange, riyadhMonthRange } from '../../common/utils/time.util';
 import { journeyCodeOf } from '../../common/utils/trip-code.util';
 import { readInvoiceFiles, UploadedInvoice } from '../cash/cash.service';
@@ -14,6 +14,7 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const BY_TRIP_LIMIT = 100;
 const sar = (value: number) => Math.round(value) / 100;
 const AUTOMATIC_GROUPS: AccountCategoryGroup[] = ['HOTEL', 'BUS'];
+const POSTING_TX_OPTIONS = { timeout: 20_000 };
 
 const ACCOUNT_SELECT = {
   id: true,
@@ -30,13 +31,17 @@ const ACCOUNT_SELECT = {
   bookings: {
     select: {
       status: true,
+      source: true,
+      branchId: true,
       totalPrice: true,
+      /** Wallet credit for a stopped ticket: a credit note on the sale, so it comes off the ticket revenue. */
+      compensation: { select: { amount: true } },
       refundAmount: true,
       payment: { select: { amount: true, walletAmount: true, status: true } },
       collections: { select: { amount: true } },
       externalRefunded: true,
       cashMovements: { where: { type: 'BOOKING_REFUND' as const }, select: { amount: true } },
-      _count: { select: { passengers: true } },
+      _count: { select: { passengers: { where: { cancelled: false } } } },
     },
   },
   hotelBookings: {
@@ -44,13 +49,14 @@ const ACCOUNT_SELECT = {
     select: {
       id: true,
       nightlyRate: true,
+      privateNightlyRate: true,
       rateUnit: true,
       extraCost: true,
       checkIn: true,
       checkOut: true,
       hasTaxInvoice: true,
       hotel: { select: { name: true } },
-      rooms: { select: { _count: { select: { occupants: true } } } },
+      rooms: { select: { type: true, _count: { select: { occupants: true } } } },
     },
   },
   accountEntries: { where: { voidedAt: null }, select: { amount: true, chargedTo: true, settlement: true, category: { select: { group: true } } } },
@@ -126,6 +132,40 @@ const JOURNEY_SELECT = {
 } satisfies Prisma.TripSelect;
 
 /**
+ * What one booking adds to the ticket revenue, in halalas: its price (already less any ticket cancelled on its own) less a
+ * compensation credited on it, or, once cancelled, only the money kept. Credit notes are covered either way.
+ */
+export function soldOf(booking: AccountTrip['bookings'][number]) {
+  const kept = netBookingFigures(booking).held;
+  if (booking.status === 'CANCELLED') return kept;
+  return halalas(booking.totalPrice) - halalas(booking.compensation?.amount ?? 0);
+}
+
+/** Whose column a booking's sale belongs to in the branch statements: the app's, its branch's, or the head office's. */
+export const APP_COLUMN = 'APP';
+export const HQ_COLUMN = 'HQ';
+/** A journey nobody sold: its result is the company's, shared out in the settlement like head-office costs. */
+export const SHARED_COLUMN = 'SHARED';
+export const columnOf = (booking: { source: string; branchId: string | null }) => (booking.source === 'APP' ? APP_COLUMN : booking.branchId ?? HQ_COLUMN);
+
+/** Shares `total` by `weights`, rounding so the parts add up to it exactly (the largest weight takes the halalas left over). */
+function shareOut(total: number, weights: Map<string, number>) {
+  const sum = [...weights.values()].reduce((a, b) => a + b, 0);
+  const parts = new Map<string, number>();
+  if (sum <= 0) return parts;
+  let given = 0;
+  let largest = '';
+  for (const [key, weight] of weights) {
+    const part = Math.round((total * weight) / sum);
+    parts.set(key, part);
+    given += part;
+    if (!largest || weight > weights.get(largest)!) largest = key;
+  }
+  parts.set(largest, parts.get(largest)! + total - given);
+  return parts;
+}
+
+/**
  * Sold value rather than cash in hand: a seat sold and not yet collected is still the trip's revenue,
  * and only what was kept counts from a cancelled booking. Collections are tracked beside it.
  *
@@ -142,12 +182,8 @@ function accountFigures(trip: AccountTrip) {
     const figures = netBookingFigures(booking);
     collected += figures.held;
     remaining += figures.remaining;
-    if (booking.status === 'CANCELLED') {
-      tickets += figures.held;
-    } else {
-      tickets += halalas(booking.totalPrice);
-      passengers += booking._count.passengers;
-    }
+    tickets += soldOf(booking);
+    if (booking.status !== 'CANCELLED') passengers += booking._count.passengers;
   }
   const counted = trip.accountEntries.filter((entry) => !insideBill(entry, live));
   // A line posted to a hotel (a fine, an extra) is part of the hotels' cost; the office's own lines keep their columns.
@@ -464,7 +500,16 @@ export class TripAccountsService {
       pendingCustody: Number(pendingCustody._sum.amount ?? 0),
       rent: live ? { amount: sar(figures.bus), missing: trip.busRentalPrice === null, hasTaxInvoice: trip.busCost?.rentHasTaxInvoice ?? false } : null,
       hotels: live
-        ? trip.hotelBookings.map((booking) => ({ id: booking.id, name: booking.hotel.name, amount: sar(hotelBookingCost(booking)), hasTaxInvoice: booking.hasTaxInvoice }))
+        ? trip.hotelBookings.map((booking) => ({
+            id: booking.id,
+            name: booking.hotel.name,
+            amount: sar(hotelBookingCost(booking)),
+            hasTaxInvoice: booking.hasTaxInvoice,
+            rateUnit: booking.rateUnit,
+            extraCost: Number(booking.extraCost),
+            /** The room bill by room type: rooms × nights × that type's rate. */
+            byType: hotelCostByType(booking).map((row) => ({ ...row, rate: sar(row.rate), amount: sar(row.amount) })),
+          }))
         : [],
       parties: partyTotals(standing, figures.bus, hotelBills),
       branchExpenses: branchExpenses.map((row) => ({
@@ -615,16 +660,115 @@ export class TripAccountsService {
     if (outbound.tripStatus === 'DRAFT') throw new ConflictException('هذه الرحلة ما زالت مسودة');
     if (outbound.financeClosedAt) throw new ConflictException('تم الإغلاق المالي لهذه الرحلة مسبقًا');
     if (!legs.every(legEnded)) throw new ConflictException('لا يُغلق حساب الرحلة ماليًا قبل تنفيذها');
-    const closed = await this.prisma.trip.updateMany({ where: { id: outbound.id, financeClosedAt: null }, data: { financeClosedAt: new Date(), financeClosedByName: actor.name ?? null } });
-    if (closed.count === 0) throw new ConflictException('تم الإغلاق المالي لهذه الرحلة مسبقًا');
-    return { success: true };
+    // Closing and posting the profit are one step: a closed account always has its profit posted, exactly once.
+    return this.prisma.$transaction(async (tx) => {
+      const closedAt = new Date();
+      const closed = await tx.trip.updateMany({ where: { id: outbound.id, financeClosedAt: null }, data: { financeClosedAt: closedAt, financeClosedByName: actor.name ?? null } });
+      if (closed.count === 0) throw new ConflictException('تم الإغلاق المالي لهذه الرحلة مسبقًا');
+      const posted = await this.postProfit(tx, outbound.id, { at: closedAt, byName: actor.name ?? null });
+      return { success: true, posted };
+    }, POSTING_TX_OPTIONS);
   }
 
-  async reopen(tripId: string) {
+  /** The owner reopens a closed account. What was posted stays; closing again posts only the difference. */
+  async reopen(actor: { name?: string | null }, tripId: string) {
     const { outbound } = await this.journeyOf(tripId);
     const reopened = await this.prisma.trip.updateMany({ where: { id: outbound.id, financeClosedAt: { not: null } }, data: { financeClosedAt: null, financeClosedByName: null } });
     if (reopened.count === 0) throw new ConflictException('حساب هذه الرحلة مفتوح');
-    return { success: true };
+    return { success: true, reopenedBy: actor.name ?? null };
+  }
+
+  /**
+   * Posts the journey's net profit (or loss) to the branches by their share of its bookings. Whatever was posted before is
+   * taken into account, so the first closing posts the whole and every later closing posts only what changed (ADJUSTMENT).
+   * A journey nobody sold is shared by the settlement like head-office costs. Run inside a transaction holding the journey's closing.
+   */
+  async postProfit(tx: Prisma.TransactionClient, outboundId: string, options: { at: Date; byName: string | null }) {
+    // One posting at a time for a journey, so two closings can never both post the same profit.
+    await tx.$queryRaw`SELECT "id" FROM "Trip" WHERE "id" = ${outboundId} FOR UPDATE`;
+    const trip = await tx.trip.findUniqueOrThrow({ where: { id: outboundId }, select: JOURNEY_SELECT });
+    const legs = legsOf(trip);
+    const figures = journeyFigures(legs);
+
+    const weights = new Map<string, number>();
+    for (const leg of legs) {
+      for (const booking of leg.bookings) {
+        const sold = soldOf(booking);
+        if (sold > 0) weights.set(columnOf(booking), (weights.get(columnOf(booking)) ?? 0) + sold);
+      }
+    }
+    if (weights.size === 0) weights.set(SHARED_COLUMN, 1);
+    const revenue = shareOut(figures.revenue, weights);
+    const costs = shareOut(figures.expenses, weights);
+
+    const before = await tx.tripProfitPosting.groupBy({ by: ['columnKey'], where: { tripId: outboundId }, _sum: { revenue: true, costs: true } });
+    const posted = new Map(before.map((row) => [row.columnKey, { revenue: halalas(row._sum.revenue ?? 0), costs: halalas(row._sum.costs ?? 0) }]));
+    const keys = new Set([...weights.keys(), ...posted.keys()]);
+    const branchIds = [...keys].filter((key) => key !== APP_COLUMN && key !== HQ_COLUMN && key !== SHARED_COLUMN);
+    const branches = await tx.branch.findMany({ where: { id: { in: branchIds } }, select: { id: true, name: true } });
+    const nameOf = (key: string) => (key === APP_COLUMN ? 'التطبيق' : key === HQ_COLUMN ? 'الإدارة العامة' : key === SHARED_COLUMN ? 'مشتركة على الفروع (لم يُبع منها شيء)' : branches.find((branch) => branch.id === key)?.name ?? 'فرع');
+
+    const kind = before.length > 0 ? 'ADJUSTMENT' : 'CLOSE';
+    const rows: Prisma.TripProfitPostingCreateManyInput[] = [];
+    for (const key of keys) {
+      const deltaRevenue = (revenue.get(key) ?? 0) - (posted.get(key)?.revenue ?? 0);
+      const deltaCosts = (costs.get(key) ?? 0) - (posted.get(key)?.costs ?? 0);
+      // The first closing records every column, even at zero, so the account shows where its profit went.
+      if (kind === 'ADJUSTMENT' && deltaRevenue === 0 && deltaCosts === 0) continue;
+      rows.push({
+        tripId: outboundId,
+        columnKey: key,
+        columnName: nameOf(key),
+        kind,
+        revenue: sar(deltaRevenue),
+        costs: sar(deltaCosts),
+        net: sar(deltaRevenue - deltaCosts),
+        postedAt: options.at,
+        postedByName: options.byName,
+      });
+    }
+    if (rows.length) await tx.tripProfitPosting.createMany({ data: rows });
+    return { kind, net: sar(rows.reduce((sum, row) => sum + halalas(row.net as number), 0)), columns: rows.length };
+  }
+
+  /**
+   * Accounts closed before profits were posted have nothing on record: they are posted now, dated when they were closed, so
+   * the settlement of that month still sees them. Safe to run any number of times.
+   */
+  async postMissing() {
+    const missing = await this.prisma.trip.findMany({
+      where: { reverseOfTripId: null, financeClosedAt: { not: null }, profitPostings: { none: {} } },
+      select: { id: true, financeClosedAt: true, financeClosedByName: true },
+    });
+    for (const trip of missing) {
+      await this.prisma.$transaction(async (tx) => {
+        // Another request may have posted it meanwhile; the lock inside postProfit makes the check below reliable.
+        await tx.$queryRaw`SELECT "id" FROM "Trip" WHERE "id" = ${trip.id} FOR UPDATE`;
+        if ((await tx.tripProfitPosting.count({ where: { tripId: trip.id } })) > 0) return;
+        await this.postProfit(tx, trip.id, { at: trip.financeClosedAt!, byName: trip.financeClosedByName });
+      }, POSTING_TX_OPTIONS);
+    }
+    return missing.length;
+  }
+
+  /** The journey's postings, newest first, with each column's running total. */
+  async postings(tripId: string) {
+    const { outbound } = await this.journeyOf(tripId);
+    const rows = await this.prisma.tripProfitPosting.findMany({ where: { tripId: outbound.id }, orderBy: [{ postedAt: 'desc' }, { columnName: 'asc' }] });
+    const totals = new Map<string, { columnKey: string; columnName: string; revenue: number; costs: number; net: number }>();
+    for (const row of rows) {
+      const total = totals.get(row.columnKey) ?? { columnKey: row.columnKey, columnName: row.columnName, revenue: 0, costs: 0, net: 0 };
+      total.revenue += halalas(row.revenue);
+      total.costs += halalas(row.costs);
+      total.net += halalas(row.net);
+      totals.set(row.columnKey, total);
+    }
+    return {
+      tripId: outbound.id,
+      items: rows.map((row) => ({ ...row, revenue: Number(row.revenue), costs: Number(row.costs), net: Number(row.net) })),
+      totals: [...totals.values()].map((total) => ({ ...total, revenue: sar(total.revenue), costs: sar(total.costs), net: sar(total.net) })),
+      net: sar([...totals.values()].reduce((sum, total) => sum + total.net, 0)),
+    };
   }
 
   /** A line left for the month's end has now been paid. */
