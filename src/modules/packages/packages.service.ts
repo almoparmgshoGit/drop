@@ -347,7 +347,11 @@ export class PackagesService {
       include: {
         images: true,
         services: { include: { service: true } },
-        trips: { select: { id: true, tripCode: true, tripStatus: true, departureTime: true } },
+        // The package page lists them to edit or unlink: nearest departure first, with their route.
+        trips: {
+          select: { id: true, tripCode: true, tripStatus: true, departureTime: true, origin: true, destination: true, availableSeats: true, totalSeats: true },
+          orderBy: { departureTime: 'asc' },
+        },
         hotel: { select: { id: true, name: true, city: true } },
         _count: { select: { bookings: true } },
       },
