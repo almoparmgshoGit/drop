@@ -45,7 +45,7 @@ import { PublicService, SERVICE_SELECT, withHotelServices } from '../../common/u
 import { assignTripCode, codePeriodOf, draftPlaceholderCode, lockPeriods, journeyCodeOf, renumberPeriods, reverseCodeOf, syncTripCode } from '../../common/utils/trip-code.util';
 import { approvedLeaveWhere, crewClashResources, scheduleOverlapWhere } from '../../common/utils/schedule-conflict.util';
 import { oneBusPerConvoy } from '../../common/utils/convoy.util';
-import { linkedReturnWhere } from '../../common/utils/linked-return.util';
+import { linkedReturnWhere, returnTwinCode } from '../../common/utils/linked-return.util';
 import { APP_SALES_STATUS_UPDATES, AppSalesTrip, appOpenPoints, appSellingWindowWhere, appStillSells, hasSetOff } from '../../common/utils/app-boarding.util';
 
 const DEFAULT_TRIP_DURATION_MS = 8 * 60 * 60 * 1000;
@@ -827,6 +827,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
           }
         }
       }
+      if (!dryRun) await this.addMissingReturns(seriesId, month);
       series.push({
         seriesId,
         route: plan.route,
@@ -851,6 +852,32 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
       autoGeneratesFrom: addDays(startOfNextRiyadhMonth(now), -schedule.generateDaysBefore),
       farFutureDrafts: await this.prisma.trip.count({ where: this.farFutureDraftsWhere(now, city) }),
     };
+  }
+
+  /**
+   * The month's draft copies of a series that came out without their way back, though the trip they were copied from has one
+   * (drafted before copies looked for it), get it now: their return is switched on and drafted as on saving.
+   */
+  private async addMissingReturns(seriesId: string, month: string) {
+    const range = riyadhMonthRange(month);
+    const drafts = await this.prisma.trip.findMany({
+      where: { seriesId, tripStatus: 'DRAFT', reverseEnabled: false, reverseTrip: null, convoyLeadId: null, departureTime: { gte: range.gte, lt: range.lt, gt: new Date() } },
+      select: { id: true, departureTime: true },
+    });
+    for (const draft of drafts) {
+      try {
+        await this.prisma.$transaction(async (tx) => {
+          const template = await this.seriesTemplate(tx, seriesId, draft.departureTime);
+          const source = template && (await tx.trip.findUnique({ where: { id: template.id }, select: { id: true, tripCode: true, reverseEnabled: true, reversePrice: true } }));
+          const wayBack = source && (await this.wayBackOf(tx, source));
+          if (!wayBack?.enabled) return;
+          await tx.trip.update({ where: { id: draft.id }, data: { reverseEnabled: true, reverseDepartureAt: null, reversePrice: source.reversePrice ?? wayBack.price } });
+          await this.syncDraftReverse(tx, draft.id);
+        }, TRIP_TX_OPTIONS);
+      } catch (err) {
+        console.error(`Could not add the return of draft ${draft.id}:`, err.message);
+      }
+    }
   }
 
   /** Unpublished weekly copies beyond next month, left by the old year-ahead rule; publishing a series skips them. */
@@ -965,6 +992,19 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
    * A draft of the trip at another departure, with every date in it moved by the same amount. A weekly copy keeps the bus
    * and crew when they are free then; otherwise the office assigns them before publishing.
    */
+  /**
+   * Whether a trip has a way back: its return switched on, or a trip back that is not cancelled, made as its reverse or
+   * carrying its R number. A copy of it gets its own return then, so a new month's schedule keeps both legs.
+   */
+  private async wayBackOf(db: Prisma.TransactionClient, trip: { id: string; tripCode: string; reverseEnabled: boolean }) {
+    if (trip.reverseEnabled) return { enabled: true, price: null as Prisma.Decimal | null };
+    const back = await db.trip.findFirst({
+      where: { tripStatus: { not: 'CANCELLED' }, OR: [{ reverseOfTripId: trip.id }, { tripCode: returnTwinCode(trip.tripCode) }] },
+      select: { price: true },
+    });
+    return { enabled: !!back, price: back?.price ?? null };
+  }
+
   private async cloneTrip(
     tx: Prisma.TransactionClient,
     sourceId: string,
@@ -998,6 +1038,7 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
 
     const moved = departure.getTime() - source.departureTime.getTime();
     const shift = <T extends Date | null>(date: T) => (date ? new Date(date.getTime() + moved) : null) as T;
+    const wayBack = options.convoy ? null : await this.wayBackOf(tx, source);
     const primaryFirst = (rows: { userId: string; isPrimary: boolean }[]) => [...rows].sort((a, b) => Number(b.isPrimary) - Number(a.isPrimary)).map((row) => row.userId);
     let crew = { busId: null as string | null, driverIds: [] as string[], supervisorIds: [] as string[] };
     if (options.keepBusAndCrew) {
@@ -1054,11 +1095,13 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
         housingPriceMode: source.housingPriceMode,
         privateRoomPriceBasis: source.privateRoomPriceBasis,
         housingPricePeriod: source.housingPricePeriod,
-        reverseEnabled: source.reverseEnabled,
+        // A trip that came back has its copy come back too, even when its return was made apart from the switch.
+        reverseEnabled: wayBack ? wayBack.enabled : source.reverseEnabled,
         reverseOpenPercent: source.reverseOpenPercent,
         singlesOverflowPercent: source.singlesOverflowPercent,
-        reverseDepartureAt: shift(source.reverseDepartureAt),
-        reversePrice: source.reversePrice,
+        // Without the switch the saved time is not the return's: the copy takes the default (departure + nights).
+        reverseDepartureAt: source.reverseEnabled ? shift(source.reverseDepartureAt) : null,
+        reversePrice: source.reversePrice ?? wayBack?.price ?? null,
         channelApp: source.channelApp,
         channelBranch: source.channelBranch,
         // Not the source's: its opening belongs to its own month. A weekly copy gets one from the monthly schedule setting.
@@ -2242,6 +2285,8 @@ export class TripsService implements OnModuleInit, OnModuleDestroy {
           bookingType: dto.bookingType,
           busId: dto.busId !== undefined ? busId : undefined,
           packageId: dto.packageId !== undefined ? dto.packageId || null : undefined,
+          // Off its package, or onto another, the trip back set with the old package no longer applies.
+          ...(packageId !== existing.packageId && { packageReturnTripId: null }),
           busRentalPrice: await this.rentAfterEdit(tx, existing, { busId, origin: dto.origin ?? existing.origin, destination: dto.destination ?? existing.destination }, dto),
           housingPrice: dto.housingPrice,
           privateRoomPrice: dto.privateRoomPrice,

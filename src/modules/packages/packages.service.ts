@@ -3,10 +3,11 @@ import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../common/services/prisma.service';
 import { formatRiyadhTime, riyadhDate, riyadhDayRange } from '../../common/utils/time.util';
 import { seatPricing } from '../../common/utils/dynamic-pricing.util';
-import { packageWindowProblem } from '../../common/utils/package-window.util';
+import { assertTripFitsPackage, packageWindowProblem } from '../../common/utils/package-window.util';
+import { RoomAllocationService } from '../../common/services/room-allocation.service';
 import { PACKAGE_MAX_PERSONS, PackagePrices, packagePriceTiers } from '../../common/utils/package-price.util';
 import { appTripWhere, bookingTypeWhere, PUBLIC_TRIP_INCLUDE, toPublicTrip } from '../trips/trips.service';
-import { CreatePackageDto, CustomJourneyQuery, CustomPreviewDto, PackageSearchQuery, UpdatePackageDto } from './packages.controller';
+import { CreatePackageDto, CustomJourneyQuery, CustomPreviewDto, PackageDepartureDto, PackageSearchQuery, UpdatePackageDto } from './packages.controller';
 import {
   CUSTOM_PACKAGE_MAX_NIGHTS,
   CUSTOM_PACKAGE_SELECT,
@@ -101,7 +102,8 @@ const publicPackageArgs = (tripWhere: Prisma.TripWhereInput) => ({
   include: {
     images: true,
     services: { include: { service: true } },
-    trips: { where: tripWhere, orderBy: { departureTime: 'asc' as const }, include: PUBLIC_TRIP_INCLUDE },
+    // Each outbound with the trip back its package price covers, so the app books the two together.
+    trips: { where: tripWhere, orderBy: { departureTime: 'asc' as const }, include: { ...PUBLIC_TRIP_INCLUDE, packageReturn: { include: PUBLIC_TRIP_INCLUDE } } },
   },
 });
 
@@ -109,7 +111,14 @@ const toPublicPackage = <T extends PackagePrices & { trips: object[] }>(pkg: T) 
   ...pkg,
   maxPersons: PACKAGE_MAX_PERSONS,
   priceTiers: packagePriceTiers(pkg),
-  trips: pkg.trips.map((trip) => toPublicTrip({ ...trip, pricePerSeat: Number(pkg.price), packagePriceTiers: packagePriceTiers(pkg) })),
+  trips: pkg.trips.map((trip) => {
+    const { packageReturn, ...outbound } = trip as typeof trip & { packageReturn?: Parameters<typeof toPublicTrip>[0] | null };
+    return {
+      ...toPublicTrip({ ...outbound, pricePerSeat: Number(pkg.price), packagePriceTiers: packagePriceTiers(pkg) } as Parameters<typeof toPublicTrip>[0]),
+      // Included in the package price: the app shows it and books its seats with the outbound's.
+      packageReturn: packageReturn ? toPublicTrip(packageReturn) : null,
+    };
+  }),
 });
 
 /** A bigger group paying less in total than a smaller one is almost always a typing slip. */
@@ -125,7 +134,10 @@ const dateInput = (value: string | null | undefined) => (value === undefined ? u
 
 @Injectable()
 export class PackagesService {
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    private rooms: RoomAllocationService,
+  ) {}
 
   /** Packages the customer builds on the searched route: no trips of their own, so they show whenever they are published and in date. */
   async getCustomPackages(search: PackageSearchQuery = {}) {
@@ -348,8 +360,15 @@ export class PackagesService {
         images: true,
         services: { include: { service: true } },
         // The package page lists them to edit or unlink: nearest departure first, with their route.
+        // Each with the trip its customers come back on and the nights of its stay.
         trips: {
-          select: { id: true, tripCode: true, tripStatus: true, departureTime: true, origin: true, destination: true, availableSeats: true, totalSeats: true },
+          select: {
+            ...ADMIN_DEPARTURE_SELECT,
+            availableSeats: true,
+            totalSeats: true,
+            packageReturn: { select: ADMIN_DEPARTURE_SELECT },
+            accommodations: { select: { nights: true } },
+          },
           orderBy: { departureTime: 'asc' },
         },
         hotel: { select: { id: true, name: true, city: true } },
@@ -365,14 +384,11 @@ export class PackagesService {
 
   async createPackage(dto: CreatePackageDto) {
     this.assertDateOrder(dateInput(dto.startDate) ?? null, dateInput(dto.endDate) ?? null);
-    const kind = dto.kind ?? 'FIXED';
-    if (kind === 'CUSTOM') assertCustomFields(dto);
-    // A custom package is priced from its trips and nights, so its group totals stay at zero.
-    const prices =
-      kind === 'CUSTOM'
-        ? { price: 0, price2: 0, price3: 0, price4: 0 }
-        : { price: dto.price, price2: dto.price2 ?? dto.price * 2, price3: dto.price3 ?? dto.price * 3, price4: dto.price4 ?? dto.price * 4 };
-    if (kind === 'FIXED') assertGroupPrices(prices);
+    // The company adds its fixed packages only: the customer builds their own in the app from the hotels' prices.
+    if (dto.kind === 'CUSTOM') throw new BadRequestException('الباقة التي يصممها العميل تُبنى في التطبيق من أسعار الفنادق، ولا تُضاف من لوحة التحكم');
+    const kind = 'FIXED' as const;
+    const prices = { price: dto.price, price2: dto.price2 ?? dto.price * 2, price3: dto.price3 ?? dto.price * 3, price4: dto.price4 ?? dto.price * 4 };
+    assertGroupPrices(prices);
     return this.prisma.package.create({
       data: {
         name: dto.name,
@@ -471,4 +487,66 @@ export class PackagesService {
     await this.prisma.package.delete({ where: { id } });
     return { success: true };
   }
+
+  /**
+   * Puts a trip on a fixed package with the trip its customers come back on, or changes them. The package price covers both
+   * trips and the stay; the nights set the outbound's stay, as the trip form's nights do (its hotel's dates follow).
+   */
+  async setDeparture(packageId: string, dto: PackageDepartureDto) {
+    return this.prisma.$transaction(async (tx) => {
+      const [outbound, inbound] = await Promise.all([
+        tx.trip.findUnique({
+          where: { id: dto.outboundTripId },
+          select: {
+            id: true, tripCode: true, origin: true, destination: true, departureTime: true, arrivalTime: true, tripStatus: true, packageId: true, packageReturnTripId: true,
+            accommodations: { select: { nights: true } },
+          },
+        }),
+        tx.trip.findUnique({ where: { id: dto.returnTripId }, select: { id: true, tripCode: true, origin: true, destination: true, departureTime: true, tripStatus: true, packageId: true } }),
+      ]);
+      if (!outbound) throw new NotFoundException('رحلة الذهاب غير موجودة');
+      if (!inbound) throw new NotFoundException('رحلة العودة غير موجودة');
+      if (outbound.packageId && outbound.packageId !== packageId) throw new ConflictException(`الرحلة ${outbound.tripCode} مرتبطة بباقة أخرى`);
+      if (inbound.packageId) throw new BadRequestException(`رحلة العودة ${inbound.tripCode} مرتبطة بباقة كرحلة ذهاب، اختر رحلة عودة عادية`);
+      if ([outbound, inbound].some((trip) => trip.tripStatus === 'CANCELLED')) throw new BadRequestException('لا تُسند رحلة ملغاة للباقة');
+      if (!sameCity(inbound.origin, outbound.destination) || !sameCity(inbound.destination, outbound.origin)) {
+        throw new BadRequestException(`رحلة العودة يجب أن تكون من ${outbound.destination} إلى ${outbound.origin}`);
+      }
+      if (inbound.departureTime <= outbound.arrivalTime) throw new BadRequestException('رحلة العودة يجب أن تنطلق بعد وصول رحلة الذهاب');
+      await assertTripFitsPackage(tx, packageId, outbound.departureTime);
+      // Who already bought the package rides back on the return they were sold.
+      if (outbound.packageReturnTripId && outbound.packageReturnTripId !== inbound.id) {
+        const sold = await tx.booking.count({ where: { tripId: outbound.id, status: { not: 'CANCELLED' } } });
+        if (sold > 0) throw new ConflictException('لا يمكن تغيير رحلة العودة بعد بيع مقاعد في هذه الرحلة');
+      }
+
+      await tx.trip.update({ where: { id: outbound.id }, data: { packageId, packageReturnTripId: inbound.id } });
+      // The stay's length, kept with the hotel's dates as the trip form keeps them. A trip without a stay has no nights.
+      const nights = dto.nights;
+      if (nights !== undefined && outbound.accommodations.length && nights !== outbound.accommodations[0].nights) {
+        await tx.accommodation.update({ where: { tripId: outbound.id }, data: { nights } });
+        const stays = await tx.hotelBooking.findMany({ where: { tripId: outbound.id, status: 'CONFIRMED' }, select: { id: true } });
+        for (const stay of stays) await tx.hotelBooking.update({ where: { id: stay.id }, data: this.rooms.stayDates(outbound.departureTime, nights) });
+      }
+      return { success: true };
+    });
+  }
+
+  /** Takes a trip off the package: it stays as it is and sells at its own price again. */
+  async removeDeparture(packageId: string, tripId: string) {
+    const trip = await this.prisma.trip.findUnique({ where: { id: tripId }, select: { packageId: true } });
+    if (!trip || trip.packageId !== packageId) throw new NotFoundException('الرحلة غير مرتبطة بهذه الباقة');
+    await this.prisma.trip.update({ where: { id: tripId }, data: { packageId: null, packageReturnTripId: null } });
+    return { success: true };
+  }
 }
+
+const ADMIN_DEPARTURE_SELECT = {
+  id: true,
+  tripCode: true,
+  tripStatus: true,
+  departureTime: true,
+  arrivalTime: true,
+  origin: true,
+  destination: true,
+} satisfies Prisma.TripSelect;

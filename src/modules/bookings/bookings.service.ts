@@ -436,6 +436,12 @@ export class BookingsService {
     if (dto.stay && !dto.transportOnly) throw new BadRequestException('الفندق المختار يُضاف إلى حجز نقل');
     const chosenStay = dto.stay ? await this.priceChosenStay(db, dto.stay, seated, { returnOnly: !!dto.returnOnly, family }) : null;
 
+    // A fixed package with its trip back set: the package price covers both trips and the stay, so the two are booked together.
+    const packageOutbound = !customPackage && seated[0].trip.package && seated[0].trip.packageReturnTripId ? seated[0].trip : null;
+    const packageReturn = !!packageOutbound && seated.length === 2 && seated[1].trip.id === packageOutbound.packageReturnTripId;
+    if (packageOutbound && !packageReturn) throw new BadRequestException('الباقة تشمل رحلة العودة، فاختر مقاعدك في رحلة العودة المحددة لها أيضًا');
+    if (packageReturn && seated[0].seats.length !== seated[1].seats.length) throw new BadRequestException('اختر في رحلة العودة عدد المقاعد نفسه الذي في رحلة الذهاب');
+
     const listedLegs = seated.map(({ leg, trip, seats }, index) => {
       // A package charges its total for the group's size; an ordinary trip charges each seat.
       // One seat price for the quote and the booking alike; without flexible pricing it is the listed price.
@@ -448,7 +454,13 @@ export class BookingsService {
       if (dto.transportOnly && includesHousing(trip.bookingType) && trip.housingPriceMode === 'INCLUDED_IN_BASE') {
         throw new BadRequestException('السكن مشمول في سعر هذه الرحلة، ولا يمكن حجزها بدون سكن');
       }
-      const stay = customStayLeg ? (index === 0 ? customStayLeg : null) : chosenStay ? (index === 0 ? chosenStay : null) : dto.transportOnly ? null : this.priceStay(trip, leg, seats.length, family);
+      const stay = customStayLeg
+        ? (index === 0 ? customStayLeg : null)
+        : chosenStay
+          ? (index === 0 ? chosenStay : null)
+          : dto.transportOnly || (packageReturn && index === 1)
+            ? null
+            : this.priceStay(trip, leg, seats.length, family);
       const housingAmount = stay?.amount ?? 0;
       return { leg, trip, seats, unitPrice, pricing, stay, seatsSubtotal, housingAmount, subtotal: seatsSubtotal + housingAmount, roundShare: false };
     });
@@ -468,7 +480,12 @@ export class BookingsService {
         throw new BadRequestException(`رحلة العودة في الذهاب والعودة هي الرحلة المرتبطة برحلة ${outboundTrip.tripCode} فقط`);
       }
     }
-    const roundShares = roundJourney ? allocate(listedLegs[outboundIndex].seatsSubtotal, listedLegs.map((leg) => leg.seatsSubtotal)) : null;
+    // A package with its trip back costs the package total once, shared by its two tickets like a round journey's.
+    const roundShares = roundJourney
+      ? allocate(listedLegs[outboundIndex].seatsSubtotal, listedLegs.map((leg) => leg.seatsSubtotal))
+      : packageReturn
+        ? allocate(listedLegs[0].seatsSubtotal, listedLegs.map((leg) => leg.seatsSubtotal))
+        : null;
     const legs = roundShares
       ? listedLegs.map((leg, idx) => {
           const seatsSubtotal = roundShares[idx];
@@ -573,6 +590,7 @@ export class BookingsService {
       customStay,
       chosenStay,
       skipsCustomStay,
+      packageReturn,
       walletUsed,
       walletOnTickets,
       payable,
@@ -908,7 +926,7 @@ export class BookingsService {
                 : stay ? ('PACKAGE_OUTBOUND_STAY' as const) : ('TRANSPORT_OUTBOUND' as const);
           // A package trip bought from its own listing is the whole package, so its rows keep no kind.
           const rowKind = (legIndex: number, hasStay: boolean, isPackage: boolean) =>
-            quote.customStay ? ('PACKAGE_ROUND_STAY' as const) : asTransport[legIndex] ? journeyKind(false) : quote.chosenStay ? journeyKind(true) : isPackage ? null : journeyKind(hasStay);
+            quote.customStay || quote.packageReturn ? ('PACKAGE_ROUND_STAY' as const) : asTransport[legIndex] ? journeyKind(false) : quote.chosenStay ? journeyKind(true) : isPackage ? null : journeyKind(hasStay);
 
           // Until the gateway ships, anything left to pay can only go through in explicit simulated mode.
           const simulated = this.config.get('PAYMENT_MODE') === 'simulated';

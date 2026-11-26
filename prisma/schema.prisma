@@ -621,6 +621,11 @@ model Trip {
   convoyOrder                Int                   @default(1)
   packageId                  String?
   package                    Package?              @relation(fields: [packageId], references: [id], onDelete: SetNull)
+  /// On a fixed package's outbound: the trip its customers come back on. The package price covers both trips and the stay,
+  /// so a package booking takes seats on the two together and pays once.
+  packageReturnTripId        String?
+  packageReturn              Trip?                 @relation("PackageReturn", fields: [packageReturnTripId], references: [id], onDelete: SetNull)
+  packageOutbounds           Trip[]                @relation("PackageReturn")
   reverseEnabled             Boolean               @default(false)
   reverseOpenPercent         Int                   @default(0)
   /// How full the whole bus must be (%) before a singles booking, finding the singles section full, may take family seats.
@@ -694,6 +699,7 @@ model Trip {
   @@index([codePeriod, codeNumber])
   @@index([executedAt])
   @@index([convoyLeadId])
+  @@index([packageReturnTripId])
 }
 
 model TripImage {

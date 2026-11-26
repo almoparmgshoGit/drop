@@ -148,6 +148,13 @@ export class CustomPreviewDto {
   @IsOptional() @IsBoolean() withoutHousing?: boolean;
 }
 
+/** A fixed package's departure: the outbound, the trip back, and the stay's nights (the outbound's own when left out). */
+export class PackageDepartureDto {
+  @IsString() @Length(1, 60) outboundTripId: string;
+  @IsString() @Length(1, 60) returnTripId: string;
+  @IsOptional() @IsInt() @Min(0) @Max(60) nights?: number;
+}
+
 class NextPackageQuery {
   @IsOptional() @IsString() @MaxLength(100) origin?: string;
   @IsOptional() @IsString() @MaxLength(100) destination?: string;
@@ -230,6 +237,22 @@ export class PackagesController {
   @ApiOperation({ summary: 'Update package' })
   async updatePackage(@Param('id') id: string, @Body() dto: UpdatePackageDto) {
     return this.packagesService.updatePackage(id, dto);
+  }
+
+  @Put(':id/departures')
+  @RequirePermission('packages.manage')
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Put a trip on a fixed package with its return trip and nights, or change them' })
+  async setDeparture(@Param('id') id: string, @Body() dto: PackageDepartureDto) {
+    return this.packagesService.setDeparture(id, dto);
+  }
+
+  @Delete(':id/departures/:tripId')
+  @RequirePermission('packages.manage')
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Take a trip off a fixed package' })
+  async removeDeparture(@Param('id') id: string, @Param('tripId') tripId: string) {
+    return this.packagesService.removeDeparture(id, tripId);
   }
 
   @Delete(':id')
